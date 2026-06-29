@@ -3496,6 +3496,18 @@ end
 
 ---------------------------------------------------
 --
+--@src/devices/machine/s97801.h,MACHINES["S97801"] = true
+---------------------------------------------------
+
+if MACHINES["S97801"] then
+	files {
+		MAME_DIR .. "src/devices/machine/s97801.cpp",
+		MAME_DIR .. "src/devices/machine/s97801.h",
+	}
+end
+
+---------------------------------------------------
+--
 --@src/devices/machine/scn_pci.h,MACHINES["SCN_PCI"] = true
 ---------------------------------------------------
 
