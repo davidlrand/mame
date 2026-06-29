@@ -1,5 +1,5 @@
 // license:BSD-3-Clause
-// copyright-holders:Patrick Mackinlay
+// copyright-holders:Patrick Mackinlay, Dave Rand
 
 /*
  * Siemens S26361-D333 CPUAP processor board.
@@ -36,9 +36,13 @@ cpuap_device::cpuap_device(machine_config const &mconfig, char const *tag, devic
 	, m_mmu(*this, "mmu")
 	, m_icu(*this, "icu")
 	, m_rtc(*this, "rtc")
+	, m_csuart(*this, "csuart")
+	, m_diag(*this, "diag")
 	, m_s7(*this, "S7")
 	, m_s8(*this, "S8")
 	, m_boot(*this, "boot")
+	, m_ram(*this, "ram", 0x100000, ENDIANNESS_LITTLE)
+	, m_installed(false)
 {
 }
 
@@ -84,7 +88,9 @@ static INPUT_PORTS_START(cpuap)
 
 	// Offen: Ausgabe des Urladers über Diagnose-Stecker, keine SERAD/G Baugruppe gesteckt
 	// Open: boot loader output via diagnostic plug, no SERAD/G module plugged in
-	PORT_DIPNAME(0x80, 0x00, "Diagnostic") PORT_DIPLOCATION("S7:8")
+	// Bring-up default On: route the console to the on-board CSUART "diagnostic plug" (there is no
+	// SERAD board emulated yet). Revert to Off once SERAD is the production console.
+	PORT_DIPNAME(0x80, 0x80, "Diagnostic") PORT_DIPLOCATION("S7:8")
 	PORT_DIPSETTING(0x00, DEF_STR(Off))
 	PORT_DIPSETTING(0x80, DEF_STR(On))
 
@@ -122,6 +128,14 @@ static INPUT_PORTS_START(cpuap)
 	PORT_DIPSETTING(0x01, "NMI")
 INPUT_PORTS_END
 
+static DEVICE_INPUT_DEFAULTS_START(diag_defaults)
+	DEVICE_INPUT_DEFAULTS("RS232_TXBAUD", 0xff, RS232_BAUD_38400)
+	DEVICE_INPUT_DEFAULTS("RS232_RXBAUD", 0xff, RS232_BAUD_38400)
+	DEVICE_INPUT_DEFAULTS("RS232_DATABITS", 0xff, RS232_DATABITS_7)
+	DEVICE_INPUT_DEFAULTS("RS232_PARITY", 0xff, RS232_PARITY_ODD)
+	DEVICE_INPUT_DEFAULTS("RS232_STOPBITS", 0xff, RS232_STOPBITS_1)
+DEVICE_INPUT_DEFAULTS_END
+
 const tiny_rom_entry *cpuap_device::device_rom_region() const
 {
 	return ROM_NAME(cpuap);
@@ -138,6 +152,16 @@ void cpuap_device::device_start()
 
 void cpuap_device::device_reset()
 {
+	if (!m_installed)
+	{
+		// Expose the 1 MiB on-board RAM as a Multibus slave so bus masters (e.g. the Storager disk
+		// controller) can DMA the IOPB and transfer buffers that live in NS32016 memory. The monitor
+		// hands the controller raw 20-bit addresses (its data structures sit in low RAM), so the RAM
+		// answers on the bus at 0x000000-0x0FFFFF -- clear of the SERAD mailbox window at 0xEF7000.
+		m_bus->space(AS_PROGRAM).install_ram(0x000000, 0x0fffff, m_ram.target());
+		m_installed = true;
+	}
+
 	m_boot.select(0);
 	m_nmi = 0xff;
 }
@@ -175,6 +199,16 @@ void cpuap_device::device_add_mconfig(machine_config &config)
 	int_callback<7>().set([this](int state) { m_s8->read() ? m_cpu->set_input_line(INPUT_LINE_NMI, !state) : m_icu->ir_w<11>(state); });
 
 	MC146818(config, m_rtc, 32.768_kHz_XTAL);
+
+	// on-board "diagnostic plug" console UART, selected by the monitor when S7:8 Diagnostic is set
+	// (i.e. no SERAD board). Channel A is the console; the monitor runs it at 38400 (CSR 0xC).
+	SCN2681(config, m_csuart, 7.3728_MHz_XTAL / 2);
+	m_csuart->a_tx_cb().set(m_diag, FUNC(rs232_port_device::write_txd));
+
+	RS232_PORT(config, m_diag, default_rs232_devices, nullptr);
+	m_diag->rxd_handler().set(m_csuart, FUNC(scn2681_device::rx_a_w));
+	m_diag->set_option_device_input_defaults("null_modem", DEVICE_INPUT_DEFAULTS_NAME(diag_defaults));
+	m_diag->set_option_device_input_defaults("terminal", DEVICE_INPUT_DEFAULTS_NAME(diag_defaults));
 }
 
 template <unsigned ST> void cpuap_device::cpu_map(address_map &map)
@@ -184,7 +218,7 @@ template <unsigned ST> void cpuap_device::cpu_map(address_map &map)
 		map(0x000000, 0x0fffff).view(m_boot);
 
 		m_boot[0](0x000000, 0x00ffff).rom().region("eprom", 0);
-		m_boot[1](0x000000, 0x0fffff).ram();
+		m_boot[1](0x000000, 0x0fffff).ram().share("ram");
 
 		//map(0x100000, 0x3fffff); // first memory expansion
 		//map(0x400000, 0x6fffff); // second memory expansion
@@ -202,7 +236,7 @@ template <unsigned ST> void cpuap_device::cpu_map(address_map &map)
 		map(0xff8100, 0xff8100).lr8([this]() { return m_s7->read(); }, "s7_r");
 		map(0xff8200, 0xff8200).lw8([this](u8 data) { LOG("prdia_w 0x%02x led 0x%x (%s)\n", data, ~data & 0x3f, machine().describe_context()); m_prdia = data; }, "prdia_w");
 		map(0xff8300, 0xff8300).lrw8([this]() { return m_poff; }, "poff_r", [this](u8 data) { m_poff = data & 3; }, "poff_w"); // 3 pohopofi - power off interrupt?
-		//map(0xff8400, 0xff840f); // 4 csuart
+		map(0xff8400, 0xff841f).rw(m_csuart, FUNC(scn2681_device::read), FUNC(scn2681_device::write)).umask16(0x00ff); // csuart (diagnostic console)
 		map(0xff8500, 0xff8500).lw8([this](u8 data) { m_boot.select(BIT(data, 0)); }, "mapprom_w");
 		map(0xff8600, 0xff863f).m(m_icu, FUNC(ns32202_device::map<0>)).umask16(0x00ff);
 		map(0xff8700, 0xff8700).lrw8(

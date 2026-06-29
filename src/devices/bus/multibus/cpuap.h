@@ -1,5 +1,5 @@
 // license:BSD-3-Clause
-// copyright-holders:Patrick Mackinlay
+// copyright-holders:Patrick Mackinlay, Dave Rand
 
 #ifndef MAME_BUS_MULTIBUS_CPUAP_H
 #define MAME_BUS_MULTIBUS_CPUAP_H
@@ -13,6 +13,9 @@
 #include "machine/ns32082.h"
 #include "machine/ns32202.h"
 #include "machine/mc146818.h"
+#include "machine/mc68681.h"
+
+#include "bus/rs232/rs232.h"
 
 
 class cpuap_device
@@ -44,13 +47,17 @@ private:
 	required_device<ns32082_device> m_mmu;
 	required_device<ns32202_device> m_icu;
 	required_device<mc146818_device> m_rtc;
+	required_device<scn2681_device> m_csuart;
+	required_device<rs232_port_device> m_diag;
 	required_ioport m_s7;
 	required_ioport m_s8;
 	memory_view m_boot;
+	memory_share_creator<u16> m_ram;
 
 	u8 m_prdia;
 	u8 m_poff;
 	u8 m_nmi;
+	bool m_installed;
 };
 
 DECLARE_DEVICE_TYPE(CPUAP, cpuap_device)
