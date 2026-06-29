@@ -28,6 +28,7 @@
 #include "bus/multibus/cpuap.h"
 //#include "bus/multibus/dueai.h"
 #include "bus/multibus/serad.h"
+#include "bus/multibus/storager.h"
 
 #define VERBOSE 0
 #include "logmacro.h"
@@ -69,13 +70,14 @@ static void pcmx2_cards(device_slot_interface &device)
 	device.option_add("cpuap", CPUAP);
 	//device.option_add("dueai", DUEAI);
 	device.option_add("serad", SERAD);
+	device.option_add("storager", MULTIBUS_STORAGER);
 }
 
 void pcmx2_state::pcmx2(machine_config &config)
 {
 	MULTIBUS(config, m_bus, 20_MHz_XTAL / 2);
 
-	MULTIBUS_SLOT(config, "slot1", m_bus, pcmx2_cards, nullptr, false); // DTC 86-1 or Storager
+	MULTIBUS_SLOT(config, "slot1", m_bus, pcmx2_cards, "storager", false); // Interphase Storager (disk/tape/floppy)
 	MULTIBUS_SLOT(config, "slot2", m_bus, pcmx2_cards, nullptr, false);
 	MULTIBUS_SLOT(config, "slot3", m_bus, pcmx2_cards, "serad", false);
 	MULTIBUS_SLOT(config, "slot4", m_bus, pcmx2_cards, nullptr, false);

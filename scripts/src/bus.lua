@@ -3632,6 +3632,8 @@ if BUSES["MULTIBUS"] then
 		MAME_DIR .. "src/devices/bus/multibus/cpuap.h",
 		MAME_DIR .. "src/devices/bus/multibus/serad.cpp",
 		MAME_DIR .. "src/devices/bus/multibus/serad.h",
+		MAME_DIR .. "src/devices/bus/multibus/storager.cpp",
+		MAME_DIR .. "src/devices/bus/multibus/storager.h",
 		MAME_DIR .. "src/devices/bus/multibus/labtam_3232.cpp",
 		MAME_DIR .. "src/devices/bus/multibus/labtam_3232.h",
 		MAME_DIR .. "src/devices/bus/multibus/labtam_vducom.cpp",
