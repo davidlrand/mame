@@ -1183,8 +1183,14 @@ void sound_coreaudio::coreaudio_stream::close()
 {
 	if (m_graph)
 	{
-		std::lock_guard<std::mutex> steam_guard(m_stream_mutex);
+		// Stop the graph BEFORE taking m_stream_mutex.  AUGraphStop blocks until the
+		// CoreAudio I/O thread finishes any in-flight sink_render callback, and that
+		// callback also takes m_stream_mutex -- so holding the mutex across AUGraphStop
+		// deadlocks (this thread waits for the callback to finish, the callback waits
+		// for the mutex).  Once AUGraphStop returns the I/O thread is quiesced and no
+		// further callbacks fire, so the rest of the teardown is safe under the lock.
 		AUGraphStop(m_graph);
+		std::lock_guard<std::mutex> steam_guard(m_stream_mutex);
 		AUGraphUninitialize(m_graph);
 		DisposeAUGraph(m_graph);
 		m_graph = nullptr;
