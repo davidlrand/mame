@@ -6698,3 +6698,31 @@ SUPPOSED to become positive between the stake and $6f44? Candidates: an intermed
 step ($7e1e/$7e90) that rewrites f0->slot#, or the capture-stake for the floppy should write the
 slot# not f0, or $6f44's input pointer/base is off so it reads the wrong cells. NEXT: find who (if
 anyone) writes a POSITIVE slot# to $7654 on the floppy path - that's the missing f0->positive step.
+
+## cont.299 (2026-07-21) — DECISIVE: ZERO firmware positive-writers; f0->positive is the gate-array's capture-into-slot event
+
+Census (secmap tap, proven block, control CTL-89f2 passing; staking seed). The ONLY $7654 writes in
+the read window (t>7.9):
+  pc=$9318  <-f0  : the STAKE ("capture noticed" - address mark passed)
+  pc=$6fe6  <-ff  : $6f44 RESETTING the rejected f0 (its negative branch $6fe0)
+  pc=$7068  <-fe  : beyond-window
+  => NO POSITIVE write anywhere (count=0). Confirms Dave's prediction.
+
+So f0->positive (the "data landed in slot N" event that $6f44 consumes) is NOT a firmware
+instruction - it is the GATE ARRAY's capture-into-slot event (cont.275): at the sector's data
+record-end, the GA DMAs the recovered sector into a local slot and writes ledger[pos]=slot#. The
+model fires event one (the stake, parity-fixed) but never event two, because it SHORT-CIRCUITS
+flux->host and never uses the slot pool. So $6f44 keeps seeing f0 (negative) and resetting to ff.
+
+THE FAITHFUL FIX (picks the whole path, doctrine-clean): at the DATA record-end (flux_advance_to,
+the second-IRQ5 site - which under ONEIRQ5 is where the data-done lands), the model DMAs the
+recovered sector into a slot and writes ledger[pos]=slot# (positive), REPLACING the flux->host
+short-circuit. This is FILLMAP-done-right (cont.276 wrote the positive byte but at the wrong
+layer/time -> collided with the scan). Dave's caveat: the slot# must land at ledger[AIM] (the pos
+the stake used, [$7428]), not the geometric position, or $6f44 and the scan disagree again (the
+FILLMAP collision). So: record-end -> slot DMA -> ledger[aim]=slot#. Retires the flux->host shim
+flagged at the very start.
+
+NEXT: implement the capture-into-slot at record-end (ledger[aim]=positive slot#), env-gated, and
+verify $6f44 now converts f0->c0 and the aim advances. Await Dave's exact edit (pos=aim vs geometric,
+slot# source, timing relative to the stake).
