@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP", "STORAGER_NOWALKSUBQ" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -4471,7 +4471,8 @@ void multibus_storager_device::device_start()
 			{0x6f44, "BUILD-6f44"}, {0x6ff0, "CONV-6ff0"}, {0x726c, "CONV-726c"}, {0x9362, "CONV-9362"},
 			{0x6fde, "SCAN-6fde"}, {0x7c34, "WALK-7c34"}, {0x7d02, "WALK-7d02"}, {0x7e58, "GATE-7e58"},
 			{0x7d4a, "RERUN-7d4a"}, {0x7e6c, "SUBQ-7e6c"}, {0x7106, "RE7106-6f44"},
-			{0x6ed2, "OP4A-6ed2"}, {0x159c, "PARK36-159c"}, {0x417a, "DESCGO-417a"} })
+			{0x6ed2, "OP4A-6ed2"}, {0x159c, "PARK36-159c"}, {0x417a, "DESCGO-417a"},
+			{0x70a0, "DRAIN-70a0"}, {0x7ebe, "WSUBQ-7ebe"}, {0x7ed8, "DISARM-7ed8"}, {0x1646, "PUMPSEL-1646"} })
 			m_cpu->space(AS_OPCODES).install_read_tap(ent.first, ent.first | 1, ent.second,
 				[this, name = ent.second](offs_t, u16 &, u16)
 				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();
@@ -4479,7 +4480,13 @@ void multibus_storager_device::device_start()
 					{ address_space &xs = m_cpu->space(AS_PROGRAM);
 						logerror("AIMCV %s 7956=%04x 7a64=%04x 7b10=%04x 7426=%04x 7958=%08x 72e2=%04x 7428=%04x @%.5f\n", name,
 							xs.read_word(0x7956), xs.read_word(0x7a64), xs.read_word(0x7b10), xs.read_word(0x7426),
-							xs.read_dword(0x7958), xs.read_word(0x72e2), xs.read_word(0x7428), t); } });
+							xs.read_dword(0x7958), xs.read_word(0x72e2), xs.read_word(0x7428), t);
+						logerror("  ^%s D3=%04x 741c=%04x\n", name, u16(m_cpu->state_int(M68K_D3)), xs.read_word(0x741c)); } });
+		// cont.304 (Dave's A/B): suppress the WALK's [$7956] subq ($7ebe) so $70a0/$6f44 can own the
+		// counter - isolates whether "the walk steals the counter" is the true half of the coupling.
+		m_cpu->space(AS_PROGRAM).install_write_tap(0x7956, 0x7957, "nowalksubq",
+			[this](offs_t, u16 &data, u16)
+			{ if (storager_getenv("STORAGER_NOWALKSUBQ") && m_cpu->pc() == 0x7ebe) data = u16(data + 1); });
 		// cont.38 (STRIP): the $7654 SECTOR-MAP write-tap - the map codes ($c0/$f0/$fe/$ff/$aa)
 		// are the floppy engine's per-sector state language; each transition names its writer.
 		m_cpu->space(AS_PROGRAM).install_write_tap(0x7654, 0x7665, "secmap",

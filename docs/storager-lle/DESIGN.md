@@ -6820,3 +6820,29 @@ drained state; or (b) route [$7956] drain through $6f44/$70a0 (not the walk) so 
 $3dbc fires - the cont.287 "walk steals the counter" fix. Both are firmware-path reads, not pokes.
 Session arc COMPLETE to the gate: parity->stake, SLOTMAP->slot#, drain->0, unpark CONDITION met.
 The only thing between here and boot is which unpark handler acts on the now-satisfied condition.
+
+## cont.304 (2026-07-21) — park-loop census: pump out (structural), $70a0 re-run gap; A/B refutes "walk subq steals", real zeroer is $7c02 RESET
+
+Control-checked park-loop census (CTL-89f2=20; ONEIRQ5+SLOTMAP):
+1. PUMPSEL-1646 = 0 - the pump NEVER selects a record. Option 1 ($8460 via pump/$836c) is
+   structurally out for bit4-clear (cont.286 byte-vs-word gate). Confirmed.
+2. DRAIN-70a0 = 1 @7.96, D3=0000 - $70a0 runs once (empty ledger, $6f44's only pass), never again.
+   The re-run gap. Confirmed.
+3. WSUBQ-7ebe = 3 (8->5); DISARM-7ed8 = 0.
+4. A/B (STORAGER_NOWALKSUBQ blocks the $7ebe subq): [$7956] STILL 0 at all 20 PARK36, [$7a64] STILL
+   0. => "the walk subq steals the counter" is REFUTED - the subq isn't the zeroer.
+
+The REAL zeroer: $7c02 move.w #$0,$7956 (in the walk, beside $7bf0 move #$0,$7428 the aim reset). So
+the walk RESETS [$7956] (and the aim) to 0 - it is NOT a capture-count drain. CORRECTION to cont.303:
+[$7956]=0 at the park is 8->5 (subq x3) then 5->0 by the $7c02 RESET, not 8 sectors counted down. The
+"$8460 unpark condition met" is thus partly a reset artifact, not a genuine capture completion - less
+close than cont.303 read it.
+
+HONEST STATE: both unpark paths remain blocked. $3dbc needs [$7a64] via $70a0's zero-LANDING (sub.w
+D3 hitting 0 with D3>0), but $70a0 runs once with D3=0 (empty) and $6f44 never re-runs (park gate);
+$8460's condition is (artifactually) met but its handler $836c is off-route (pump never selects,
+structural). Neither Dave option is clean: option 1 structural-out, option 2's "walk steals" refuted
++ the re-run gap remains. NEXT (fresh read, not derived): what gates $7c02 (why the walk resets
+[$7956]/aim mid-read), and whether $70a0 could ever land the zero with a populated ledger - since the
+walk reset + the D3=0 empty pass are the two things keeping [$7a64] unset. This region has been
+mis-mapped repeatedly; read $7bf0-$7c34 (the walk reset gate) before deriving the next edge.
