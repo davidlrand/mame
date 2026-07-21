@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -3324,6 +3324,29 @@ void multibus_storager_device::device_start()
 				[this](offs_t,u16&d,u16){ logerror("W71B6 <- %04x pc=%06x @%.6f\n", d, m_cpu->pc(), machine().time().as_double()); });
 			m_cpu->space(AS_PROGRAM).install_write_tap(0x7a3e, 0x7a41, "w7a3e",
 				[this](offs_t o,u16&d,u16){ logerror("W%04x <- %04x pc=%06x @%.6f\n", unsigned(o), d, m_cpu->pc(), machine().time().as_double()); });
+		}
+		// cont.285 (Dave's REDISP): after op-36 parks (phase $A), does the dispatcher $2250 loop
+		// back and dispatch $A (run the pump), or exit to the main loop? What re-enters it? Run on
+		// BASELINE. Outcome A: DISP-LOOP/PH-READ fire after PARK36 but PUMP doesn't -> phase-cell
+		// placement bug (pure state fix). Outcome B: DISP-LOOP stops after PARK36 -> dispatcher
+		// exits, command off-list; need the re-queue trigger the gate array returns.
+		if (storager_getenv("STORAGER_REDISP"))
+		{
+			auto snap = [this](char const *tag) {
+				address_space &s = m_cpu->space(AS_PROGRAM);
+				logerror("%s ph7216=%04x 7424=%04x cmd=%02x pc=%06x @%.6f\n",
+					tag, s.read_word(0x7216), s.read_word(0x7424), m_iopb_cmd, m_cpu->pc(), machine().time().as_double());
+			};
+			static int s_rcap[6] = {};
+			struct rsite { u32 a; char const *t; };
+			int ridx = 0;
+			for (rsite pr : { rsite{0x2244,"DISP-ENTER"}, rsite{0x2250,"DISP-LOOP "}, rsite{0x2258,"PH-READ   "},
+				rsite{0x159c,"PARK36    "}, rsite{0x15fe,"PUMP      "} })
+			{
+				m_cpu->space(AS_OPCODES).install_read_tap(pr.a, pr.a|1, pr.t,
+					[snap, t = pr.t, i = ridx, this](offs_t,u16&,u16){ if(machine().time().as_double()<7.9)return; if(s_rcap[i]++ < 250) snap(t); });
+				ridx++;
+			}
 		}
 		// cont.123 (STRIP): the $92b4 INVOCATION ROUTE - the toggler bank ($2970/$297e/
 		// $298c: bchg #0,$7950; old-bit routes ID/DATA) + [$7940]/[$7950] state. Read1's

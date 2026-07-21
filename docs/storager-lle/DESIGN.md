@@ -6337,3 +6337,35 @@ $3dbc / $7286-activation are all downstream of that one missing return-of-state.
 off the normal path for this options-0x00 read: (primary) the re-dispatch wake, (secondary) the
 [$71b6] install. Open for Dave: name the exact completion the op-42 channel arm waits on (the
 $6bc2/[$798e] path and what a real gate array returns to wake the scheduler).
+
+## cont.285 (2026-07-21) — REDISP: re-dispatch WORKS; the sole blocker is the pump's byte-vs-word phase-gate
+
+Ran Dave's STORAGER_REDISP on baseline. Read-window (t>=7.9) counts:
+  DISP-ENTER($2244)=0  DISP-LOOP($2250)=250  PH-READ($2258)=250(ph7216=000a=$A)
+  PARK36($159c)=0  PUMP($15fe)=250
+Setup phase (6.40-6.43) all fire too incl PUMP; PARK36 stamped phase $A back there.
+
+RESULT = a THIRD outcome, cleaner than Dave's A/B: the dispatcher IS looping, reads the phase as
+a WORD and correctly gets $A ($2258 move.w ($26,A0),D0 -> $000A), and DISPATCHES THE PUMP -- the
+pump runs 250x. So re-dispatch WORKS (Outcome B "dispatcher exits / needs a re-queue trigger" is
+REFUTED; no interrupt/wake needed) and the dispatcher's own phase read is fine. The block is
+INSIDE the pump: PUMPFOUND($1646)=0 -- it never selects a record.
+
+Mechanism (same run, DESCTRACE cross-check): the pump's record-select gate is a BYTE read
+  $161c/$162a: cmpi.b #$a,($26,A1)
+For the read's record slots (all A0<=$72e2) the LOW gate is used, A1=[$71bc]=$71f0, and
+GATEB shows byte[$71f0+$26]=$00 (40x). But the op-36 park wrote the phase as a WORD $000A
+(big-endian: byte[$26]=$00 MSB, byte[$27]=$0A LSB). So: dispatcher WORD-reads $71f0+$26 -> $A
+(works); pump BYTE-reads $71f0+$26 -> $00 (fails, never == $a) -> PUMPFOUND=0 -> no +6 handler,
+no $3dbc unpark. The HIGH gate ([$71b6]) is never reached (walk stays low) and is null anyway
+(options-0x00, $1144 install skipped).
+
+So Gate 1 = the cont.253 phase-byte-gate, now the PRIMARY and only remaining blocker. It is pure
+state, NO interrupt -- the clean floor Dave predicted. OPEN for Dave: the park writes the phase as
+a WORD at $71f0+$26 (byte[$26]=$00, byte[$27]=$0A); the pump byte-reads offset $26 and needs $a.
+Is the model placing/parking the phase at the wrong offset/width, should the pump node [$71bc]
+point one byte higher (so +$26 hits the LSB $0A), or is [$71b6] supposed to be installed for this
+read and point at a node whose byte[$26]=$a? Name which, and it's a small pure-state edit.
+
+(Note: RTC-seeded flake -- cont.284's run had PUMP absent at t>=7.9; this run PUMP fires 250x.
+But when it runs it selects nothing, so the phase-byte-gate is the true blocker either way.)
