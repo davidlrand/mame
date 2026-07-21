@@ -4482,6 +4482,20 @@ void multibus_storager_device::device_start()
 							xs.read_word(0x7956), xs.read_word(0x7a64), xs.read_word(0x7b10), xs.read_word(0x7426),
 							xs.read_dword(0x7958), xs.read_word(0x72e2), xs.read_word(0x7428), t);
 						logerror("  ^%s D3=%04x 741c=%04x\n", name, u16(m_cpu->state_int(M68K_D3)), xs.read_word(0x741c)); } });
+		// cont.305 (Dave's Part A): read inventory + arming + completion. Control = $89f2 (must fire).
+		// Per PC log m_iopb_cmd (the command) so we can correlate: which cmds reach $9400 (armed) and
+		// which complete ($1a54=0x80) vs stall ($184e=0x82). No time gate - catch all commands.
+		for (auto ent : { std::pair<u16, char const *>{0x89f2, "PA-CTL"},
+			{0x24aa, "PA-DOORBELL"}, {0x1a54, "PA-DONE80"}, {0x184e, "PA-ERR82"},
+			{0x9400, "PA-ARM9400"}, {0x9412, "PA-INST5fc0"}, {0x940a, "PA-INST6102"},
+			{0x739a, "PA-ARM79ae"}, {0x6ed6, "PA-ARM7b10"}, {0x1144, "PA-INST71b6"} })
+			m_cpu->space(AS_OPCODES).install_read_tap(ent.first, ent.first | 1, ent.second,
+				[this, name = ent.second](offs_t, u16 &, u16)
+				{ static std::map<std::string, int> pc; if (pc[name]++ >= 24) return;
+					address_space &xs = m_cpu->space(AS_PROGRAM);
+					logerror("PARTA %-12s cmd=%02x 71bc=%04x 799a=%04x uib20=%04x @%.5f\n", name,
+						m_iopb_cmd, xs.read_word(0x71bc), xs.read_word(0x799a),
+						xs.read_word((xs.read_word(0x799a) + 0x20) & 0xffff), machine().time().as_double()); });
 		// cont.304 (Dave's A/B): suppress the WALK's [$7956] subq ($7ebe) so $70a0/$6f44 can own the
 		// counter - isolates whether "the walk steals the counter" is the true half of the coupling.
 		m_cpu->space(AS_PROGRAM).install_write_tap(0x7956, 0x7957, "nowalksubq",

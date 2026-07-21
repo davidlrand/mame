@@ -6846,3 +6846,24 @@ structural). Neither Dave option is clean: option 1 structural-out, option 2's "
 [$7956]/aim mid-read), and whether $70a0 could ever land the zero with a populated ledger - since the
 walk reset + the D3=0 empty pass are the two things keeping [$7a64] unset. This region has been
 mis-mapped repeatedly; read $7bf0-$7c34 (the walk reset gate) before deriving the next edge.
+
+## cont.305 (2026-07-21) — Part A read inventory: $9400 NEVER reached (outcome 2); INIT(87)/89 COMPLETE, read(95) doesn't; 95 IS armed
+
+Control-checked (PA-CTL=24). Part A (doorbell + completion + arming census):
+A1 - the monitor issues 4 commands: 00, 87(INIT), 89, 95(READ) @0.4-1.35s. ONLY ONE read (0x95).
+A2 - cmd=87(INIT) and cmd=89 COMPLETE (0x80 at $1a54); cmd=95(READ) does NOT. Zero 0x82. => 87/89
+     are the golden reference we've lacked - firmware commands that complete.
+A3 - $9400 (PA-ARM9400) is NEVER reached by ANY command; $5fc0/$6102 never installed via $9412/$940a.
+     => Dave's OUTCOME 2: $9400 is NOT this firmware's read path; the arming-via-$9400 hypothesis is
+     REFUTED. BUT the read IS armed: [$79ae] (PA-ARM79ae=1) and [$7b10] (PA-ARM7b10=2) fire for cmd=95
+     via NON-$9400 paths (so $6ed2/$739a have callers other than $948e - corrects cont.301). [$71b6]
+     never installs (bit4-clear, cont.286).
+
+So the divergence is NOT arming - the read IS armed. 87/89 complete WITHOUT data transfer (INIT/seek
+class); the read (95) is armed but its DATA-TRANSFER completion stalls (the park/pump/re-run maze).
+The reference (87/89 -> $1a54) is a NON-data completion, so it may not diff usefully against a data
+read. NEXT: (a) is there a completing DATA path anywhere (v1.80/sgic, or does 0x95 ever complete in
+any config)? (b) trace 87/89's path to $1a54 and see which step the armed-but-stalled 95 diverges at.
+The read being ARMED (flags set) yet stalled at data-transfer completion re-centers on the transfer
+itself, not the dispatch/arm - i.e. back to the two-event contract (stake OK, convert blocked by the
+$6f44 re-run gap, cont.301-304), now known to be downstream of a correctly-armed read.
