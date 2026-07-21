@@ -6676,3 +6676,25 @@ builder: $6f44 was starved of a populated map; ONEIRQ5 now populates it via the 
 
 NEXT: census $6ff0/$726c (c0-convert) + $6f44 entry with the f0 fill-map present - does the transfer
 builder now convert f0->c0 and advance the aim? Control-checked taps in the ~4438 block.
+
+## cont.298 (2026-07-21) — the convert's ENCODING MISMATCH: stake writes f0 (negative), $6f44 wants POSITIVE
+
+Convert-path census (control CTL-89f2=20; staking runs): STAKE-92f6=3, BUILD-6f44=2 (the transfer
+builder RUNS), but CONV-6ff0=0 / CONV-726c=0 / CONV-9362=0 - NO c0-convert fires. Ledger stays f0.
+
+DISASM (the convert gate $6fda-$6ff0, the floppy c0-convert inside $6f44):
+  $6fdc: D4 = (A0)+ (ledger byte); $6fde: bge $6fe8  -> POSITIVE (bit7=0) converts to c0 at $6ff0
+  $6fe0: move.b #$ff,(-1,A0)  -> NEGATIVE resets to ff (re-wanted)
+=> $6f44/$6ff0 converts only POSITIVE ledger entries. The stake $9312 writes #$f0 = NEGATIVE. So
+$6f44 sees the f0 stakes, takes the negative branch, and RESETS them to ff. The capture cycles:
+stake->f0 -> $6f44 resets->ff -> re-stake->f0 -> ... never c0, aim never advances. This is the
+mechanism behind "stake fires but convert doesn't" (cont.297) and the ff-dominated ledger.
+
+So the two-event contract has an ENCODING GAP for the floppy: STAKE writes f0 (negative) but the
+TRANSFER-BUILDER $6f44 wants a POSITIVE slot number. cont.276 FILLMAP (write positive slot#) was
+papering over exactly this - which is also why FILLMAP "helped capture complete" (cont.291): it fed
+$6f44 the positive bytes it wants. The real question (Dave's ledger-lifecycle domain): where is f0
+SUPPOSED to become positive between the stake and $6f44? Candidates: an intermediate FE-leg/scan
+step ($7e1e/$7e90) that rewrites f0->slot#, or the capture-stake for the floppy should write the
+slot# not f0, or $6f44's input pointer/base is off so it reads the wrong cells. NEXT: find who (if
+anyone) writes a POSITIVE slot# to $7654 on the floppy path - that's the missing f0->positive step.
