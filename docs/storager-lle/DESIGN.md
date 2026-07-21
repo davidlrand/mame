@@ -7064,3 +7064,19 @@ watch-records, no per-sector stake) so the bulk completion path - proven end-to-
 clean. NEXT: the setup mode-select - what builds the watch-record list ($3980 region, cont.282) and
 runs the stake, and what would route the read to bulk instead (the DESCGO/$417a arm vs the per-sector
 $727e build). The completion is architecturally solved; the finish is making setup choose bulk.
+
+## cont.314 (2026-07-21) — the read does NOT reach the $40c2 mode-fork / $3980 build; [$72d6] built at $37ae (different setup path)
+
+Census (control CTL=20, addresses verified: $3980=move.w A3,$72d6; $40c2=btst #$b,D0; $4122=bset
+#0,$7a1a): the read NEVER reaches MODEFORK-40c2=0, BULKARM-4122=0, WRBUILD-3980=0, DISC-3920=0 -
+ungated (from t=0), while PARK36=20/OP4A=2 fire (block works). So the read's setup does NOT go through
+the $3900/$40c2 mode-select Dave traced. And there is a SECOND [$72d6] setter: $37ae (also move.w
+A3,$72d6). So [$72d6]=$727e is built at $37ae, not $3980.
+
+=> Like the pump/$9400/$82b2 before it, the $40c2/$3980 mode-select is a path this read doesn't take.
+The read's actual setup builds the watch-records at $37ae (the $3700 region), and never evaluates the
+bit11 bulk-vs-per-sector fork at $40c2. So the mode-select framing (cont.313's "route as bulk at
+$40c2") is for a variant the read doesn't use. The read's real setup path ($37ae builder) is the one
+to read. NEXT: what is the $37ae region ($3700 builder), what arm does IT do (bulk/DESCGO or
+per-sector), and is ITS mode-select the bit11 or a different discriminant. The completion is still
+architecturally proven (cont.312); the setup that routes THIS read is the $37ae path, not $3900/$40c2.
