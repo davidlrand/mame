@@ -6425,3 +6425,37 @@ op-4a on capture-complete); (b) [$7956] is the transfer counter $70a0 owns -- Ga
 walk decrementing it is on the wrong path and steals the zero-landing; the walk should move off
 [$7956] (or not run once the transfer path is active). #1 is primary: even without the walk, $6f44
 at fillpos=0 drains nothing.
+
+## cont.288 (2026-07-21) — R7426: completion needs the walk's $fe-terminator MISMATCH path; Gate 2's aim-match starves it
+
+Ran Dave's STORAGER_R7426 on baseline + traced the walk. The single completion gate is $808a
+(routes to $82e2 ledger-scan ISR -> $6f44 re-run -> $3dbc unpark IF [$7426]!=0; else $810e
+dead-end). Findings:
+  GATE808a  27  (all see 7426=0 -> DEAD810e 27x; boundary hit fillpos=8 7dac=fe 7daf=08 7426=0)
+  SET-7cac   0  (the TERMINAL accept that STICKS -- never fires)
+  SET-7d62 268  (sets 7426=1 but $7f1a clr.w $7426 on the scan path wipes it before $808a)
+  SCAN82e2   1  (ran once @8.144 with fillpos=0 -- empty map)
+  $7f1a: clr.w $7426  (confirmed the Gate-2 scan clear)
+
+The terminal accept $7cac is reached ONLY via the walk's MISMATCH path:
+  $7c34: tst [$79ae]; beq $7ce6            <- [$79ae]==0 -> generic path (taken 249/250)
+  $7c40: A0=capture ptr; D0=captured byte
+  $7c46: cmp [$7436],D0; beq $7c52         <- MATCH stays in walk
+  $7c50: bra $7c70                         <- MISMATCH -> $7c70
+  $7c70: cmpi.b #$fe,$7daf; beq $7c84      <- terminator
+  $7c7a: cmpi.b #$fe,$7dac; bne $7d4a      <- ([$7dac]==$fe also routes to accept)
+  $7c84 -> $7ca4 -> $7cac: move.w #$1,$7426  (TERMINAL, bypasses $7f1a)
+Runtime: WALK34=250, P-7ce6=249, MATCH52=1, MISS50=0, DEC7c70=0. The walk bails to $7ce6 via
+[$79ae]==0 EVERY sector -- never reaches the compare, so never mismatches, so never reaches the
+terminator accept. And even the compare path needs a MISMATCH ($fe terminator) which Gate 2's
+aim-match would deny.
+
+ROOT (the Gate-2 coupling, exact): completion requires the window-boundary sector to (a) have
+[$79ae]!=0 so the walk does the terminator compare, and (b) present the $fe terminator (a
+MISMATCH vs [$7436], and/or [$7daf]/[$7dac]==$fe) so it routes $7c50->$7c70->$7c84->$7cac, setting
+[$7426]=1 on the STICKING path (not $7d62, which $7f1a clears). Gate 2 (cont.282) made every sector
+aim-MATCH to grind [$7956]/fix the aim -- which is precisely what denies the boundary mismatch and
+starves $7cac. This is Dave's shape-1 "detection is capture": the model must stage the $fe
+terminator mark at capture-complete/window-close (and ensure [$79ae] gates the compare) so the
+firmware's own walk completes. Pure boundary-state, no injected interrupt. Await Dave's exact
+one-site edit (couples with Gate 2 -- must not re-break the aim).

@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -3394,6 +3394,38 @@ void multibus_storager_device::device_start()
 				m_cpu->space(AS_OPCODES).install_read_tap(pr.a, pr.a|1, pr.t,
 					[snap, t = pr.t, i = xidx](offs_t,u16&,u16){ if(s_xcap[i]++ < 300) snap(t); });
 				xidx++;
+			}
+		}
+		// cont.288 (Dave's R7426): the single completion gate. $808a: tst [$7426]; ==0 -> $810e
+		// (dead-end per-sector closer), !=0 -> ... -> $82e2 (ledger-scan ISR) -> $7106/$6f44 re-run
+		// (full map, [$7956]=0, [$7a64]=1) -> $3dbc UNPARK. [$7426]=1 is set at $7cac ($fe-terminator
+		// ID-verify tail) or $7d62 (walk generic tail); Gate 2 clears it at $7f1a and never reaches
+		// $7d62. Which setter should the read hit at the window boundary? Run on BASELINE.
+		if (storager_getenv("STORAGER_R7426"))
+		{
+			auto snap = [this](char const *t){ address_space &s = m_cpu->space(AS_PROGRAM);
+				int p = 0; for (int k = 1; k <= 8; k++) if (!(s.read_byte(0x7654 + k) & 0x80)) p++;
+				logerror("%s 7426=%04x 7daf=%02x 7dac=%02x aim7428=%04x fillpos=%d pc=%06x @%.6f\n",
+					t, s.read_word(0x7426), s.read_byte(0x7daf), s.read_byte(0x7dac), s.read_word(0x7428),
+					p, m_cpu->pc(), machine().time().as_double()); };
+			for (auto wp : { std::pair<u32,char const*>{0x7c34,"WALK34"},{0x7ce6,"P-7ce6"},{0x7c52,"MATCH52"},{0x7c50,"MISS50"} })
+				m_cpu->space(AS_OPCODES).install_read_tap(wp.first, wp.first|1, wp.second,
+					[this,t=wp.second](offs_t,u16&,u16){ static int c=0; if(c++<500){ address_space &s=m_cpu->space(AS_PROGRAM);
+						logerror("%s 7436=%04x 7daf=%02x 7dac=%02x @%.6f\n", t, s.read_word(0x7436), s.read_byte(0x7daf), s.read_byte(0x7dac), machine().time().as_double()); } });
+			m_cpu->space(AS_OPCODES).install_read_tap(0x7c70, 0x7c71, "DEC7c70",
+				[this](offs_t,u16&,u16){ static int c=0; if(c++<60){ address_space &s=m_cpu->space(AS_PROGRAM);
+					int p=0; for(int k=1;k<=8;k++) if(!(s.read_byte(0x7654+k)&0x80)) p++;
+					logerror("DEC7c70 7daf=%02x 7dac=%02x (fe->7cac ACCEPT / else 7d62) fillpos=%d aim=%04x @%.6f\n",
+						s.read_byte(0x7daf), s.read_byte(0x7dac), p, s.read_word(0x7428), machine().time().as_double()); } });
+			static int s_gcap[6] = {};
+			struct gsite { u32 a; char const *t; };
+			int gidx = 0;
+			for (gsite pr : { gsite{0x808a,"GATE808a"}, gsite{0x7cac,"SET-7cac"}, gsite{0x7d62,"SET-7d62"},
+				gsite{0x82e2,"SCAN82e2"}, gsite{0x810e,"DEAD810e"} })
+			{
+				m_cpu->space(AS_OPCODES).install_read_tap(pr.a, pr.a|1, pr.t,
+					[snap, t = pr.t, i = gidx](offs_t,u16&,u16){ if(s_gcap[i]++ < 300) snap(t); });
+				gidx++;
 			}
 		}
 		// cont.123 (STRIP): the $92b4 INVOCATION ROUTE - the toggler bank ($2970/$297e/
