@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP", "STORAGER_NOWALKSUBQ" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP", "STORAGER_NOWALKSUBQ", "STORAGER_BULKRERUN" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -388,6 +388,7 @@ private:
 	bool m_aim_deposited[17] = {};    // cont.257i
 	u64  m_read_hostmap = 0;          // cont.257t: bitmap of the read's logical blocks delivered
 	std::vector<u8> m_win_buf;        // cont.281 FAITHXFER: the gate-array SERDES window buffer the fw's $748a transfer DMAs to host
+	bool m_bulk_rearmed = false;      // cont.311: one-shot per read - [$7b10] re-armed once the window is full (convergence test)
 	                                  // by the single position-keyed host-DMA path (bit n = the
 	                                  // block at host+n*ssz). Reset per read window (DESCARM);
 	                                  // when all total/ssz blocks are set, the read is complete.
@@ -806,6 +807,18 @@ private:
 								if (storager_getenv("STORAGER_FILLMAP"))
 									m_cpu->space(AS_PROGRAM).write_byte((0x7654 + n + 1) & 0xffff, u8(m_flux_r & 0x7f));
 								u64 const full = (nblk >= 64) ? ~u64(0) : ((u64(1) << nblk) - 1);
+								// cont.311 (Dave's convergence test): the window is captured (SLOTMAP populated the
+								// ledger). Re-arm the fw's $6f44 re-run trigger [$7b10] ONCE so the walk re-runs $6f44
+								// against the FULL ledger -> $70a0 D3=8 -> [$7956]==0 -> $70a6 sets [$7a64] -> the
+								// DESCGO/$3dbc completion ($4102 gates on [$7a64]!=0). Tests whether [$7a64] is the
+								// single root reachable via a full-ledger $6f44 pass (the bulk arm, no stake).
+								if (storager_getenv("STORAGER_BULKRERUN") && (m_read_hostmap & full) == full && !m_bulk_rearmed)
+								{
+									m_cpu->space(AS_PROGRAM).write_word(0x7b10, 0xffff);
+									m_bulk_rearmed = true;
+									if (storager_getenv("STORAGER_PHASELOG"))
+										logerror("BULKRERUN [$7b10] re-armed, ledger full @%.6f\n", machine().time().as_double());
+								}
 								if ((m_read_hostmap & full) == full && !storager_getenv("STORAGER_FAITHXFER"))
 								{   // baseline only: the synthetic window-done DESCDONE. Under FAITHXFER the fw's own arm+kick
 								    // drives IRQ4 per sector, so we must NOT fire this bare edge here.
@@ -7499,6 +7512,7 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 					m_depot_r.clear();   // cont.256w: deposits are per-transfer
 					for (auto &d : m_aim_deposited) d = false;   // cont.257i: per-window
 					m_read_hostmap = 0;   // cont.257t: per-window position-delivery coverage
+					m_bulk_rearmed = false;   // cont.311
 					m_win_buf.clear();   // cont.281 FAITHXFER: drop the prior read's window buffer
 					s_desc.base_trk = m_flux_track;
 					s_desc.ssz = m_unit_secsize[2] ? m_unit_secsize[2] : 128;

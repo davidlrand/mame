@@ -6987,3 +6987,29 @@ the sole remaining fault, and it gates EVERYTHING downstream. NEXT: the entire s
 [$7b10]/op-4a question) OR $70a0's single pass must see the ledger already populated (a timing/order
 question: $6f44 @7.96 is BEFORE captures @8.04). That timing gap - $6f44 before captures - is the
 concrete, finite root. Read whether $6f44 can be made to run after the window fills.
+
+## cont.311 (2026-07-21) — convergence test: the $6f44 re-run mechanism WORKS + reaches $3dbc; [$7a64] blocked only by incomplete ledger (D3!=8)
+
+STORAGER_BULKRERUN (experimental: re-arm [$7b10]=ffff once the window is full -> the walk re-runs
+$6f44 against the ledger). Tests whether [$7a64] is the single root reachable via a full-ledger $6f44.
+Result (control CTL=20):
+  stake-OFF (SLOTMAP only): BUILD-6f44 20x (was 2), DRAIN-70a0 20x (was 1), UNPARK-3dbc 20x (was 0!)
+    -> the re-run mechanism WORKS. BUT [$7a64]=0 always: $70a0 D3=0040(garbage), ledger c0 c0 02 ff..
+    (only ~1 slot# - the aim doesn't advance without the stake, so SLOTMAP writes ~1 position).
+  stake-ON: BUILD-6f44 4x, $70a0 D3=0/1/2 (never 8), [$7956]=8 never drains, [$7a64]=0, ledger
+    c0 ff c0 ff ff ff (2 c0). CHLAUNCH-4102=0, SET7454-413c=0.
+
+=> CONFIRMED: [$7a64] IS the single root (setter enumeration + this test), reachable via a $6f44
+re-run that reaches $70a0/$70a6 - and the re-run + $3dbc DO fire now. The ONLY remaining block:
+$70a0 needs D3==[$7956] (=8) in ONE pass to land [$7956]==0, but the ledger is NEVER fully populated
+at once - SLOTMAP writes ledger[aim] (aim covers few positions, $6f44 consumes/resets), so D3 per pass
+is 0/1/2, never 8. The full 8-sector window is never simultaneously present when $6f44 runs.
+
+THE FIX SHAPE (Dave's bulk architecture, now concrete): SLOTMAP should populate the FULL GEOMETRIC
+window (all 8 positions ledger[1..8]=slot#), NOT ledger[aim] - the aim-write (cont.299) was right for
+the multi-segment scan, WRONG for the bulk $6f44 which wants the whole window. All 8 geometric slot#s
+present + one $6f44 re-run -> D3=8 -> $70a0 lands [$7956]==0 -> $70a6 sets [$7a64] -> $4102 launch /
+$3dbc unpark -> 0x80. This is the capture-into-slots-then-bulk-$6f44 route, and the test proved every
+step downstream of a full ledger works. NEXT: SLOTMAP-geometric (all 8) + BULKRERUN -> does D3=8 and
+[$7a64] set. (BULKRERUN's [$7b10] re-arm is the experimental stand-in for the faithful re-run trigger
+- the channel-complete IRQ4/the capture-complete that a real controller raises after the window.)
