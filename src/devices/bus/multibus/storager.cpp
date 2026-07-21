@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -3347,6 +3347,30 @@ void multibus_storager_device::device_start()
 					[snap, t = pr.t, i = ridx, this](offs_t,u16&,u16){ if(machine().time().as_double()<7.9)return; if(s_rcap[i]++ < 250) snap(t); });
 				ridx++;
 			}
+		}
+		// cont.286 (Dave's OPTBIT4, adapted): the [$71b6] install ($1144) is gated by btst #4,D5
+		// where D5=[UIB+$20], written from D6 = the $92 op-descriptor FLAGS word (A1=$92+cmd*4) --
+		// so bit4 is a per-COMMAND ROM flag, NOT a host-IOPB options field. Observe whether the boot
+		// read command's descriptor sets bit4 (-> high-gate/[$71b6] install) or clears it (-> low gate).
+		if (storager_getenv("STORAGER_OPTBIT4"))
+		{
+			// $0e0e: btst #4,D6 (D6 = the $92-descriptor flags for this command)
+			m_cpu->space(AS_OPCODES).install_read_tap(0x0e0e, 0x0e0f, "DESC-BIT4",
+				[this](offs_t,u16&,u16){ static int c=0; if(c++<24){
+					u16 d6 = u16(m_cpu->state_int(M68K_D6));
+					logerror("DESC-BIT4 cmd=%02x D6=%04x bit4=%d D1=%04x pc=%06x @%.6f\n",
+						m_iopb_cmd, d6, BIT(d6,4), u16(m_cpu->state_int(M68K_D1)), m_cpu->pc(), machine().time().as_double()); } });
+			// $113c: btst #4,D5 (D5 = [UIB+$20]) -- the actual $71b6-install guard
+			m_cpu->space(AS_OPCODES).install_read_tap(0x113c, 0x113d, "INST-BIT4",
+				[this](offs_t,u16&,u16){ static int c=0; if(c++<24){
+					u16 d5 = u16(m_cpu->state_int(M68K_D5));
+					logerror("INST-BIT4 cmd=%02x D5=%04x bit4=%d -> %s71b6 pc=%06x @%.6f\n",
+						m_iopb_cmd, d5, BIT(d5,4), BIT(d5,4)?"INSTALL ":"SKIP ", m_cpu->pc(), machine().time().as_double()); } });
+			// confirm the install actually runs (or not)
+			m_cpu->space(AS_OPCODES).install_read_tap(0x1144, 0x1145, "INSTALL1144",
+				[this](offs_t,u16&,u16){ static int c=0; if(c++<8){ address_space &s=m_cpu->space(AS_PROGRAM);
+					logerror("INSTALL1144 (71b6<-A3) cmd=%02x 71b6=%04x pc=%06x @%.6f\n",
+						m_iopb_cmd, s.read_word(0x71b6), m_cpu->pc(), machine().time().as_double()); } });
 		}
 		// cont.123 (STRIP): the $92b4 INVOCATION ROUTE - the toggler bank ($2970/$297e/
 		// $298c: bchg #0,$7950; old-bit routes ID/DATA) + [$7940]/[$7950] state. Read1's

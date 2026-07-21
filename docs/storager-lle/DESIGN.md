@@ -6369,3 +6369,31 @@ read and point at a node whose byte[$26]=$a? Name which, and it's a small pure-s
 
 (Note: RTC-seeded flake -- cont.284's run had PUMP absent at t>=7.9; this run PUMP fires 250x.
 But when it runs it selects nothing, so the phase-byte-gate is the true blocker either way.)
+
+## cont.286 (2026-07-21) — OPTBIT4: bit4 is a per-COMMAND ROM flag, CLEAR for the read -> not a fetch bug
+
+Dave's OPTBIT4 check, adapted after tracing the guard: the [$71b6] install ($1144) is gated by
+btst #4,D5 where D5=[UIB+$20], written at $0e7e from D6 = the $92 op-descriptor FLAGS word
+(A1=$92+cmd*4, D6=second word of the entry). So bit4 is a per-COMMAND ROM constant, NOT a
+host-IOPB options field -- the auto-fetch-fidelity theory does not apply.
+
+Runtime (baseline):
+  DESC-BIT4 cmd=95 D6=8c27 bit4=0    (read)
+  INST-BIT4 cmd=95 D5=8c27 bit4=0 -> SKIP 71b6
+  cmd=87 D6=0820 bit4=0 ; cmd=89 D6=0026 bit4=0    (none set bit4)
+  INSTALL1144 = 0 (never installs)
+
+=> [$71b6] is never installed for the read command BY ROM DESIGN. The read is NOT supposed to use
+the pump's high-gate. This is Dave's SECOND outcome: the options-0x00 / bit4-clear read does not
+complete via the pump/high-gate path at all.
+
+So the contradiction resolves the other way: the LOW gate byte-reads $71f0+$26 = word $000A ->
+$00 and structurally cannot match cmpi.b #$a either. Neither gate is the consumer for a bit4-clear
+read. Yet the firmware DID build op-36 into the read's ladder (OPLIST tail ..$42 $36 $00) and it
+parks at phase $A. OPEN, sharpened for Dave: what consumes the op-36 phase-$A park for a
+bit4-clear read (0x95), given neither the high-gate ([$71b6] uninstalled by ROM) nor the low-gate
+(byte[$71f0+$26]=$00 from the word write) can select the record? i.e. what is the real completion
+/ unpark path for a options-0x00 read, and is the model steering it onto the pump path wrongly, or
+starving that real path of a state it should return? The $3dbc unpark record ($7286) is activated
+at $3ef6/$40f8/$840a (channel-completion sites) -- likely the real path is a channel-completion
+that activates $3dbc directly, bypassing the pump.
