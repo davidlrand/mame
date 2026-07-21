@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -1377,6 +1377,12 @@ void multibus_storager_device::device_start()
 								logerror("REC-OPEN (742c match) pc=%06x @%.6f\n", m_cpu->pc(), machine().time().as_double()); }
 						}
 					});
+			m_cpu->space(AS_OPCODES).install_read_tap(0x15fe, 0x15ff, "PSELECT",
+				[this](offs_t,u16&,u16){ static int n=0; double t=machine().time().as_double(); if(t<7.9||n>=8)return; n++;
+					address_space &s = m_cpu->space(AS_PROGRAM);
+					logerror("PSELECT rec727e+6=%04x  71f0+26=%02x 71f0+27=%02x  [71bc]=%04x [71b6]=%04x  721a=%04x @%.6f\n",
+						s.read_word(0x7284), s.read_byte(0x71f0+0x26), s.read_byte(0x71f0+0x27),
+						s.read_word(0x71bc), s.read_word(0x71b6), s.read_word(0x721a), t); });
 			m_cpu->space(AS_PROGRAM).install_write_tap(0x7956, 0x7957, "w7956",
 				[this](offs_t, u16 &data, u16)
 				{ static int wn = 0; if (wn++ < 400)
@@ -3266,6 +3272,34 @@ void multibus_storager_device::device_start()
 			}
 			m_cpu->space(AS_PROGRAM).install_write_tap(0x7b42, 0x7b43, "w7b42",
 				[this](offs_t, u16 &d, u16){ logerror("W7B42 <- %04x pc=%06x @%.6f\n", d, m_cpu->pc(),
+					machine().time().as_double()); });
+		}
+		// cont.283 (Dave's UNPARK): why doesn't [$7956]==0 reach the $8460 unpark? Run on BASELINE
+		// (FAITHXFER off) where [$7956] does drain 8->0. Unpark at $845c/$8460 fires the instant
+		// [$7956]==0 && [$7958]==0 && [$72e2]==0 -> +$26=$c on [$71bc]. F000 bit2 is on the $846a
+		// still-working branch, NOT a completion gate. Three outcomes: PUMPH never fires (handler
+		// off-route), PUMPH fires w/ [$7958]/[$72e2] nonzero (those are the gate), or UNPARK fires
+		// but hangs (block is downstream $3dbc/$1a54).
+		if (storager_getenv("STORAGER_UNPARK"))
+		{
+			address_space &os = m_cpu->space(AS_OPCODES);
+			auto snap = [this](char const *tag) {
+				address_space &s = m_cpu->space(AS_PROGRAM);
+				logerror("%s 7956=%04x 7958=%08x 72e2=%04x 791a=%04x 7a62=%04x ph7216=%02x pc=%06x @%.6f\n",
+					tag, s.read_word(0x7956), s.read_dword(0x7958), s.read_word(0x72e2), s.read_word(0x791a),
+					s.read_word(0x7a62), s.read_byte(0x7216), m_cpu->pc(), machine().time().as_double());
+			};
+			static int s_ucap[4] = {};
+			struct usite { u32 a; char const *t; };
+			int uidx = 0;
+			for (usite pr : { usite{0x8416,"PUMPH "}, usite{0x8428,"g7958 "}, usite{0x845c,"UNPARK"}, usite{0x846a,"WORK  "} })
+			{
+				os.install_read_tap(pr.a, pr.a|1, pr.t,
+					[snap, t = pr.t, i = uidx](offs_t,u16&,u16){ if (s_ucap[i]++ < 300) snap(t); });
+				uidx++;
+			}
+			m_cpu->space(AS_PROGRAM).install_write_tap(0x7956, 0x7957, "w7956",
+				[this](offs_t,u16&d,u16){ if((d & 0xffff)==0) logerror("W7956 <- 0 pc=%06x @%.6f\n", m_cpu->pc(),
 					machine().time().as_double()); });
 		}
 		// cont.123 (STRIP): the $92b4 INVOCATION ROUTE - the toggler bank ($2970/$297e/

@@ -6275,3 +6275,37 @@ conf R" -- likely wrong). Piece 2 should then key on the E800 write from the SEG
 Instrumentation added (all env-gated STORAGER_PUMP836 / STORAGER_DESCTRACE, baseline untouched):
 PUMP836 six-site tap set + W7B42; DESCTRACE SEEK/SEEKok/SEEKgo/SEEKret, SETTLECHK/TIMERSCHD/
 SET7NOW/W7a36, LADOP handler-resolve, GATEA/GATEB/PUMPFOUND/PUMP36/OP36.
+
+## cont.283 (2026-07-21) — UNPARK trace: outcome #1 (handler off-route); [$7956] underflows past 0
+
+Ran Dave's STORAGER_UNPARK on BASELINE (FAITHXFER off, the case where the walk drains [$7956]).
+Killed the IRQ4-bootstrap/F000-bit2 story (Dave's correction): the unpark at $845c/$8460 fires
+the instant [$7956]==0 && [$7958]==0 && [$72e2]==0 -> +$26=$c on [$71bc]; F000 bit2 ($8472) is
+on the $846a still-working branch, NOT a completion gate.
+
+Result = Dave's outcome #1: **PUMPH ($8416/$836c) never fires; the pump $15fe never runs in the
+read window at all** (PSELECT/PUMP36 empty). The unpark handler is simply not on the read's
+executed route. W7956<-0 only at setup (t=0.01-0.14); the drain-to-0 is the parallel $7c34 IRQ6
+ID-walk. CPU spins in the $2axx scheduler/timer area (SPINFLAG pc=$2aac/$2afa/$2b8a).
+
+Authoritative RUNTIME record layout (WAITDUMP @12s) -- SUPERSEDES the disasm read of $3990 (that
+was the BUILD-time +6=$836c; firmware phase-swaps the handler):
+  [$72d6]=727e {+0=0000 +2=0248 +6=$7964}   pump-eligible (+0==0) but phase-gated
+  [$72d8]=7286 {+0=ffff +2=0248 +6=$3dbc}   <- the UNPARK-POSTER, but +0=$ffff -> pump SKIPS it ($160e tst+bne)
+  [$72da]=728e {+0=0000 +2=7208 +6=$9188}   pump-eligible but phase-gated
+  [$72dc]=7296 {+0=ffff +2=0248 +6=$94ec}   skipped (+0=ffff)
+  [$72de]=729e {+0=ffff +2=0248 +6=$9984}   skipped
+  [$72e0]=72a6 {+0=ffff +2=0248 +6=$9398}   skipped
+  71b6=0000 st=02  71bc=71f0 st=00  727c=72d6
+
+Phase-gate dead: NODE71F0+$26 = word $000a -> byte[$26]=$00 (st=00). op-ladder op-$36 park writes
+the phase as a WORD ($159c/$15a0 move.w #$a,($26,A2)); the pump reads it as a BYTE
+(cmpi.b #$a,($26,A1)) at offset $26 = big-endian MSB = $00. Never matches.
+
+[$7956]=$ffed at 12s -- underflowed PAST 0 into negative: the walk decrements but the ==0 unpark
+check lives in a handler that never runs, so it over-decrements (two-consumer split, at the limit).
+
+OPEN question for Dave (the real dispatch question outcome #1 points to): what is supposed to
+(a) run the pump $15fe during the read, (b) ACTIVATE the $3dbc unpark record (+0: ffff->0) and/or
+(c) satisfy the pump phase-gate (byte[$71f0+$26]==$a) -- so the pump calls $3dbc / the [$7956]==0
+unpark actually executes. The $3dbc record being +0=$ffff (pump-skipped) is the cleanest lead.
