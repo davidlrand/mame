@@ -6516,3 +6516,29 @@ bytes satisfy $6f44 but break the scan's boundary dispatch. Also seen: $7d62 set
 tail runs); 7956 underflowed to fffa. Open for Dave to read: whether the real route is the scan
 (and FILLMAP's positive bytes are actively breaking it), or the model owes an arm/setup-time state
 that never got returned (why $9400 rw-setup / the $6f44 consumer branch is off-route). No forward-map.
+
+## cont.291 (2026-07-21) — CORRECTION: NOHANDLER is a code label ($7d4a), not a fault; FILLMAP-off makes capture WORSE
+
+Ran Dave's step-1 A/B: FILLMAP OFF (AAFIX/FWDONE kept), census 8.3-9.5. Refutes the cont.290
+interpretation AND Dave's prediction:
+
+1. CORRECTION (mine): "LEGCEN NOHANDLER" is the model's LABEL for PC=$7d4a (source line 3804/3833:
+   {0x7d4a,"NOHANDLER"} / {0x7d4a,"IDAM-DEFAULT"}) = the walk's GENERIC/DEFAULT branch ($7c80 bne
+   $7d4a -> $7d62). It is NOT a fault and NOT caused by FILLMAP positive bytes. It fires 156x
+   (FILLMAP off) vs 128x (on) because it's just the normal walk path. cont.290's "positive bytes
+   break the scan" was a misread of an instrumentation label.
+
+2. FILLMAP-off ledger $7654: c0 c0 ff ff ff ff ff c0 c0 aa -- INCOMPLETE. positions ~2-6 stay ff
+   (wanted/uncaptured), never fully c0. The scan re-aims to the ff gaps forever; no clean c0..c0 aa.
+   With FILLMAP capture reached fillpos=8; without it capture is INCOMPLETE. So FILLMAP was helping
+   the capture COMPLETE, not merely adding positive bytes. Removing it is strictly worse.
+
+3. $1a54 (STAMP80) fired only at 6.4s (setup, aim=0), never in the read window. No 0x80, no boot.
+
+So the "simple scan route completes once freed of FILLMAP's positive bytes" hypothesis is refuted:
+the scan ($7d4a/$7d62) IS on-route (fires either way) but never completes because the ledger never
+reaches the terminal state - WITH FILLMAP the bytes are positive (not c0), WITHOUT it there are ff
+gaps. Neither is the clean c0..c0 aa the scan needs. The blocker is that CAPTURE never stamps all 8
+window positions to c0 on this route (positions 2-6 = the R9-R13 "00" data sectors stay ff without
+FILLMAP; with FILLMAP they went positive not c0). Open, factual: why do the middle window positions
+never reach c0 via the firmware's own $810e stamp? That is the next thing to READ (not forward-map).
