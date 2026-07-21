@@ -4477,9 +4477,9 @@ void multibus_storager_device::device_start()
 				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();
 					if (t > 7.9 && ac[name]++ < 20)
 					{ address_space &xs = m_cpu->space(AS_PROGRAM);
-						logerror("AIMCV %s 7428=%04x 7424=%04x ph=%02x 742c=%04x D0=%04x @%.5f\n", name,
-							xs.read_word(0x7428), xs.read_word(0x7424), xs.read_byte((xs.read_word(0x71bc)+0x26)&0xffff), xs.read_word(0x742c),
-							u16(m_cpu->state_int(M68K_D0)), t); } });
+						logerror("AIMCV %s 7956=%04x 7a64=%04x 7b10=%04x 7426=%04x 7958=%08x 72e2=%04x 7428=%04x @%.5f\n", name,
+							xs.read_word(0x7956), xs.read_word(0x7a64), xs.read_word(0x7b10), xs.read_word(0x7426),
+							xs.read_dword(0x7958), xs.read_word(0x72e2), xs.read_word(0x7428), t); } });
 		// cont.38 (STRIP): the $7654 SECTOR-MAP write-tap - the map codes ($c0/$f0/$fe/$ff/$aa)
 		// are the floppy engine's per-sector state language; each transition names its writer.
 		m_cpu->space(AS_PROGRAM).install_write_tap(0x7654, 0x7665, "secmap",

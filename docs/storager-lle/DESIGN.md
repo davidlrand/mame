@@ -6797,3 +6797,26 @@ now be satisfiable where it wasn't three sessions ago. NEXT: census the op-36 pa
 (what pass-one waits on: [$7956]/[$7a64]/$3dbc/the pump select), now with stakes+slot# present.
 Session arc: parity (cont.294) -> stake fires; SLOTMAP (cont.299) -> encoding correct; re-run is
 op-4a recurring (cont.301/302) -> gated on leaving the first op-36 park. The park exit is the finish.
+
+## cont.303 (2026-07-21) — FINISH LINE: [$7956] now DRAINS to 0; the $8460 unpark CONDITION is met, but the handler doesn't run
+
+Control-checked park-exit census (CTL-89f2=20; ONEIRQ5+SLOTMAP). THE KEY COLUMN:
+  [$7956] MOVES across the read: 8(17x) 7(7x) 6(7x) 5(91x) 0(23x) - it DRAINS now (impossible before
+  this session: nothing staked -> nothing to drain). At ALL 20 PARK36 hits: 7956=0000.
+  Park snapshot (x20): 7956=0000 7958=00000000 72e2=0000 7a64=0000 7426=0000 7428=0000
+=> Dave's outcome 1's key is MET: [$7956] drains to 0. And the $8460 unpark CONDITION
+([$7956]==0 && [$7958]==0 && [$72e2]==0, cont.283) is now SATISFIED at the park - the first time
+in the saga. BUT the read still parks, and [$7a64]=0 (the $3dbc gate).
+
+The nuance (cont.287 two-drain coupling, now decisive): [$7956] drained via the WALK subq ($7eb2),
+NOT via $6f44's $70a0 tail. $70a0 is what sets [$7a64] on its zero-landing (sub.w D3,[$7956]==0);
+the walk pre-drained [$7956] to 0, so $70a0 (if it ran) subtracts into negative and never sets
+[$7a64]. So the $3dbc path ([$7a64]-gated) can't fire. Meanwhile the $8460 path's condition IS met
+but its handler ($836c) doesn't run (cont.283: PUMPH=0, the handler is off-route).
+
+So the finish is ONE of: (a) make the $8460 unpark handler run now that its condition
+([$7956]/[$7958]/[$72e2] all 0) is finally met - re-read cont.283's "why $836c never runs" with the
+drained state; or (b) route [$7956] drain through $6f44/$70a0 (not the walk) so [$7a64] sets and
+$3dbc fires - the cont.287 "walk steals the counter" fix. Both are firmware-path reads, not pokes.
+Session arc COMPLETE to the gate: parity->stake, SLOTMAP->slot#, drain->0, unpark CONDITION met.
+The only thing between here and boot is which unpark handler acts on the now-satisfied condition.
