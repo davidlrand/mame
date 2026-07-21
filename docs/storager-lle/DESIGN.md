@@ -6397,3 +6397,31 @@ bit4-clear read (0x95), given neither the high-gate ([$71b6] uninstalled by ROM)
 starving that real path of a state it should return? The $3dbc unpark record ($7286) is activated
 at $3ef6/$40f8/$840a (channel-completion sites) -- likely the real path is a channel-completion
 that activates $3dbc directly, bypassing the pump.
+
+## cont.287 (2026-07-21) — XFERDRAIN: $6f44 consumes an EMPTY fill-map before capture; walk then steals [$7956]
+
+Ran Dave's XFERDRAIN on baseline. The read's completion path ($6f44 fill-map consumer, NOT the
+pump) DID execute -- once -- and it lands both of Dave's failure modes at once:
+
+  BUILD ($6f44)  7956=0000 fillpos=0  @7.963413  (x2, never again)
+  XFER  ($702e)  7956=0008 fillpos=0  @7.963464
+  DRAIN ($70a0)  7956=0008 fillpos=0  @7.963537   sub.w D3(=0),$7956 -> no change
+  WIN64 ($70a6)  7956=0008 fillpos=0  @7.963538   7956!=0 -> [$7a64] NOT set
+  WALK-- ($7ebe) 7956=0008->0003 @8.05-8.11 ... 7956=fff0 fillpos=7 7a64=0001 @11.5-11.9
+
+Outcome #1 (dominant): $6f44 runs at 7.963 with fillpos=0 -- the fill-map has NO positive slots
+yet -- so D3=0, $70a0 drains nothing, $70a6 sees 7956=8 and never sets [$7a64]. $6f44 fires
+exactly 2x (both @7.963413) and NEVER re-runs.
+Outcome #2 (compounding): the $7ebe walk then owns [$7956], draining 8->0->underflow fff0 over
+8.05-11.9, and the fill-map only reaches fillpos=7 by ~11.5 -- long after $6f44 consumed it empty.
+[$7a64] does reach 1 (via the walk path $825c, not $70a6) but the $3dbc unpark in the $6f44 path
+($70f4) never runs with a populated map, so no completion.
+
+Root: STATE-ORDERING. The model's flux capture populates the fill-map (via the IRQ6 $7ebe walk)
+AFTER the firmware's ladder reaches op-4a/$6f44, so $6f44 consumes an empty map. On real hardware
+capture-complete precedes $6f44. Two coupled fixes to weigh (Dave to pick): (a) the fill-map /
+capture-complete must precede $6f44's drain (deliver captured slots before op-4a runs, or gate
+op-4a on capture-complete); (b) [$7956] is the transfer counter $70a0 owns -- Gate 2's $7c34/$7ebe
+walk decrementing it is on the wrong path and steals the zero-landing; the walk should move off
+[$7956] (or not run once the transfer path is active). #1 is primary: even without the walk, $6f44
+at fillpos=0 drains nothing.

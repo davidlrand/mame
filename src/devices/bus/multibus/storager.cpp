@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -3371,6 +3371,30 @@ void multibus_storager_device::device_start()
 				[this](offs_t,u16&,u16){ static int c=0; if(c++<8){ address_space &s=m_cpu->space(AS_PROGRAM);
 					logerror("INSTALL1144 (71b6<-A3) cmd=%02x 71b6=%04x pc=%06x @%.6f\n",
 						m_iopb_cmd, s.read_word(0x71b6), m_cpu->pc(), machine().time().as_double()); } });
+		}
+		// cont.287 (Dave's XFERDRAIN): the read's completion is $6f44 (fill-map consumer), NOT the
+		// pump. $6f44 builds the xfer queue from POSITIVE ledger slots, $702e D3=blocks placed,
+		// $70a0 sub.w D3,$7956, $70a6 (if $7956==0) $7a64=1, $70f4 bsr $3dbc -> $3ef6 activates
+		// $7286 + $3e30 posts +$26=$c = UNPARK. Question: does $70a0 ever land $7956==0 with real
+		// D3, or does the $7c34/$7ebe walk pre-drain $7956 and steal the zero? Run on BASELINE.
+		if (storager_getenv("STORAGER_XFERDRAIN"))
+		{
+			auto snap = [this](char const *tag) {
+				address_space &s = m_cpu->space(AS_PROGRAM);
+				int pos = 0; for (int k = 1; k <= 8; k++) if (!(s.read_byte(0x7654 + k) & 0x80)) pos++;
+				logerror("%s 7956=%04x 7a64=%04x fillpos=%d pc=%06x @%.6f\n",
+					tag, s.read_word(0x7956), s.read_word(0x7a64), pos, m_cpu->pc(), machine().time().as_double());
+			};
+			static int s_xcap[6] = {};
+			struct xsite { u32 a; char const *t; };
+			int xidx = 0;
+			for (xsite pr : { xsite{0x6f44,"BUILD "}, xsite{0x702e,"XFER  "}, xsite{0x70a0,"DRAIN "},
+				xsite{0x70a6,"WIN64 "}, xsite{0x7ebe,"WALK--"} })
+			{
+				m_cpu->space(AS_OPCODES).install_read_tap(pr.a, pr.a|1, pr.t,
+					[snap, t = pr.t, i = xidx](offs_t,u16&,u16){ if(s_xcap[i]++ < 300) snap(t); });
+				xidx++;
+			}
 		}
 		// cont.123 (STRIP): the $92b4 INVOCATION ROUTE - the toggler bank ($2970/$297e/
 		// $298c: bchg #0,$7950; old-bit routes ID/DATA) + [$7940]/[$7950] state. Read1's
