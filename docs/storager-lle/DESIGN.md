@@ -6309,3 +6309,31 @@ OPEN question for Dave (the real dispatch question outcome #1 points to): what i
 (a) run the pump $15fe during the read, (b) ACTIVATE the $3dbc unpark record (+0: ffff->0) and/or
 (c) satisfy the pump phase-gate (byte[$71f0+$26]==$a) -- so the pump calls $3dbc / the [$7956]==0
 unpark actually executes. The $3dbc record being +0=$ffff (pump-skipped) is the cleanest lead.
+
+## cont.284 (2026-07-21) — LADWAIT: [$71b6] never installed; op-42 re-dispatched then scheduler idles
+
+Ran Dave's STORAGER_LADWAIT on baseline. Answers to his three questions:
+
+Q3 (does [$71b6] install for this read?): NO. W71B6 fires only at setup (t<=0.099, memset
+c8c8/c9c9). For the monitor's options-0x00 read, [$71b6]=0000 all read-window. Confirms the
+secondary gate (board notes: [$71b6] installed at $1144 only for IOPB options bit4) -- the pump's
+low-record eligibility (cmpi.b #$a,($26,[$71b6])) would read a null node and skip every record.
+
+Q2 (which completion cell does $6bc2 poll, satisfied?): op-42 handler $6bc2 = `tst.w $798e;
+blt $6cda` then channel/transfer setup off [$71bc]+$18 / [$799a] UIB. The ladder RE-DISPATCHES
+op-42 ~200x at 7.90-7.92; across all samples the cells [$7a3e]/[$7a40]/[$7a36] stay 0000 and
+never satisfy. (They ARE later written by the $2axx seek-settle timer callbacks -- SPINFLAG
+[$7a40]<-7360 @7.96 pc=$2aac, [$7a3e]<-0001 @9.79 pc=$2b8a -- but after $6bc2 stops looking.)
+
+Q1 (does [$7424] advance to 0x42/0x36 or stuck early?): the ladder walker $156a runs until ~8.3s
+and advances through the op-list toward the end (OPLIST@12: [cur]=7262, list tail ..$42 $36 $00).
+After ~8.3 NEITHER $6bc2 nor $156a runs -- the CPU idles in the $2axx TIMER-LIST scheduler
+($2aba/$2aac/$2afa), i.e. the scheduler has gone quiescent and nothing re-queues the parked
+(phase-$A) command into the dispatcher. Late activity reaches pc=$8344 ($3dbc-adjacent) @11.94.
+
+Net (Dave's doctrine read, confirmed): the firmware armed a read channel op and its scheduler
+parked waiting to be woken by a channel/operation-complete the model never returns; the pump /
+$3dbc / $7286-activation are all downstream of that one missing return-of-state. TWO things are
+off the normal path for this options-0x00 read: (primary) the re-dispatch wake, (secondary) the
+[$71b6] install. Open for Dave: name the exact completion the op-42 channel arm waits on (the
+$6bc2/[$798e] path and what a real gate array returns to wake the scheduler).

@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -3301,6 +3301,29 @@ void multibus_storager_device::device_start()
 			m_cpu->space(AS_PROGRAM).install_write_tap(0x7956, 0x7957, "w7956",
 				[this](offs_t,u16&d,u16){ if((d & 0xffff)==0) logerror("W7956 <- 0 pc=%06x @%.6f\n", m_cpu->pc(),
 					machine().time().as_double()); });
+		}
+		// cont.284 (Dave's LADWAIT): which ladder op is the read actually stuck on, and what
+		// completion cell does the $6bc2 (op-42) wait poll? Plus whether [$71b6] (record-eligibility,
+		// installed at $1144 only for IOPB options bit4) is ever set for this options-0x00 read.
+		// Run on BASELINE.
+		if (storager_getenv("STORAGER_LADWAIT"))
+		{
+			auto snap = [this](char const *tag) {
+				address_space &s = m_cpu->space(AS_PROGRAM);
+				logerror("%s 7424=%04x 7a3e=%04x 7a40=%04x 7a36=%04x 71b6=%04x 7286=%04x ph7216=%04x "
+					"7956=%04x pc=%06x @%.6f\n",
+					tag, s.read_word(0x7424), s.read_word(0x7a3e), s.read_word(0x7a40), s.read_word(0x7a36),
+					s.read_word(0x71b6), s.read_word(0x7286), s.read_word(0x7216), s.read_word(0x7956),
+					m_cpu->pc(), machine().time().as_double());
+			};
+			m_cpu->space(AS_OPCODES).install_read_tap(0x6bc2, 0x6bc3, "OP42",
+				[snap,this](offs_t,u16&,u16){ if(machine().time().as_double()<7.9)return; static int c=0; if(c++<400) snap("OP42 "); });
+			m_cpu->space(AS_OPCODES).install_read_tap(0x156a, 0x156b, "WALK",
+				[snap,this](offs_t,u16&,u16){ if(machine().time().as_double()<7.9)return; static int c=0; if(c++<400) snap("WALK "); });
+			m_cpu->space(AS_PROGRAM).install_write_tap(0x71b6, 0x71b7, "w71b6",
+				[this](offs_t,u16&d,u16){ logerror("W71B6 <- %04x pc=%06x @%.6f\n", d, m_cpu->pc(), machine().time().as_double()); });
+			m_cpu->space(AS_PROGRAM).install_write_tap(0x7a3e, 0x7a41, "w7a3e",
+				[this](offs_t o,u16&d,u16){ logerror("W%04x <- %04x pc=%06x @%.6f\n", unsigned(o), d, m_cpu->pc(), machine().time().as_double()); });
 		}
 		// cont.123 (STRIP): the $92b4 INVOCATION ROUTE - the toggler bank ($2970/$297e/
 		// $298c: bchg #0,$7950; old-bit routes ID/DATA) + [$7940]/[$7950] state. Read1's
