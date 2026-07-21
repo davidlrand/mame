@@ -6938,3 +6938,27 @@ exit-enable. NEXT: what restores [$79ba]==0 and [$741c]!=0 for the floppy after 
 7956 reach 0 at $822c - i.e. does the $82b2 precondition EVER align in one pass? Read [$79ba]'s clear
 ($a476, D0=0 case) and whether the 7 gates ever co-hold. This is the finish: one aligned $822c pass ->
 $82b2 -> [$7968]=1 -> [$742c] clear -> $9354 convert. Linear chain, no loop, SLOTMAP-independent.
+
+## cont.309 (2026-07-21) — DECIDER: the read is SINGLE-SEGMENT; the $82b2/$9354-via-[$742c] chain is the WRONG (multi-segment) exit
+
+Census (control CTL=20): $a476 fires EXACTLY ONCE @7.96 (setup, [$7956]=0, D0=8 -> sets [$79ba]=8,
+NOT a clear). Stakes ($931c) set [$79ba]=1 (3x). So [$79ba] is set (by stakes and $a476) and NEVER
+re-cleared to 0. => Dave's OUTCOME 1: the label read is SINGLE-SEGMENT (8 sectors, one track, no
+segment boundary to re-clear [$79ba]). The $82b2 precondition [$79ba]==0 is structurally
+unsatisfiable on this path.
+
+=> The whole $82b2/[$7968]/[$742c]/$9354-convert chain (cont.297-308) is the MULTI-SEGMENT/HD exit,
+NOT this read's completion route - the same class of error as the pump ($836c, cont.286) and $9400
+(cont.305): a different-variant path we walked a single-segment read down. cont.307's "$9354 is the
+floppy convert" holds for multi-segment; for the single-segment label read the f0->c0 convert via the
+[$742c]==0 fork is unreachable (gated on [$79ba]==0 which never holds).
+
+So a SINGLE-SEGMENT floppy read completes some OTHER way. What we know: (a) the read is stuck at the
+op-36 park (cont.302), never reaching op-00->phase-$c->$1a54; (b) the $8460 unpark CONDITION
+([$7956]==0 && [$7958]==0 && [$72e2]==0) IS met at the park (cont.303) but its handler $836c is
+off-route (pump never selects, structural); (c) INIT(87)/89 COMPLETE (Part A cont.305) - the
+reference for a simple single-command completion. NEXT (the real question, finite): how does a
+single-segment read post 0x80 - the op-36 park exit to op-00, or a single-segment completion that
+does NOT gate on [$79ba]/$82b2? Diff the read's op-36-stuck state against how 87/89 reach $1a54.
+The convert may not even be needed single-segment: staked f0 + [$7956]==0 + park-exit may be the
+whole completion. Stop chasing $82b2/$9354; find the single-segment exit.

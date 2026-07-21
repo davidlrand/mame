@@ -4481,9 +4481,9 @@ void multibus_storager_device::device_start()
 				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();
 					if (t > 7.9 && ac[name]++ < 20)
 					{ address_space &xs = m_cpu->space(AS_PROGRAM);
-						logerror("AIMCV %-14s 742c=%04x 7968=%04x 7426=%04x 79ba=%04x 741c=%04x aim=%04x ledgeraim=%02x @%.5f\n", name,
-							xs.read_word(0x742c), xs.read_word(0x7968), xs.read_word(0x7426), xs.read_word(0x79ba),
-							xs.read_word(0x741c), xs.read_word(0x7428), xs.read_byte((0x7654 + xs.read_word(0x7428)) & 0xffff), t);
+						logerror("AIMCV %-14s 7956=%04x 79ba=%04x 742c=%04x 7968=%04x 741c=%04x aim=%04x D0=%04x @%.5f\n", name,
+							xs.read_word(0x7956), xs.read_word(0x79ba), xs.read_word(0x742c), xs.read_word(0x7968),
+							xs.read_word(0x741c), xs.read_word(0x7428), u16(m_cpu->state_int(M68K_D0)), t);
 						logerror("  ^%s D3=%04x 741c=%04x\n", name, u16(m_cpu->state_int(M68K_D3)), xs.read_word(0x741c)); } });
 		// cont.305 (Dave's Part A): read inventory + arming + completion. Control = $89f2 (must fire).
 		// Per PC log m_iopb_cmd (the command) so we can correlate: which cmds reach $9400 (armed) and
