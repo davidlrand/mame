@@ -6489,3 +6489,30 @@ bit4-clear read complete via a DIFFERENT path (not $7c70/$7cac)? or (c) is a mod
 at the IAM the faithful stand-in for a boundary re-arm the firmware genuinely doesn't do for this
 variant (the rejected-patch fallback Dave flagged)? The IAM presentation itself is correct and
 kept; the blocker is strictly upstream at the [$79ae] arm.
+
+## cont.290 (2026-07-21) — post-capture PC census (Dave's method: read the route, don't forward-map)
+
+Pointed STORAGER_PCHIST_WIDE at the post-capture window (PCHIST_AT=8.3 PCHIST_END=9.5) on baseline.
+Top PCs (491 distinct, 300k samples) cluster in THREE regions - all machinery we already mapped:
+  ~25%  $22xx-$23xx : the TOP-LEVEL op-dispatch scheduler $2290-$23e6 (reads phase D0=[$71bc+$26],
+                      dispatches via table $222[phase] at $2312, then runs op-ladder [$721a]+6 at $2342)
+  ~15%  $15xx       : the op-ladder walker $156A + pump $15fe
+  ~7%   $6bxx-$6cxx : op-42 ($6bc2 wait region)
+No unmapped completion poster appears. Per Dave's read: "spinning in scheduler + $810e => the read
+reaches no completion poster on its own route; the missing state is owed much earlier (arm/setup)."
+
+Steady state = continuous ID-search RE-ARM: the fw executes $891a (E000=$22f ID-arm -> delay ->
+$23f park) over and over; the model defers an IRQ4 (300us) each time (IRQ4defer-ARM pc=00891a/$89b6).
+So capture keeps re-arming but nothing posts completion.
+
+CONCRETE LEAD (model-caused, from the census tail): **LEGCEN NOHANDLER aim=0008 (128x)** with
+L1-4=07 08 09 0a (the fill-map positive slots) and 7956=fffa. The ledger SCAN ($7e58/$32ac) reaches
+the last position aim=8 but the byte there is a POSITIVE fill-map slot# (07/08/09/0a, written by the
+cont.276 FILLMAP change), which is NOT one of the scan's recognized handler bytes (ff re-aim / f0
+pending / c0 done / fe beyond-window / aa) -> NOHANDLER -> the scan does nothing and cannot advance
+or complete at the boundary. So there are TWO INCOMPATIBLE consumers of the $7654 ledger: $6f44
+(fill-map) WANTS positive slot# bytes; the scan/$7e58 WANTS handler bytes. The FILLMAP positive
+bytes satisfy $6f44 but break the scan's boundary dispatch. Also seen: $7d62 sets [$741c]=1 (walk
+tail runs); 7956 underflowed to fffa. Open for Dave to read: whether the real route is the scan
+(and FILLMAP's positive bytes are actively breaking it), or the model owes an arm/setup-time state
+that never got returned (why $9400 rw-setup / the $6f44 consumer branch is off-route). No forward-map.
