@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -826,6 +826,22 @@ private:
 									}
 								}
 							}
+					}
+					// cont.299 (Dave's SLOTMAP): the gate array's "data landed in slot N" event (cont.275),
+					// done right. At the data record-end the SERDES has recovered this sector; report the
+					// slot index into the ledger at the AIM the stake used, overwriting the fw's f0. $6f44
+					// then takes the POSITIVE branch ($6fde bge $6fe8) and converts it to c0 ($6ff0); the aim
+					// advances (two-event contract). FILLMAP fixed: writes at [$7428] (the aim), NOT the
+					// geometric block index n+1 - the pos mismatch that made cont.276 collide with the scan.
+					// Staged: flux->host delivery kept for now; the faithful slot-DMA replaces it only once
+					// this encoding path is proven to convert + advance.
+					if (storager_getenv("STORAGER_SLOTMAP") && !m_flux_test
+							&& (m_iopb_cmd == 0x95 || m_iopb_cmd == 0x94) && s_desc.active)
+					{
+						address_space &cs = m_cpu->space(AS_PROGRAM);
+						u16 const aim = cs.read_word(0x7428);              // Detail 1: pos = the aim, not geometric
+						if (aim >= 1 && aim < 64)
+							cs.write_byte((0x7654 + aim) & 0xffff, u8(m_flux_r & 0x7f));  // Detail 2: slot# = R
 					}
 					// cont.294 (Dave's parity A/B): the SECOND data-IRQ5 (cont.266 data-done). The $7950
 					// alternator toggles on each mark; 2 IRQ5/sector = EVEN parity -> every ID-IRQ6 lands
@@ -4452,15 +4468,16 @@ void multibus_storager_device::device_start()
 			{0x3968, "AW-3968"}, {0x70e0, "AW-70e0"}, {0x7e0a, "AW-7e0a"}, {0x7e32, "AW-7e32"},
 			{0x8318, "AW-8318"}, {0x8628, "AW-8628"}, {0x945e, "AW-945e"}, {0x992e, "AW-992e"},
 			{0x71ec, "AW-71ec"}, {0x7bf0, "AW-7bf0"}, {0x92f6, "STAKE-92f6"}, {0x933c, "CONVERT-933c"},
-			{0x6f44, "BUILD-6f44"}, {0x6ff0, "CONV-6ff0"}, {0x726c, "CONV-726c"}, {0x9362, "CONV-9362"} })
+			{0x6f44, "BUILD-6f44"}, {0x6ff0, "CONV-6ff0"}, {0x726c, "CONV-726c"}, {0x9362, "CONV-9362"},
+			{0x6fde, "SCAN-6fde"} })
 			m_cpu->space(AS_OPCODES).install_read_tap(ent.first, ent.first | 1, ent.second,
 				[this, name = ent.second](offs_t, u16 &, u16)
 				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();
 					if (t > 7.9 && ac[name]++ < 20)
 					{ address_space &xs = m_cpu->space(AS_PROGRAM);
-						logerror("AIMCV %s 7428=%04x 742c=%04x D0=%04x D1=%04x @%.5f\n", name,
+						logerror("AIMCV %s 7428=%04x 742c=%04x D4=%04x A0=%06x D1=%04x @%.5f\n", name,
 							xs.read_word(0x7428), xs.read_word(0x742c),
-							u16(m_cpu->state_int(M68K_D0)), u16(m_cpu->state_int(M68K_D1)), t); } });
+							u16(m_cpu->state_int(M68K_D4)), u32(m_cpu->state_int(M68K_A0)) & 0xffffff, u16(m_cpu->state_int(M68K_D1)), t); } });
 		// cont.38 (STRIP): the $7654 SECTOR-MAP write-tap - the map codes ($c0/$f0/$fe/$ff/$aa)
 		// are the floppy engine's per-sector state language; each transition names its writer.
 		m_cpu->space(AS_PROGRAM).install_write_tap(0x7654, 0x7665, "secmap",

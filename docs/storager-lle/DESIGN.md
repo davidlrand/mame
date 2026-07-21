@@ -6726,3 +6726,29 @@ flagged at the very start.
 NEXT: implement the capture-into-slot at record-end (ledger[aim]=positive slot#), env-gated, and
 verify $6f44 now converts f0->c0 and the aim advances. Await Dave's exact edit (pos=aim vs geometric,
 slot# source, timing relative to the stake).
+
+## cont.300 (2026-07-21) — SLOTMAP encoding fix WORKS, but $6f44 runs once (pre-capture) and never re-runs
+
+Implemented Dave's STORAGER_SLOTMAP (env-gated; verified): at DATA record-end write ledger[aim] =
+(m_flux_r & 0x7f) = the positive slot#, overwriting the stake's f0. Result: the write LANDS - ledger
+becomes "c0 0d ff ff ff ff ff" (position 1 = 0d = R13, positive, at [$7428]=aim=1). Encoding fix
+confirmed correct.
+
+BUT the convert still doesn't fire (CONV-6ff0=0). TIMING is the cause:
+  $6f44 (BUILD/scan)  @7.96341  x2 (one pass) - scans ledger, SCAN-6fde reads D4=0000 at all 8
+                                  positions (A0=7655..765c) - the ledger is EMPTY at scan time
+  first STAKE-92f6    @8.04908  - captures start ~90ms AFTER $6f44
+  SLOTMAP 0d writes   @8.04-8.07 - the positive slot#s land AFTER $6f44's only scan
+  last BUILD-6f44     @7.96341  - $6f44 NEVER re-runs
+So $6f44 scans the empty ledger once at 7.963, finds nothing, and never re-runs after the captures
+populate it. The encoding is now correct but unconsumed - same single-early-run as cont.287.
+
+=> The blocker is no longer encoding; it's the $6f44 RE-RUN. $6f44 must run (or re-run) AFTER the
+record-ends populate the ledger. What re-triggers $6f44? It's the op-4a dispatch / transfer-complete
+path. Leading hypothesis: $6f44 re-runs on the transfer-complete IRQ4, which the flux->host
+short-circuit SUPPRESSES (no real transfer -> no completion -> no re-run). If so, Dave's step-2 (the
+faithful slot-DMA replacing flux->host, which raises the real transfer-complete) is what re-triggers
+$6f44 - meaning steps 1 and 2 may not be separable: the encoding needs the slot-DMA's completion to
+drive the re-run. NEXT: census what triggers $6f44 (op-4a dispatch) and whether a transfer-complete
+IRQ4 is what re-runs it - that decides whether step-2 (slot-DMA) is required now or a lighter re-run
+trigger exists.
