@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -827,7 +827,11 @@ private:
 								}
 							}
 					}
-					if (!m_flux_skip) m_cpu->set_input_line(M68K_IRQ_5, HOLD_LINE);
+					// cont.294 (Dave's parity A/B): the SECOND data-IRQ5 (cont.266 data-done). The $7950
+					// alternator toggles on each mark; 2 IRQ5/sector = EVEN parity -> every ID-IRQ6 lands
+					// old-bit 0 -> $89f2 no-stake, $92b4 never fires. STORAGER_ONEIRQ5 drops back to ONE
+					// IRQ5/sector (odd parity) to test whether the next ID-IRQ6 then stakes.
+					if (!m_flux_skip && !storager_getenv("STORAGER_ONEIRQ5")) m_cpu->set_input_line(M68K_IRQ_5, HOLD_LINE);
 				}
 				if (storager_getenv("STORAGER_PHASELOG")) { static int _d=0; if(_d++<120) {
 					address_space &cs = m_cpu->space(AS_PROGRAM);

@@ -6603,3 +6603,27 @@ That cadence pins the data-record IRQ6 at phase-0 (no-stake). Open, faithful que
 model's per-sector mark cadence match a real VGC7219's, such that the data-record IRQ6 would
 naturally land at phase-1 (stake)? NOT force the phase (C135PH proved forcing -> 0x82); check the
 cadence/parity. This is upstream of everything touched since cont.262.
+
+## cont.294 (2026-07-21) — BREAKTHROUGH: one IRQ5/sector unpins the $7950 parity; the f0-stake FIRES
+
+Dave's parity math (worked out): every IRQ6 leaves $7950 bit0 at 0 (stake's own toggle-from-1, or
+the ID-round $8A38 clr). So the bit between two ID marks = parity of the data-IRQ5 count in the gap.
+The model emitted 2 IRQ5/sector (data-AM + data-done) = EVEN -> next ID-IRQ6 always old-bit 0 ->
+$89f2 no-stake -> $92b4 never. Self-reinforcing PARITY pin (not timing) - which is also why C135PH
+(force the bit) failed.
+
+A/B: STORAGER_ONEIRQ5 suppresses the SECOND data-IRQ5 (the cont.266 data-done at line 830), keeping
+the first (data-AM setup, needed). Result (verified edit, git diff non-empty, build clean):
+  PHFORK: $92b4 (STAKE) = 3x  (was 0!) ; $89f2 (no-stake) = 30x
+  Ledger $7654: c0 f0 ff ff ff ff ff f0  -- positions 1 and 7 now hold f0 (STAKED), where with
+  2 IRQ5 the ledger was frozen at the setup c0-fill. The f0 capture-stake FIRES for the first time.
+=> Dave's hypothesis (1) CONFIRMED: the cont.266 second IRQ5 was a PARITY regression; it flipped the
+gap parity even and starved the stake. Dropping to one IRQ5 -> odd parity -> the stake fires.
+
+PARTIAL, not full boot yet: only 2-3 of 8 positions stake (positions 1,7 got f0; 0=c0 setup, 2-6=ff);
+no 0x80 in the read window (STAMP80 still only the 2 setup stamps @6.4s). So the parity root is
+proven and the stake is unpinned, but the cadence isn't cleanly staking all 8. Open (Dave's (1) vs
+(2)): is it hypothesis (1) needing refinement (the per-sector IRQ5/IRQ6 interleave across sectors
+isn't uniformly 1-per-gap, so only some ID-IRQ6 land odd), or (2) the data-record-end should be an
+IRQ6 (carry-strobe) rather than merely dropping the second IRQ5? Next: census the exact per-mark
+{level, old-bit, fork} sequence across sectors to see why only 2-3 gaps reach odd parity.
