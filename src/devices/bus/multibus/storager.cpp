@@ -4474,7 +4474,8 @@ void multibus_storager_device::device_start()
 			{0x6ed2, "OP4A-6ed2"}, {0x159c, "PARK36-159c"}, {0x417a, "DESCGO-417a"},
 			{0x70a0, "DRAIN-70a0"}, {0x7ebe, "WSUBQ-7ebe"}, {0x7ed8, "DISARM-7ed8"}, {0x1646, "PUMPSEL-1646"},
 			{0x822c, "EVAL-822c"}, {0x82b2, "ENABLE-82b2"}, {0x931c, "SET79ba-931c"}, {0xa476, "SET79ba-a476"},
-			{0x92b4, "FORK-92b4"}, {0x92be, "CONVENTRY-92be"}, {0x9354, "C0WRITE-9354"}, {0x7e1e, "FELEG-7e1e"} })
+			{0x92b4, "FORK-92b4"}, {0x92be, "CONVENTRY-92be"}, {0x9354, "C0WRITE-9354"}, {0x7e1e, "FELEG-7e1e"},
+			{0x7ea4, "SET-7ea4"}, {0x7eb2, "SET-7eb2"}, {0x7e42, "CLR-7e42"}, {0x7e90, "CLR-7e90"}, {0x7e58, "SCAN-7e58"} })
 			m_cpu->space(AS_OPCODES).install_read_tap(ent.first, ent.first | 1, ent.second,
 				[this, name = ent.second](offs_t, u16 &, u16)
 				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();

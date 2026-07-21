@@ -6916,3 +6916,25 @@ via IRQ6 phase; this needs the convert's IRQ6 phase-1 to arrive with [$742c]==0)
 byte value routes the scan to $7ea4/$7eb2 (SET) vs $7e42/$7e90 (CLEAR), and does SLOTMAP's positive
 slot# push it to the SET branch? Read the $7e58 dispatch on ledger[aim] -> [$742c] set/clear. The
 convert is a direct IRQ6 - the circularity is gone; the finish is one [$742c] flip.
+
+## cont.308 (2026-07-21) — the convert chain is LINEAR (no loop) and SLOTMAP-independent: it's the [$79ba]/$82b2/[$7968] gate
+
+SLOTMAP-off A/B (control CTL=20): [$742c]=0001 at all 3 forks WITHOUT SLOTMAP too; C0WRITE-9354=0. So
+SLOTMAP does NOT push [$742c] to 1 - hypothesis REFUTED. The walk's own SET ($7eb2, 3x) does, running
+after the FE-leg CLEAR ($7e90, 3x).
+
+DISASM (the walk dispatch $7e8a): tst $7968; beq $7eb2 -> [$7968]==0 SETS [$742c]=1 ($7eb2); [$7968]!=0
+CLEARS it ($7e90). So the [$742c] SET-vs-CLEAR is gated on [$7968] (the exit-enable). Full chain, LINEAR
+(the circularity is gone):
+  convert $9354  <-  [$742c]==0  <-  [$7968]!=0 (CLEAR $7e90)  <-  $82b2 exit-enable  <-  $822c 7-gate pass  <-  [$79ba]==0
+And [$79ba]=1 is set by the STAKE ($931c). So cont.306's [$79ba] and cont.307's [$742c] are the SAME
+chain: the stake's [$79ba]=1 blocks $82b2 -> [$7968]=0 -> walk SETs [$742c]=1 -> convert starved.
+
+=> The root gating the floppy convert is the $82b2 exit-enable, gated at $822c on [$79ba]==0 (+ the other
+6: 79b6=0 7956=0 7958=0 741c!=0 796a!=0 727e=0). cont.306 measured 3 failing at $822c: 79ba=1 (stake),
+7956=5-7 (draining), 741c=0 (stake-cleared). The stake sets [$79ba]=1 AND clears [$741c]=0 - two of the
+three - as its own side effects ($931c/$9318). So the parity fix that fires the stake also trips the
+exit-enable. NEXT: what restores [$79ba]==0 and [$741c]!=0 for the floppy after the stake, and when does
+7956 reach 0 at $822c - i.e. does the $82b2 precondition EVER align in one pass? Read [$79ba]'s clear
+($a476, D0=0 case) and whether the 7 gates ever co-hold. This is the finish: one aligned $822c pass ->
+$82b2 -> [$7968]=1 -> [$742c] clear -> $9354 convert. Linear chain, no loop, SLOTMAP-independent.
