@@ -6867,3 +6867,28 @@ any config)? (b) trace 87/89's path to $1a54 and see which step the armed-but-st
 The read being ARMED (flags set) yet stalled at data-transfer completion re-centers on the transfer
 itself, not the dispatch/arm - i.e. back to the two-event contract (stake OK, convert blocked by the
 $6f44 re-run gap, cont.301-304), now known to be downstream of a correctly-armed read.
+
+## cont.306 (2026-07-21) — IAM re-test broke the [$7426] barrier; the divert is the STAKE's own side effects, not an HD leak
+
+IAM re-test (ONEIRQ5+SLOTMAP+IAM, control CTL=20): the [$7426] BARRIER IS BROKEN - [$7426]=1 (3x),
+$7cac fires, $82e2 ledger-scan ISR runs 3x. cont.288/289's "dead" conclusion OVERTURNED (cont.289's
+[$79ae]-never-armed was the Part A mismeasurement). (The IAM itself didn't fire=0; [$7426]=1 came via
+the natural SLOTMAP path, so the IAM isn't needed for the trigger.) BUT still no convert: op-4a
+doesn't re-dispatch (OP4A=1), park doesn't exit (PARK36=20), [$7b10] never re-arms, $82e2's own $6f44
+re-run ($8330) is also [$7b10]-gated, so BUILD-6f44 stays at 7.96 (empty). CONV-6ff0=0.
+
+Dave's [$79ba]-divert lead (7-gate census at $822c, control-checked): CONFIRMED the evaluator diverts
+at [$79ba]!=0 - but the OWNER is NOT an HD leak. [$79ba]=1 is set at $931c, which is the STAKE's OWN
+TAIL: $9312 stake f0 -> $9318 clr $741c -> $931c set $79ba=1 -> $9322 tst $79b6 (floppy skips $933c).
+So the stake (this session's parity fix) sets [$79ba]=1 AND clears [$741c]=0 as side effects, every
+time it fires, for the floppy too. The 7 $82b2 gates at EVAL-822c: THREE fail - 79ba=1 (stake-set),
+7956=5-7 (draining, not 0 yet), 741c=0 (stake-cleared, must be !=0); the other 4 hold (79b6=0 7958=0
+796a=1 727e=0). ENABLE-82b2=0 (exit-enable never fires).
+
+So it's NOT one stale flag - it's the STAKE's own [$79ba]=1 / [$741c]=0 writes (plus 7956 not-yet-0)
+diverting the completion evaluator. On real HW the stake sets these and the read still completes, so
+either the HD-convert path (floppy skips it) clears them, or the evaluator's gate timing differs, or
+$82b2 isn't the floppy's completion path. OPEN (Dave's domain): after the stake sets [$79ba]=1 /
+[$741c]=0, what restores them for the floppy so $822c passes to $82b2 -> [$7968]=1 -> deferred re-run
+-> convert? The stake<->evaluator interaction is the seam. Session net: barrier broken, completion
+path live, diverted by the stake's own side effects at the first evaluator gate.
