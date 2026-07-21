@@ -6653,3 +6653,26 @@ records captures (ledger f0 at the staked positions); the read stops because the
 $8114-vs-$831c aim traffic - Gate-2 territory), now that the parity confound is removed. NOT a
 phase poke; the aim advance is firmware-walk state driven by the mark cadence/ledger the model
 returns. Keep ONEIRQ5 for aim work (it's the correct cadence for the stake).
+
+## cont.297 (2026-07-21) — stake fires, CONVERT doesn't: f0 never becomes c0, aim locks. [$742c] NOT pinned.
+
+Control-checked census (CTL-89f2=20, taps in the PROVEN PHFORK ~4438 block; retract cont.296's
+dead-block zeros). 3 runs (RTC flake: 2 stake, 1 doesn't):
+  run1/3: PHFORK-stake=3  STAKE-92f6=3  CONVERT-933c=0  [$742c]={0,1}  ledger c0 f0 ff.. (f0 stays)
+  run2:   stake=0 (flaked - RTC-seeded)
+=> CONFIRMED (Dave's extension): the STAKE (event 1, $92f6/$9312 move.b #$f0,ledger[aim]) FIRES
+(3x, writes f0), but the CONVERT (event 2, f0->c0) NEVER fires - the ledger stays f0, so the aim
+never advances off the staked position. CORRECTION to Dave's leading hypothesis: [$742c] is NOT
+pinned at 1 - it alternates {0,1} (the FE-leg does clear it). So the convert is starved for a
+different reason than [$742c] stuck.
+
+DISASM (the convert path): the stake $9304-$9326 tests [$79b6] (HD-flag) at $9322; beq $9370 for
+the floppy ([$79b6]=0) SKIPS the $933c convert region ($9328-$9362, incl the $9362 c0-write). So
+$933c is HD-gated - NOT the floppy's convert. The floppy c0-convert is $6ff0 (move.b #$c0,(-1,A0))
+inside the $6f44 TRANSFER BUILDER (the fill-map consumer from cont.287, which then ran on an EMPTY
+map). Now the stake writes f0, so the fill-map has entries - the question is whether $6f44/$6ff0
+now consumes them to c0. That couples the parity win (stake->f0) directly to the cont.287 transfer
+builder: $6f44 was starved of a populated map; ONEIRQ5 now populates it via the stake.
+
+NEXT: census $6ff0/$726c (c0-convert) + $6f44 entry with the f0 fill-map present - does the transfer
+builder now convert f0->c0 and advance the aim? Control-checked taps in the ~4438 block.

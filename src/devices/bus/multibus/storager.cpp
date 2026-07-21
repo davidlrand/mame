@@ -4445,6 +4445,22 @@ void multibus_storager_device::device_start()
 						logerror("PHFORK %s 7950=%04x 7428=%04x 741c=%04x 79b8=%04x 7dac.r=%02x @%.5f\n", name,
 							xs.read_word(0x7950), xs.read_word(0x7428), xs.read_word(0x741c),
 							xs.read_word(0x79b8), xs.read_byte(0x7db2), t); } });
+		// cont.297 (Dave): aim-writers + the STAKE($92f6, event1) vs CONVERT($933c, event2) of the
+		// two-event contract, in the PROVEN PHFORK block with $89f2 as the must-fire control. Log
+		// [$7428] + [$742c] to read: does $933c fire at all, and does [$742c] alternate 1->0?
+		for (auto ent : { std::pair<u16, char const *>{0x89f2, "CTL-89f2"},
+			{0x3968, "AW-3968"}, {0x70e0, "AW-70e0"}, {0x7e0a, "AW-7e0a"}, {0x7e32, "AW-7e32"},
+			{0x8318, "AW-8318"}, {0x8628, "AW-8628"}, {0x945e, "AW-945e"}, {0x992e, "AW-992e"},
+			{0x71ec, "AW-71ec"}, {0x7bf0, "AW-7bf0"}, {0x92f6, "STAKE-92f6"}, {0x933c, "CONVERT-933c"},
+			{0x6f44, "BUILD-6f44"}, {0x6ff0, "CONV-6ff0"}, {0x726c, "CONV-726c"}, {0x9362, "CONV-9362"} })
+			m_cpu->space(AS_OPCODES).install_read_tap(ent.first, ent.first | 1, ent.second,
+				[this, name = ent.second](offs_t, u16 &, u16)
+				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();
+					if (t > 7.9 && ac[name]++ < 20)
+					{ address_space &xs = m_cpu->space(AS_PROGRAM);
+						logerror("AIMCV %s 7428=%04x 742c=%04x D0=%04x D1=%04x @%.5f\n", name,
+							xs.read_word(0x7428), xs.read_word(0x742c),
+							u16(m_cpu->state_int(M68K_D0)), u16(m_cpu->state_int(M68K_D1)), t); } });
 		// cont.38 (STRIP): the $7654 SECTOR-MAP write-tap - the map codes ($c0/$f0/$fe/$ff/$aa)
 		// are the floppy engine's per-sector state language; each transition names its writer.
 		m_cpu->space(AS_PROGRAM).install_write_tap(0x7654, 0x7665, "secmap",
