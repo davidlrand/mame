@@ -6776,3 +6776,24 @@ just fires too early and once. NEXT (Dave's domain): what should re-arm [$7b10] 
 after the window fills? Is the arm ($6ed2/$948e) supposed to run per-capture, or should a mark
 handler re-set [$7b10] so the re-run fires against the populated ledger? That is the last coupling -
 the convert is one re-arm away.
+
+## cont.302 (2026-07-21) — OUTCOME 2: stuck at the first op-36 park; op-4a never re-dispatches -> no re-run
+
+Control-checked (CTL-89f2=20; ONEIRQ5+SLOTMAP). Ladder-progression census:
+  OP4A-6ed2 (op-4a dispatch)  = 1  (only @7.96341 - the single early pass, empty ledger)
+  PARK36-159c (op-36 park)    = 20 (STUCK at the first data-phase park)
+  DESCGO-417a                 = 0
+  BUILD-6f44=2 / CONV-6ff0=0
+=> Dave's OUTCOME 2 confirmed: the read is stuck at the first op-36 park. The read ladder
+(24 28 56 58 1A 18 54 4A 42 36 00, continuation 28 54 4A 42 36 00) never reaches the continuation's
+2nd op-4a, so [$7b10] never re-arms and $6f44 never re-runs against the SLOTMAP-populated ledger.
+No [$7b10] poke - the faithful re-run IS op-4a recurring, which requires leaving the first park.
+
+So the LAST lever is the first op-36 park's EXIT condition - the unpark question from cont.283-289,
+re-read now that the two things it ultimately needs are SOLVED this session: parity (ONEIRQ5) gives
+the stake, SLOTMAP gives the positive slot#. A recorded, correctly-encoded capture now sits below
+the park for the first time. The park exit ($3dbc +$26=$c, gated on [$7a64]<-[$7956]==0 etc.) may
+now be satisfiable where it wasn't three sessions ago. NEXT: census the op-36 park exit condition
+(what pass-one waits on: [$7956]/[$7a64]/$3dbc/the pump select), now with stakes+slot# present.
+Session arc: parity (cont.294) -> stake fires; SLOTMAP (cont.299) -> encoding correct; re-run is
+op-4a recurring (cont.301/302) -> gated on leaving the first op-36 park. The park exit is the finish.
