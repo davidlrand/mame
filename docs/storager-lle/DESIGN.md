@@ -7037,3 +7037,30 @@ the unpark -> 0x80 -> boot. NOTE: SLOTGEO+BULKRERUN are EXPERIMENTAL stand-ins (
 (all 8, cont.275) + the channel-complete IRQ4 re-trigger. The architecture is proven; the finish is
 [$72d6] drain. Session arc: parity->stake; SLOTMAP->encoding; SLOTGEO->full window; BULKRERUN->re-run;
 [$7a64] SET; $3dbc reached. One gate ([$72d6]) from the boot.
+
+## cont.313 (2026-07-21) — the IRQ4 does NOT drain [$72d6] (hyp.1 refuted); it's a per-sector-setup artifact -> hyp.2 (bulk shouldn't build it)
+
+Traced Dave's two hypotheses for the [$72d6] drain (the last gate on the bulk completion, cont.312):
+- $34ee (the unlink, called from $43c8/$7ac6-the-$99-router): stamps slot status #$80 ($2,A0,D4) and
+  relinks the list, but does NOT clear [$72d6] (the head).
+- $3bfe (IRQ4 handler): -> $3c16 identity (cmpa $7a14,A0) -> $1348/$1310 (re-arm/done). Never reaches
+  $34ee, never clears [$72d6].
+- [$72d6] cleared ONLY at: $7a62 (teardown, POST-completion), $843e (pump/$836c, off-route byte-gate
+  cont.286), $91f2 (HD). NONE on the bulk route before $3dbc.
+=> Hyp.1 (channel-complete IRQ4 drains [$72d6]) is REFUTED. The IRQ4 doesn't touch it.
+
+=> Hyp.2 is the path: [$72d6]=$727e (the watch-record list, records $727e/$728e/... from cont.281) is
+built by the PER-SECTOR setup - the same per-sector machinery whose stake we proved is the poison
+(cont.309). The BULK read doesn't consume them; they're a leftover that $3dbc still gates on. The fix
+is NOT "find their drain" (there isn't one on the bulk route) - it's that a BULK-mode setup should not
+build the watch-record list at all, leaving [$72d6]=0 so $3dbc's gate is trivially satisfied.
+
+So the whole thing reduces, again, to the MODE SELECTION at setup: the read is set up in PER-SECTOR
+mode (builds watch-records $727e, runs the stake) but its completion wants the BULK route ($6f44 full
+window -> $70a6 -> [$7a64] -> $3dbc with [$72d6]==0). Everything that blocks the bulk completion -
+the stake's [$79ba]=1 poison (cont.309), the watch-record list [$72d6] (this) - is a per-sector-setup
+artifact. THE ROOT (through the entire saga): route the bit4-clear read as BULK at setup (no
+watch-records, no per-sector stake) so the bulk completion path - proven end-to-end at cont.312 - runs
+clean. NEXT: the setup mode-select - what builds the watch-record list ($3980 region, cont.282) and
+runs the stake, and what would route the read to bulk instead (the DESCGO/$417a arm vs the per-sector
+$727e build). The completion is architecturally solved; the finish is making setup choose bulk.
