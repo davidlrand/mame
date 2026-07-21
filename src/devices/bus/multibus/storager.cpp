@@ -4435,7 +4435,8 @@ void multibus_storager_device::device_start()
 		// phase0->$89f2 (ID processor) / phase1->$92b4 (the error-stamp region). Log both
 		// entries with the phase + verdict cells in the retry era: the alternation pattern
 		// names why every capture lands in the error path.
-		for (auto ent : { std::pair<u16, char const *>{0x89f2, "89f2-IDPROC"}, {0x92b4, "92b4-PH1"} })
+		for (auto ent : { std::pair<u16, char const *>{0x89f2, "89f2-IDPROC"}, {0x92b4, "92b4-PH1"},
+			{0x7ba8, "7ba8-IRQ5a"}, {0x8018, "8018-IRQ5b"} })
 			m_cpu->space(AS_OPCODES).install_read_tap(ent.first, ent.first | 1, ent.second,
 				[this, name = ent.second](offs_t, u16 &, u16)
 				{ static std::map<std::string, int> ns; double const t = machine().time().as_double();

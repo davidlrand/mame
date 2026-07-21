@@ -6627,3 +6627,29 @@ proven and the stake is unpinned, but the cadence isn't cleanly staking all 8. O
 isn't uniformly 1-per-gap, so only some ID-IRQ6 land odd), or (2) the data-record-end should be an
 IRQ6 (carry-strobe) rather than merely dropping the second IRQ5? Next: census the exact per-mark
 {level, old-bit, fork} sequence across sectors to see why only 2-3 gaps reach odd parity.
+
+## cont.295 (2026-07-21) — full mark census: parity PROVEN (3 stakes), remaining blocker is the AIM advance
+
+Extended PHFORK to all 4 forks (89f2/92b4=IRQ6, 7ba8/8018=IRQ5; verified installed). ONEIRQ5 on,
+IAM off. Per-mark sequence {fork, old-bit, aim}:
+  92b4(stake) 7ba8  aim=1     first 3 sectors: 2 marks each (1 IRQ6 + 1 IRQ5), odd parity -> STAKE
+  92b4(stake) 7ba8  aim=7
+  92b4(stake) 7ba8  aim=8
+  [89f2 x3, 7ba8 x1] repeating, aim STUCK at 1     -> 4 marks/group (even) -> no more stakes
+Counts: 92b4=3, 89f2=30, 7ba8=30, 8018=0.
+
+READING (Dave's decision, both separated):
+- Parity is PROVEN: the first 3 ID-IRQ6 land old-bit 1 and stake (aims 1,7,8). ONEIRQ5 works.
+- The remaining blocker is the AIM ADVANCE: [$7428] goes 1->7->8 then STICKS at 1 instead of
+  walking the 8-sector window. Once stuck, the firmware RE-READS aim=1 every rev, and each re-read
+  emits 3 IRQ6 (no-stake) + 1 IRQ5 = 4 marks (even parity) -> the extra IRQ6 flip parity back even
+  -> no further stakes. So the aim-stick and the late parity-drift are the SAME fault: the stuck
+  aim generates the extra marks. (8018 = IRQ5 old-bit 1 never fires; all IRQ5 -> 7ba8 old-bit 0.)
+
+So the two couplings tangled since Gate-2 are now cleanly separated: PARITY (solved by ONEIRQ5,
+the cont.266 second-IRQ5 was the regression) and AIM-ADVANCE (the next lever). The stake now
+records captures (ledger f0 at the staked positions); the read stops because the aim won't walk
+0..7. Next lever: why [$7428] sticks at 1 after 1->7->8 (the $7e58 aim-match / [$7daf] cursor /
+$8114-vs-$831c aim traffic - Gate-2 territory), now that the parity confound is removed. NOT a
+phase poke; the aim advance is firmware-walk state driven by the mark cadence/ledger the model
+returns. Keep ONEIRQ5 for aim work (it's the correct cadence for the stake).
