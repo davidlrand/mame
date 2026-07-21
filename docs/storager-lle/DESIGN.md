@@ -6962,3 +6962,28 @@ single-segment read post 0x80 - the op-36 park exit to op-00, or a single-segmen
 does NOT gate on [$79ba]/$82b2? Diff the read's op-36-stuck state against how 87/89 reach $1a54.
 The convert may not even be needed single-segment: staked f0 + [$7956]==0 + park-exit may be the
 whole completion. Stop chasing $82b2/$9354; find the single-segment exit.
+
+## cont.310 (2026-07-21) — CONVERGENCE: the DESCGO route AND the unpark both gate on [$7a64]!=0, set by $70a0's zero-landing
+
+Control-checked (CTL=20 all configs). The DESCGO/channel-launch route ($4102/$413c/$417a) is NEVER
+reached, [$7454]=0000 always, $3dbc never fires - in baseline AND current. (cont.280 had DESCGO=20;
+it died in the intervening tree.) IRQ4-3bfe fires 20x = the model's synthetic IRQ4, WITHOUT any
+firmware channel launch.
+
+DISASM (the gate): $40fe tst $7a64; $4102 bne $410a -> the channel-launch (which sets [$7454]=1 at
+$413c) fires ONLY if [$7a64]!=0. So the DESCGO/bulk route is gated on [$7a64] - the SAME cell that
+gates $3dbc (cont.285/303: $3dbc gated on [$7a64] set). And [$7a64] is set by $70a0 (in $6f44's tail)
+when its D3-drain lands [$7956]==0 (cont.303).
+
+=> UNIFICATION: every completion route this session mapped - DESCGO channel-launch ($4102), $3dbc
+unpark, the $9354 convert chain - converges on [$7a64]!=0. And [$7a64] is NEVER set because $70a0
+runs exactly once @7.96 with D3=0 (empty ledger, $6f44's only pass, cont.304), so sub.w D3 never
+lands the zero, and $6f44 never re-runs against the SLOTMAP-populated ledger (cont.301). So Dave's
+DESCGO reframe is historically real but converges back to the SAME blocker: [$7a64]=0. The single
+root, through all reframings (per-sector convert, DESCGO bulk, unpark): $6f44/$70a0 must run against
+a POPULATED ledger and land [$7956]==0 to set [$7a64]. The re-run gap (cont.301, [$7b10] one-shot) is
+the sole remaining fault, and it gates EVERYTHING downstream. NEXT: the entire saga reduces to
+"$70a0 must land [$7956]==0 with a real D3" - either $6f44 re-runs against the populated ledger (the
+[$7b10]/op-4a question) OR $70a0's single pass must see the ledger already populated (a timing/order
+question: $6f44 @7.96 is BEFORE captures @8.04). That timing gap - $6f44 before captures - is the
+concrete, finite root. Read whether $6f44 can be made to run after the window fills.

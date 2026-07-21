@@ -4475,15 +4475,16 @@ void multibus_storager_device::device_start()
 			{0x70a0, "DRAIN-70a0"}, {0x7ebe, "WSUBQ-7ebe"}, {0x7ed8, "DISARM-7ed8"}, {0x1646, "PUMPSEL-1646"},
 			{0x822c, "EVAL-822c"}, {0x82b2, "ENABLE-82b2"}, {0x931c, "SET79ba-931c"}, {0xa476, "SET79ba-a476"},
 			{0x92b4, "FORK-92b4"}, {0x92be, "CONVENTRY-92be"}, {0x9354, "C0WRITE-9354"}, {0x7e1e, "FELEG-7e1e"},
-			{0x7ea4, "SET-7ea4"}, {0x7eb2, "SET-7eb2"}, {0x7e42, "CLR-7e42"}, {0x7e90, "CLR-7e90"}, {0x7e58, "SCAN-7e58"} })
+			{0x7ea4, "SET-7ea4"}, {0x7eb2, "SET-7eb2"}, {0x7e42, "CLR-7e42"}, {0x7e90, "CLR-7e90"}, {0x7e58, "SCAN-7e58"},
+			{0x3bfe, "IRQ4-3bfe"}, {0x3fd0, "CLR7454-3fd0"}, {0x3dbc, "UNPARK-3dbc"}, {0x413c, "SET7454-413c"}, {0x4102, "CHLAUNCH-4102"} })
 			m_cpu->space(AS_OPCODES).install_read_tap(ent.first, ent.first | 1, ent.second,
 				[this, name = ent.second](offs_t, u16 &, u16)
 				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();
 					if (t > 7.9 && ac[name]++ < 20)
 					{ address_space &xs = m_cpu->space(AS_PROGRAM);
-						logerror("AIMCV %-14s 7956=%04x 79ba=%04x 742c=%04x 7968=%04x 741c=%04x aim=%04x D0=%04x @%.5f\n", name,
-							xs.read_word(0x7956), xs.read_word(0x79ba), xs.read_word(0x742c), xs.read_word(0x7968),
-							xs.read_word(0x741c), xs.read_word(0x7428), u16(m_cpu->state_int(M68K_D0)), t);
+						logerror("AIMCV %-14s 7454=%04x 7a64=%04x 72d6=%04x 741c=%04x 7956=%04x aim=%04x @%.5f\n", name,
+							xs.read_word(0x7454), xs.read_word(0x7a64), xs.read_word(0x72d6), xs.read_word(0x741c),
+							xs.read_word(0x7956), xs.read_word(0x7428), t);
 						logerror("  ^%s D3=%04x 741c=%04x\n", name, u16(m_cpu->state_int(M68K_D3)), xs.read_word(0x741c)); } });
 		// cont.305 (Dave's Part A): read inventory + arming + completion. Control = $89f2 (must fire).
 		// Per PC log m_iopb_cmd (the command) so we can correlate: which cmds reach $9400 (armed) and
