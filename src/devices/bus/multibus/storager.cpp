@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -645,6 +645,8 @@ private:
 	// firmware never completes the sector (ledger orphans at f0).
 	void flux_data_am()
 	{
+		if (storager_getenv("STORAGER_C0CENSUS")) { static int c=0; double t=machine().time().as_double();
+			if (t>=7.9 && c++<40) logerror("C0CEN DAM(1stIRQ5) R=%02x skip=%d @%.6f\n", m_flux_r, m_flux_skip?1:0, t); }
 		if (!m_flux_test && !m_flux_skip) m_cpu->set_input_line(M68K_IRQ_5, HOLD_LINE);
 	}
 	// step the PLL up to `when`, recovering bytes into m_flux_byte and firing marks at each AM.
@@ -762,6 +764,9 @@ private:
 			}
 			else   // DATA complete: deliver the recovered field to the host, then raise IRQ5
 			{
+				if (storager_getenv("STORAGER_C0CENSUS")) { static int c=0; double t=machine().time().as_double();
+					if (t>=7.9 && c++<40) logerror("C0CEN DATADONE R=%02x nb=%u want=%u skip=%d map=%04x @%.6f\n",
+						m_flux_r, m_flux_nb, m_flux_want, m_flux_skip?1:0, unsigned(m_read_hostmap), t); }
 				if (!m_flux_test)
 				{
 					// "detection is capture" for the DATA field: the just-recovered sector is in

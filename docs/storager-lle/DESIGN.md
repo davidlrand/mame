@@ -6542,3 +6542,32 @@ gaps. Neither is the clean c0..c0 aa the scan needs. The blocker is that CAPTURE
 window positions to c0 on this route (positions 2-6 = the R9-R13 "00" data sectors stay ff without
 FILLMAP; with FILLMAP they went positive not c0). Open, factual: why do the middle window positions
 never reach c0 via the firmware's own $810e stamp? That is the next thing to READ (not forward-map).
+
+## cont.292 (2026-07-21) — REFUTES model-side hypothesis: model captures ALL 8; the ledger is FROZEN during the read
+
+Dave's census (STORAGER_C0CENSUS: DAM/1st-IRQ5 + DATADONE + m_flux_skip, correlated by R):
+
+1. MODEL COMPLETES ALL 8 in-window sectors, INCLUDING the blanks R9-R13:
+   DATADONE R=07..0e nb=128 want=128 skip=0 (data-record-end fires, full 128B field recovered);
+   DAM (1st IRQ5) fires for each; m_flux_skip=0 for all R7-R14. So the SERDES recovers the all-0x00
+   FM data field and raises the completion mark for the blank sectors exactly as for VOL1/HDR1.
+   => Dave's leading hypothesis (blank sectors' record-end never fires in the flux path) is REFUTED.
+   The "2 vs 8" is NOT a model capture failure. Delivery to host works; recovery is honest.
+
+2. The firmware's f0/c0 CAPTURE-STAKE path ($92b4/$92f6/$9312 = move.b #$f0,ledger[aim]) NEVER runs
+   during the read (STK-* = 0 in 7.99-9.85). Off-route, like the pump / $7c34 / $9400 rw-setup.
+
+3. THE LEDGER $7654 IS NOT WRITTEN DURING THE READ. Two independent write-taps (mine + the existing
+   IAMRD "LEDGWR") both = 0 across 3.5-11.0s. The ledger state (c0 c0 ff ff ff ff ff c0 c0 aa) is
+   FROZEN from setup (<3.5s); the read's capture does not reach it. ($810e, where the IRQ5 dead-ends,
+   is `move.w $7430,(A0)+` - NOT a ledger write; my earlier "$810e stamps c0" was wrong.)
+
+CONSISTENT PICTURE (consolidates cont.286-291): the model captures + delivers all 8 sectors, but the
+firmware's IRQ5 handler routes every mark to $808a -> $810e (dead-end) because [$7426]=0, and never
+stamps the ledger. Every [$7426]-setter is off-route for this read variant: $7cac needs [$79ae]
+(never armed - $9400 rw-setup off-route), $7d62 sets it but $7f1a wipes it, $933c/$9342 need $92xx
+(off-route). So completion is blocked at [$7426]=0, the ledger stays frozen, and $1a54 (0x80) only
+fires at 6.4s setup, never in the read. The blocker is NOT capture and NOT the flux path - it is that
+NO on-route path durably sets [$7426], so the ledger-scan completion never engages. Open, factual:
+what SETS [$7426] on the variant this read actually takes (the scheduler $2290-$23e6 / op-ladder /
+op-42 / walk $7ce6-$7d62 route from cont.290) - since the three setters we mapped are all off-route.
