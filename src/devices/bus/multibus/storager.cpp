@@ -4473,15 +4473,16 @@ void multibus_storager_device::device_start()
 			{0x7d4a, "RERUN-7d4a"}, {0x7e6c, "SUBQ-7e6c"}, {0x7106, "RE7106-6f44"},
 			{0x6ed2, "OP4A-6ed2"}, {0x159c, "PARK36-159c"}, {0x417a, "DESCGO-417a"},
 			{0x70a0, "DRAIN-70a0"}, {0x7ebe, "WSUBQ-7ebe"}, {0x7ed8, "DISARM-7ed8"}, {0x1646, "PUMPSEL-1646"},
-			{0x822c, "EVAL-822c"}, {0x82b2, "ENABLE-82b2"}, {0x931c, "SET79ba-931c"}, {0xa476, "SET79ba-a476"} })
+			{0x822c, "EVAL-822c"}, {0x82b2, "ENABLE-82b2"}, {0x931c, "SET79ba-931c"}, {0xa476, "SET79ba-a476"},
+			{0x92b4, "FORK-92b4"}, {0x92be, "CONVENTRY-92be"}, {0x9354, "C0WRITE-9354"}, {0x7e1e, "FELEG-7e1e"} })
 			m_cpu->space(AS_OPCODES).install_read_tap(ent.first, ent.first | 1, ent.second,
 				[this, name = ent.second](offs_t, u16 &, u16)
 				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();
 					if (t > 7.9 && ac[name]++ < 20)
 					{ address_space &xs = m_cpu->space(AS_PROGRAM);
-						logerror("AIMCV %-13s 79b6=%04x 79ba=%04x 7956=%04x 7958=%08x 741c=%04x 796a=%04x 727e=%04x 7968=%04x D0=%04x @%.5f\n", name,
-							xs.read_word(0x79b6), xs.read_word(0x79ba), xs.read_word(0x7956), xs.read_dword(0x7958),
-							xs.read_word(0x741c), xs.read_word(0x796a), xs.read_word(0x727e), xs.read_word(0x7968), u16(m_cpu->state_int(M68K_D0)), t);
+						logerror("AIMCV %-14s 742c=%04x 7968=%04x 7426=%04x 79ba=%04x 741c=%04x aim=%04x ledgeraim=%02x @%.5f\n", name,
+							xs.read_word(0x742c), xs.read_word(0x7968), xs.read_word(0x7426), xs.read_word(0x79ba),
+							xs.read_word(0x741c), xs.read_word(0x7428), xs.read_byte((0x7654 + xs.read_word(0x7428)) & 0xffff), t);
 						logerror("  ^%s D3=%04x 741c=%04x\n", name, u16(m_cpu->state_int(M68K_D3)), xs.read_word(0x741c)); } });
 		// cont.305 (Dave's Part A): read inventory + arming + completion. Control = $89f2 (must fire).
 		// Per PC log m_iopb_cmd (the command) so we can correlate: which cmds reach $9400 (armed) and

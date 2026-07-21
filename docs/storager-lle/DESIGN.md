@@ -6892,3 +6892,27 @@ $82b2 isn't the floppy's completion path. OPEN (Dave's domain): after the stake 
 [$741c]=0, what restores them for the floppy so $822c passes to $82b2 -> [$7968]=1 -> deferred re-run
 -> convert? The stake<->evaluator interaction is the seam. Session net: barrier broken, completion
 path live, diverted by the stake's own side effects at the first evaluator gate.
+
+## cont.307 (2026-07-21) — TOPOLOGY CORRECTION: the floppy convert is $933c/$9354 (direct IRQ6), starved on [$742c]==0 - NOT $6f44
+
+Dave's topology correction, measured (control CTL=20): $92b4 tst $742c; bne $92f6(STAKE) / fall-through
+$92be->$92f4 bra $933c->$9354(CONVERT ledger[aim]=c0). $933c is reachable for the FLOPPY via [$742c]==0
+(the $9322 HD-gate is inside the STAKE tail only, downstream - cont.298/306 mislabeled it).
+
+Measurement:
+  FORK-92b4 = 3, [$742c]=0001 at ALL 3 -> every fork takes the STAKE branch; NONE the convert.
+  C0WRITE-9354 = 0 -> the real floppy convert NEVER fires. FELEG-7e1e = 3 (the clear-leg runs).
+=> Dave's OUTCOME 1: the floppy convert is $933c/$9354 - a DIRECT IRQ6 handler, NO re-run, NO [$7b10],
+NO continuation, NO park-exit. It is starved because [$742c] is never 0 at the $92b4 fork. THE WHOLE
+cont.297-304 $6f44/re-run/park/[$7b10]/circularity was chasing the WRONG convert ($6f44 = the host-DMA
+transfer-queue builder, a different function). Also: the stake sets [$7426]=1 at $92fe, so the
+"cont.306 [$7426] barrier broken" was the 3 stakes, not a separate completion event.
+
+THE LEVER = [$742c]: SET at $7ea4/$7eb2 (walk) + $7162/$7bf6/$95da; CLEARED at $7e42/$7e90 (FE-leg) +
+$7ca8 (terminator). At the fork it's 1 -> the walk's SET wins over the FE-leg's CLEAR. Which ledger-byte
+case the scan ($7e58) takes decides SET-vs-CLEAR, and the read hits the SET case every fork. This is a
+[$742c]-timing/cadence question - the DIRECT SIBLING of the parity fix (ONEIRQ5 got the stake to fire
+via IRQ6 phase; this needs the convert's IRQ6 phase-1 to arrive with [$742c]==0). NEXT: which ledger[aim]
+byte value routes the scan to $7ea4/$7eb2 (SET) vs $7e42/$7e90 (CLEAR), and does SLOTMAP's positive
+slot# push it to the SET branch? Read the $7e58 dispatch on ledger[aim] -> [$742c] set/clear. The
+convert is a direct IRQ6 - the circularity is gone; the finish is one [$742c] flip.
