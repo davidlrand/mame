@@ -6571,3 +6571,35 @@ fires at 6.4s setup, never in the read. The blocker is NOT capture and NOT the f
 NO on-route path durably sets [$7426], so the ledger-scan completion never engages. Open, factual:
 what SETS [$7426] on the variant this read actually takes (the scheduler $2290-$23e6 / op-ladder /
 op-42 / walk $7ce6-$7d62 route from cont.290) - since the three setters we mapped are all off-route.
+
+## cont.293 (2026-07-21) — CONFIRMS cont.262 root: the f0-stake never fires ($7950 fork pinned no-stake). Retraction of failed-tap results.
+
+RETRACTION: several instrumentation results earlier this turn came from Python tap-installs that
+FAILED SILENTLY (wrong anchor -> file written unchanged, git diff empty). Invalid, disregard:
+"$92b4=0 / W7426=0 / LEDGWR=0 / ledger frozen" from those non-installed taps. Re-read below uses
+the PRE-EXISTING taps (PHFORK line 4434, secmap line 4445), which are real.
+
+CONFIRMED (Dave's cont.262 root, clean instrumentation): the IRQ6 alternator fork is pinned to the
+NO-STAKE path.
+  PHFORK: $89f2 (no-stake ID) = 30x ; $92b4 (f0-stake) = 0x ; [$7950] = 0000 (21x) / 0100 (9x),
+  bit0 = 0 in all 30. So every data-record IRQ6 forks $89f2, the move.b #$f0,ledger[aim] stake at
+  $92b4/$92f6 NEVER runs, and NO capture is ever recorded. Everything downstream (ledger scan,
+  [$7426], the terminator, the pump, FILLMAP, Gate-2) is compensation built on an unrecorded capture
+  - which is exactly why each piece turned out off-route. cont.262 named this; we walked away for 30
+  continuations; it is the root.
+
+CORRECTION to cont.292 "ledger frozen": the ledger IS written, but only at SETUP -- secmap shows
+c0c0 word-fills at pc=$1280 (the #$c0c0 init loop) @6.40s. The read's capture writes NOTHING to the
+ledger (because the stake never fires). The c0 c0 ff .. aa state is the setup c0-fill with some
+positions reset to ff/aa. So "capture never writes the ledger during the read" holds; "frozen" was
+imprecise (setup writes it once).
+
+STILL VALID (committed C0CENSUS tap, cont.292): the MODEL completes all 8 sectors (DATADONE nb=128
+skip=0, incl blanks) -- the flux path is honest; the 2-vs-8 is not a capture failure.
+
+ROOT, faithful framing (Dave): the $7950 alternator parity is determined by the count/order of
+IRQ5/IRQ6 the model emits per sector (model cadence = 1 IRQ6 ID + 2 IRQ5 [data-AM + data-done]).
+That cadence pins the data-record IRQ6 at phase-0 (no-stake). Open, faithful question: does the
+model's per-sector mark cadence match a real VGC7219's, such that the data-record IRQ6 would
+naturally land at phase-1 (stake)? NOT force the phase (C135PH proved forcing -> 0x82); check the
+cadence/parity. This is upstream of everything touched since cont.262.
