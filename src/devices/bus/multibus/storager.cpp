@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP", "STORAGER_NOWALKSUBQ", "STORAGER_BULKRERUN" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP", "STORAGER_NOWALKSUBQ", "STORAGER_BULKRERUN", "STORAGER_SLOTGEO" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -852,9 +852,25 @@ private:
 							&& (m_iopb_cmd == 0x95 || m_iopb_cmd == 0x94) && s_desc.active)
 					{
 						address_space &cs = m_cpu->space(AS_PROGRAM);
-						u16 const aim = cs.read_word(0x7428);              // Detail 1: pos = the aim, not geometric
-						if (aim >= 1 && aim < 64)
-							cs.write_byte((0x7654 + aim) & 0xffff, u8(m_flux_r & 0x7f));  // Detail 2: slot# = R
+						if (storager_getenv("STORAGER_SLOTGEO"))
+						{   // cont.312: GEOMETRIC - write every window position ledger[1+n]=slot# (not aim),
+							// so the BULK $6f44 sees the FULL 8-sector window (D3=8) -> $70a0 lands [$7956]==0
+							// -> $70a6 sets [$7a64] -> $4102 launch / $3dbc unpark. The aim-write (Detail 1) is
+							// for the per-sector scan; the bulk convert wants the whole window present at once.
+							u32 const spt = s_desc.spt ? s_desc.spt : 16;
+							u32 const sec0 = s_desc.sec0 ? s_desc.sec0 : 7;
+							u32 const nblk = s_desc.ssz ? (s_desc.total / s_desc.ssz) : 8;
+							u32 const ntrk = (m_flux_track >= s_desc.base_trk) ? (m_flux_track - s_desc.base_trk) : 0;
+							u32 const gn = ntrk * spt + ((u32(m_flux_r) + spt - sec0) % spt);
+							if (gn < nblk && gn < 63)
+								cs.write_byte((0x7654 + 1 + gn) & 0xffff, u8(m_flux_r & 0x7f));
+						}
+						else
+						{
+							u16 const aim = cs.read_word(0x7428);              // Detail 1: pos = the aim, not geometric
+							if (aim >= 1 && aim < 64)
+								cs.write_byte((0x7654 + aim) & 0xffff, u8(m_flux_r & 0x7f));  // Detail 2: slot# = R
+						}
 					}
 					// cont.294 (Dave's parity A/B): the SECOND data-IRQ5 (cont.266 data-done). The $7950
 					// alternator toggles on each mark; 2 IRQ5/sector = EVEN parity -> every ID-IRQ6 lands

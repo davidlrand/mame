@@ -7013,3 +7013,27 @@ $3dbc unpark -> 0x80. This is the capture-into-slots-then-bulk-$6f44 route, and 
 step downstream of a full ledger works. NEXT: SLOTMAP-geometric (all 8) + BULKRERUN -> does D3=8 and
 [$7a64] set. (BULKRERUN's [$7b10] re-arm is the experimental stand-in for the faithful re-run trigger
 - the channel-complete IRQ4/the capture-complete that a real controller raises after the window.)
+
+## cont.312 (2026-07-21) — MILESTONE: geometric SLOTMAP + BULKRERUN -> ledger FULLY c0, [$7a64]=1, $3dbc reached. Last gate: [$72d6] drained.
+
+STORAGER_SLOTGEO (write ALL 8 window positions ledger[1+n]=slot#, not aim) + BULKRERUN. Result
+(control-checked): FIRST TIME EVER -
+  ledger $7654: c0 c0 c0 c0 c0 c0 c0 c0 - FULLY converted to c0 (the $6f44 bulk convert consumed the
+    full geometric window). $70a0 D3=0007 (was 0/1/2). [$7a64]=0001 (125x - SET by $70a6, was 0 always).
+  $3dbc reached 20x, 10 of them with [$7a64]=1. IRQ4-3bfe 20x.
+=> the bulk architecture (full ledger -> $6f44 D3~8 -> $70a0 -> $70a6 -> [$7a64]) WORKS end to end up
+to $3dbc. Every step the convergence (cont.310) predicted fires.
+
+LAST GATE: $3dbc is reached with [$7a64]=1 but does NOT post +$26=$c because [$72d6]=727e (the
+watch-record list head, NOT drained). $3dbc gate (cont.285) = [$7a64] set (NOW ✓) & [$7454]==0 (✓,
+never set) & [$72d6] drained (✗ =727e). So the park doesn't exit: PARK36=20, OP4A=1 (no re-dispatch),
+DESCGO=0, no 0x80 in read window (STAMP80 only @6.4 setup).
+
+So the finish is ONE more gate: [$72d6] must drain to 0 (the watch-records retired). [$72d6] holds
+$727e (the record list from cont.281's WAITDUMP). What retires/drains the record list ($34ee unlink,
+or $82e2/$8460's clr $72d6/$72da/$72de/$72e0 from cont.283)? That is the last gate between here and
+the unpark -> 0x80 -> boot. NOTE: SLOTGEO+BULKRERUN are EXPERIMENTAL stand-ins (geometric slot-write
++ [$7b10] re-arm) proving the bulk path; the faithful versions are the gate-array capture-into-slots
+(all 8, cont.275) + the channel-complete IRQ4 re-trigger. The architecture is proven; the finish is
+[$72d6] drain. Session arc: parity->stake; SLOTMAP->encoding; SLOTGEO->full window; BULKRERUN->re-run;
+[$7a64] SET; $3dbc reached. One gate ([$72d6]) from the boot.
