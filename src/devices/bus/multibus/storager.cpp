@@ -4469,15 +4469,16 @@ void multibus_storager_device::device_start()
 			{0x8318, "AW-8318"}, {0x8628, "AW-8628"}, {0x945e, "AW-945e"}, {0x992e, "AW-992e"},
 			{0x71ec, "AW-71ec"}, {0x7bf0, "AW-7bf0"}, {0x92f6, "STAKE-92f6"}, {0x933c, "CONVERT-933c"},
 			{0x6f44, "BUILD-6f44"}, {0x6ff0, "CONV-6ff0"}, {0x726c, "CONV-726c"}, {0x9362, "CONV-9362"},
-			{0x6fde, "SCAN-6fde"} })
+			{0x6fde, "SCAN-6fde"}, {0x7c34, "WALK-7c34"}, {0x7d02, "WALK-7d02"}, {0x7e58, "GATE-7e58"},
+			{0x7d4a, "RERUN-7d4a"}, {0x7e6c, "SUBQ-7e6c"}, {0x7106, "RE7106-6f44"} })
 			m_cpu->space(AS_OPCODES).install_read_tap(ent.first, ent.first | 1, ent.second,
 				[this, name = ent.second](offs_t, u16 &, u16)
 				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();
 					if (t > 7.9 && ac[name]++ < 20)
 					{ address_space &xs = m_cpu->space(AS_PROGRAM);
-						logerror("AIMCV %s 7428=%04x 742c=%04x D4=%04x A0=%06x D1=%04x @%.5f\n", name,
-							xs.read_word(0x7428), xs.read_word(0x742c),
-							u16(m_cpu->state_int(M68K_D4)), u32(m_cpu->state_int(M68K_A0)) & 0xffffff, u16(m_cpu->state_int(M68K_D1)), t); } });
+						logerror("AIMCV %s 7428=%04x 7daf=%02x 742c=%04x D0=%04x D4=%04x @%.5f\n", name,
+							xs.read_word(0x7428), xs.read_byte(0x7daf), xs.read_word(0x742c),
+							u16(m_cpu->state_int(M68K_D0)), u16(m_cpu->state_int(M68K_D4)), t); } });
 		// cont.38 (STRIP): the $7654 SECTOR-MAP write-tap - the map codes ($c0/$f0/$fe/$ff/$aa)
 		// are the floppy engine's per-sector state language; each transition names its writer.
 		m_cpu->space(AS_PROGRAM).install_write_tap(0x7654, 0x7665, "secmap",

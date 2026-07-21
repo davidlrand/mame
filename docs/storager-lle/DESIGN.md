@@ -6752,3 +6752,27 @@ $6f44 - meaning steps 1 and 2 may not be separable: the encoding needs the slot-
 drive the re-run. NEXT: census what triggers $6f44 (op-4a dispatch) and whether a transfer-complete
 IRQ4 is what re-runs it - that decides whether step-2 (slot-DMA) is required now or a lighter re-run
 trigger exists.
+
+## cont.301 (2026-07-21) — the $6f44 re-run is WALK-driven (not IRQ4) but gated by [$7b10], a one-shot armed at setup
+
+Control-checked walk census (CTL-89f2=20; ONEIRQ5+SLOTMAP). Dave's correction confirmed: the re-run
+is walk-driven, not IRQ4. Findings:
+  WALK-7c34=20 WALK-7d02=20 RERUN-7d4a=20 (walk RUNS, reaches $7d4a 20x @8.07-8.51 AFTER captures,
+    cursor [$7daf] ADVANCING 9->14->7->8, aim stuck=1) ; GATE-7e58=0 ($7d4a reached via other entries,
+    NOT the cursor-vs-aim gate - so it's NOT outcome-2/Gate-2 cursor==aim)
+  BUILD-6f44=2 @7.96341 (scans EMPTY, SCAN-6fde D4=0000 all 8) ; RE7106=1 @7.96355 ; CONV-6ff0=0
+  first stake @8.049 - captures land AFTER the only $6f44 pass
+
+THE GATE (disasm): $7d68 tst $7b10; beq $7d9c -> the re-run $7d94 bsr $7106 fires ONLY if [$7b10]!=0
+(and $7d6e clears it - one-shot). [$7b10] is set to $ffff at EXACTLY ONE site: $6ed6, called from
+$948e (the read-arm/$9400 setup). So [$7b10] is armed ONCE at read-setup, consumed by the FIRST
+mark's walk (the single $6f44 re-run @7.96, EMPTY ledger), never re-armed. The 20 post-capture
+$7d4a walk hits all see [$7b10]==0 -> skip the re-run.
+
+=> ROOT of the missing convert: the $6f44 re-run trigger [$7b10] is a ONE-SHOT armed at read-setup
+that fires on the first mark (before captures), scans the empty ledger, and is never re-armed after
+the captures populate it. Encoding (SLOTMAP) is correct; parity (ONEIRQ5) is correct; the re-run
+just fires too early and once. NEXT (Dave's domain): what should re-arm [$7b10] after each capture /
+after the window fills? Is the arm ($6ed2/$948e) supposed to run per-capture, or should a mark
+handler re-set [$7b10] so the re-run fires against the populated ledger? That is the last coupling -
+the convert is one re-arm away.
