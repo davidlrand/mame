@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -657,6 +657,31 @@ private:
 			int const bit = m_pll.get_next_bit(tm, m_flux_fdd, when);
 			if (bit < 0) break;                 // reached `when`
 			m_flux_tm = tm;
+			// cont.289 (faithful boundary - replaces the rejected $79ae/fabricated-$fe steer):
+			// the Index Address Mark. When the head crosses the physical index (once/rev, already
+			// tracked as m_flux_next_index) during an armed read, the SERDES decodes the IAM and
+			// DMAs its real field {A1 A1 A1 FE FF} to the fw-published capture cells, raising IRQ6 -
+			// the SAME pointer-directed capture path as every IDAM. POSITION=$FE is the gate array's
+			// index-gap sentinel (normal sectors are 1..SPT). The fw's own residual math has already
+			// armed [$79ae]; its walk reads captured [$7daf]==$FE, mismatches HEAD, routes $7c70->$7cac
+			// (sets [$7426]=1 itself), and completes. Real captured mark - no control-flag poke.
+			if (!m_flux_next_index.is_never() && m_flux_tm >= m_flux_next_index)
+			{
+				if (storager_getenv("STORAGER_IAM") && !m_flux_test
+						&& (m_iopb_cmd == 0x95 || m_iopb_cmd == 0x94) && m_serdes_active)
+				{
+					address_space &cs = m_cpu->space(AS_PROGRAM);
+					cs.write_byte(0x7dac, 0xa1);   // A1 sync (the $8a14 OR-fold; also the $7c7a alt test)
+					cs.write_byte(0x7dad, 0xa1);   // A1
+					cs.write_byte(0x7dae, 0xa1);   // A1  -> HEAD mismatch vs [$7436], routes $7c46 -> $7c70
+					cs.write_byte(0x7daf, 0xfe);   // POSITION = $FE = the index-gap sentinel ($7c70 boundary)
+					cs.write_byte(0x7db0, 0xff);   // N = $FF
+					m_cpu->set_input_line(M68K_IRQ_6, HOLD_LINE);
+					if (storager_getenv("STORAGER_PHASELOG"))
+						logerror("IAM index mark presented (A1 A1 A1 FE FF) trk=%u @%.6f\n", m_flux_track, machine().time().as_double());
+				}
+				if (m_flux_fdd) m_flux_next_index = m_flux_fdd->time_next_index();   // schedule next rev's index
+			}
 			m_flux_shift = (m_flux_shift << 1) | unsigned(bit);
 			if (m_flux_state == 0)   // HUNT
 			{

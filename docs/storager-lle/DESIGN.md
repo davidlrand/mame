@@ -6459,3 +6459,33 @@ starves $7cac. This is Dave's shape-1 "detection is capture": the model must sta
 terminator mark at capture-complete/window-close (and ensure [$79ae] gates the compare) so the
 firmware's own walk completes. Pure boundary-state, no injected interrupt. Await Dave's exact
 one-site edit (couples with Gate 2 -- must not re-break the aim).
+
+## cont.289 (2026-07-21) — faithful IAM at the physical index: presents correctly, but [$79ae] is never armed for this read
+
+Implemented Dave's faithful boundary edit (replaces the rejected cont.288 $79ae/fabricated-$fe
+steer): in flux_advance_to, at the physical index crossing (m_flux_next_index) during an armed
+read (m_serdes_active, cmd 0x95/0x94), DMA the real Index Address Mark {A1 A1 A1 FE FF} to the
+fw-published capture cells [$7dac..$7db0] and raise IRQ6 -- the same pointer-directed capture path
+as every IDAM. NO [$79ae]/[$7426] poke, no fabricated sector. Env-gated STORAGER_IAM (registered
+in the passthrough whitelist); baseline untouched.
+
+RESULT: the IAM presents correctly -- 56x over 14s at 200ms spacing (once/rev @300RPM), 6 of them
+IN the read window (7.57-8.57). But completion does NOT fire: DEC7c70=0, SET-7cac=0, [$7426]=0.
+
+ROOT (traced): [$79ae] is NEVER armed for this read. $739a (its ONLY writer, unconditional once
+reached) never runs -- ARM79ae=0 even ungated from t=0. And the entire arm path is off-route:
+$9400 rw-setup=0, $947c bsr $7346=0, $9412 arm-READ=0, $7346 resid-setup=0. So the walk $7c34
+takes the [$79ae]==0 bail to $7ce6 EVERY pass (P-7ce6=249/250), never reaching the terminator
+compare -- regardless of the IAM. Dave's premise "the firmware's residual math has already armed
+[$79ae]" does NOT hold: $739a is a strict one-shot reached only via $9400/$7346 rw-setup, which
+never executes for the options-0x00 / bit4-clear label read. ($7ce6, the generic path, drains the
+ledger but never re-arms [$79ae]; there is no other [$79ae]=1 site in the ROM.)
+
+So the completion path we mapped ($7c34 armed -> compare -> $fe mismatch -> $7c70 -> $7cac ->
+[$7426]=1 -> $808a -> $82e2 -> $6f44 re-run -> $3dbc) is NOT on this read's route, because its
+entry gate [$79ae] is never armed. OPEN for Dave: (a) is $9400 rw-setup supposed to run for this
+read (what state is the model failing to return that keeps it off-route)? or (b) does the
+bit4-clear read complete via a DIFFERENT path (not $7c70/$7cac)? or (c) is a model arm of [$79ae]
+at the IAM the faithful stand-in for a boundary re-arm the firmware genuinely doesn't do for this
+variant (the rejected-patch fallback Dave flagged)? The IAM presentation itself is correct and
+kept; the blocker is strictly upstream at the [$79ae] arm.
