@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP", "STORAGER_NOWALKSUBQ", "STORAGER_BULKRERUN", "STORAGER_SLOTGEO" };
+		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP", "STORAGER_NOWALKSUBQ", "STORAGER_BULKRERUN", "STORAGER_SLOTGEO", "STORAGER_UNSTAKE", "STORAGER_DRAIN72D6", "STORAGER_A64CENSUS" };
 	for (auto const *n : hard_on)
 		if (!strcmp(name, n)) return "1";
 	for (auto const *n : passthrough)
@@ -819,6 +819,25 @@ private:
 									if (storager_getenv("STORAGER_PHASELOG"))
 										logerror("BULKRERUN [$7b10] re-armed, ledger full @%.6f\n", machine().time().as_double());
 								}
+								// TEST (cont.316, STORAGER_UNSTAKE): [$79ba] is set by every stake ($931c) and
+								// cleared ONLY at command setup ($a476) - the grep is clean, no in-read clearer, and
+								// the convert ($933c) does not touch it. It gates the watch-record drain
+								// ($7964 $796c: tst $79ba; beq $797e) that nulls [$72d6], which is $3dbc's third
+								// completion gate ($3e24: tst.w $72d6; bne exit). So once any sector stakes,
+								// [$79ba]=1 sticks and the drain is unreachable. Hold it 0 once the window is fully
+								// delivered so the drain runs -> [$72d6]=0 -> $3dbc posts 0x80. Tests whether the
+								// stake flag is the SOLE remaining blocker (the "bulk delivery must not stay staked"
+								// hypothesis). STORAGER_DRAIN72D6 (stage 2) also nulls the watch-list head directly,
+								// isolating $3dbc's gate from the $7964 drain routine in case $7964 does not re-run.
+								if (storager_getenv("STORAGER_UNSTAKE") && (m_read_hostmap & full) == full)
+								{
+									m_cpu->space(AS_PROGRAM).write_word(0x79ba, 0x0000);
+									if (storager_getenv("STORAGER_DRAIN72D6"))
+										m_cpu->space(AS_PROGRAM).write_word(0x72d6, 0x0000);
+									if (storager_getenv("STORAGER_PHASELOG"))
+										logerror("UNSTAKE [$79ba]=0%s, window full @%.6f\n",
+											storager_getenv("STORAGER_DRAIN72D6") ? " + [$72d6]=0" : "", machine().time().as_double());
+								}
 								if ((m_read_hostmap & full) == full && !storager_getenv("STORAGER_FAITHXFER"))
 								{   // baseline only: the synthetic window-done DESCDONE. Under FAITHXFER the fw's own arm+kick
 								    // drives IRQ4 per sector, so we must NOT fire this bare edge here.
@@ -1367,6 +1386,26 @@ void multibus_storager_device::device_start()
 		// also: does the channel-service routine that CONTAINS $9400 run at all? tap its head $93b0.
 		m_cpu->space(AS_OPCODES).install_read_tap(0x93b0, 0x93b1, "rs_93b0",
 			[this](offs_t, u16 &, u16){ static int n = 0; if (n++ < 40) logerror("HIT $93b0 chan-setup-entry cmd=%02x @%.5f\n", m_iopb_cmd, machine().time().as_double()); });
+		// cont.317 (STORAGER_A64CENSUS): [$7a64] is NOT a latch - it is recomputed on every $6f44 pass
+		// ($709a clears it, $70a6 re-sets it ONLY when [$7956]==0), so it oscillates and the async $3dbc
+		// poll races (outcome-3: $3dbc reached but reads [$7a64]=0). Log every [$7a64] WRITE (value +
+		// writing pc + [$7956]/[$7abc]) AND every $3dbc poll (value read + all three gates + CALLER off
+		// the stack), to see whether any poll lands while [$7a64]=1 and whether $3dbc is reached
+		// in-sequence from $70a6 or via a decoupled async caller. READ-ONLY (no firmware-flag writes).
+		if (storager_getenv("STORAGER_A64CENSUS"))
+		{
+			m_cpu->space(AS_PROGRAM).install_write_tap(0x7a64, 0x7a65, "a64_wr",
+				[this](offs_t, u16 &data, u16){ static int n=0; if(n++<600){ address_space &xs=m_cpu->space(AS_PROGRAM);
+					logerror("A64 WR <- %04x pc=%06x 7956=%04x 7abc=%04x @%.6f\n", data, m_cpu->pc(),
+						xs.read_word(0x7956), xs.read_word(0x7abc), machine().time().as_double()); } });
+			m_cpu->space(AS_OPCODES).install_read_tap(0x3dbc, 0x3dbd, "a64_poll",
+				[this](offs_t, u16 &, u16){ static int n=0; if(n++<600){ address_space &xs=m_cpu->space(AS_PROGRAM);
+					u32 const sp=u32(m_cpu->state_int(M68K_SP)) & 0xffffff;
+					logerror("A64 POLL $3dbc caller=%06x 7a64=%04x 7454=%04x 72d6=%04x 7956=%04x @%.6f\n",
+						xs.read_dword(sp) & 0xffffff, xs.read_word(0x7a64), xs.read_word(0x7454),
+						xs.read_word(0x72d6), xs.read_word(0x7956), machine().time().as_double()); } });
+			logerror("A64CENSUS taps installed: write $7a64 + poll $3dbc\n");
+		}
 		// task#5: capture the read's requested sector COUNT (IOPB) at READ-START, non-invasively (opcode tap reads
 		// host IOPB via bs - a read, not a write-tap). The model pump feeds rotationally w/o count; the fix is a
 		// count-driven transfer-complete. Dump the read IOPB fields to find the count.
@@ -4513,8 +4552,8 @@ void multibus_storager_device::device_start()
 				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();
 					if (ac[name]++ < 20)
 					{ address_space &xs = m_cpu->space(AS_PROGRAM);
-						logerror("AIMCV %-14s 72d6=%04x 7986=%04x 796e=%04x 7a64=%04x 7454=%04x @%.5f\n", name,
-							xs.read_word(0x72d6), xs.read_word(0x7986), xs.read_word(0x796e), xs.read_word(0x7a64), xs.read_word(0x7454), t);
+						logerror("AIMCV %-14s 72d6=%04x 7462=%04x 74b4=%04x 7a64=%04x 7454=%04x @%.5f\n", name,
+							xs.read_word(0x72d6), xs.read_word(0x7462), xs.read_word(0x74b4), xs.read_word(0x7a64), xs.read_word(0x7454), t);
 						logerror("  ^%s D3=%04x 741c=%04x\n", name, u16(m_cpu->state_int(M68K_D3)), xs.read_word(0x741c)); } });
 		// cont.305 (Dave's Part A): read inventory + arming + completion. Control = $89f2 (must fire).
 		// Per PC log m_iopb_cmd (the command) so we can correlate: which cmds reach $9400 (armed) and
@@ -6229,6 +6268,12 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		// the fw then re-inits ($94a0), re-arms ($6ed2), and rides its own path to $17fe
 		// with both bits set. One status bit; the machine completes itself.
 		d = (d & ~0x0010) | (((present && fdd->idx_r()) || m_want_ready) ? 0x0010 : 0);
+		// TEST (cont.316, STORAGER_UNSTAKE): hold [$79ba]=0 while the fw polls F000 during the
+		// completion loop, so the $7964/$3dbc evaluator sees the un-poisoned gate on the
+		// post-delivery poll (after flux stops, the delivery-block write no longer re-fires).
+		// Gated on m_bulk_rearmed so the hold only starts once the window is full (bulk config).
+		if (storager_getenv("STORAGER_UNSTAKE") && m_bulk_rearmed)
+			m_cpu->space(AS_PROGRAM).write_word(0x79ba, 0x0000);
 		// cont.232 (STORAGER_PAIR): bit6 = chunk MID-BLOCK - the odd sector deposited, the
 		// 256B block's second half pending. The fw's $7F2C per-cycle gate: SET -> wait for
 		// the pair; CLEAR -> proceed to the append/kick. The per-block cadence's true signal.

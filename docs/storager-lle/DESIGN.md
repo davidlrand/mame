@@ -7129,3 +7129,31 @@ does it survive to $3dbc's poll) is the next factual read, and it's the same [$7
 under the pure cont.312 bulk config (no UNSTAKE poke), to see if they EVER align - if $70a6 sets
 [$7a64]=1 and a $3dbc poll lands while it holds, the post fires; if $70a6's set is transient/cleared
 before any $3dbc poll, that clear is the real last edge.
+
+## cont.317 (2026-07-21) — A64 census (read-only): $70a6 NEVER fires; NOT an ordering race - D3 never == [$7956], so [$7956] never lands 0
+
+Dave's STORAGER_A64CENSUS (read-only write-tap on [$7a64] + poll-tap on $3dbc). Pure cont.312 bulk
+config. Control: A64 WR=9, A64 POLL=9 (installed + firing). DECISIVE:
+  A64 WR: [$7a64] written ONLY to 0 - pc=$70a0 (3x, 7956=0008, value 0000 = the $70d4 clear via the
+    $70a4 bne), plus init/$9d14/memset. $70a6 (move #$1,$7a64) NEVER fires. So [$7a64] is never SET to 1
+    in this run (cont.312's [$7a64]=1 was RTC-flake-dependent; the census shows it's not reliable).
+  $70a0-$70a6 gate: sub.w D3,$7956; bne $70d4 (clear); $70a6 set [$7a64]=1 ONLY if [$7956]==0. The
+    writes show 7956=0008 -> 8-D3=8 -> D3=0 this run (D3=7 in cont.312), NEVER 8.
+  A64 POLL: $3dbc callers = $0cd0/$5f4e/$1d1a (setup), and in the read window $70f8 (IN-SEQUENCE, right
+    after $6f44/$70a0) + $8348 (async). BOTH read 7a64=0000.
+
+=> CALLER TEST: NOT an ordering race - the in-sequence poll ($70f8, immediately after $70a6's own path)
+also reads [$7a64]=0, because $70a6 genuinely never set it. TIMELINE TEST: no poll ever falls between a
+$70a6 set and a clear, because there is no $70a6 set. ROOT (Dave's option 3, confirmed): the bulk $6f44
+pass's D3 (blocks placed) never equals [$7956]=8, so the $70a0 subtract never lands [$7956]==0, so
+$70a6 never sets [$7a64]. D3 is 0 (this run) / 7 (cont.312), never 8 - the ledger never gives $6f44 all
+8 consumable entries in ONE pass (SLOTGEO/BULKRERUN experimental drivers deliver 0/7, not 8; RTC-flaky).
+
+So the finish is NOT a hold/latch or in-sequence-eval fix - it is: make ONE $6f44 pass see D3==[$7956]
+(all 8 window blocks consumable at once) so [$7956] drains to a STABLE 0 and $70a6 sets [$7a64]. That is
+exactly Dave's faithful no-stake direct-convert / full-window-capture path: the gate array delivers all
+8 slots, the firmware's single $6f44 pass converts all 8 (D3=8), [$7956]==0, $70a6 sets [$7a64],
+$3dbc's in-sequence poll ($70f8) reads it 1 and posts +$26=$c. The experimental SLOTGEO+BULKRERUN prove
+the path but deliver a flaky/partial window (D3=0/7); the faithful capture-into-slots must deliver all 8
+atomically. NEXT: why does $6f44 compute D3=7 (or 0) not 8 - which window position is not consumable in
+the pass (the off-by-one: position 0 setup-c0 vs the 8 window slots, or a not-yet-captured slot).
