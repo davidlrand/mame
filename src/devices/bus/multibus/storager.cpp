@@ -1737,6 +1737,8 @@ void multibus_storager_device::device_start()
 				logerror("%s aim=%04x 742c=%04x ledger[aim]=%02x 7950=%04x @%.6f\n", nm, aim,
 					ks.read_word(0x742c), ks.read_byte((0x7654 + aim) & 0xffff), ks.read_word(0x7950), kt); });
 		}
+		m_cpu->space(AS_PROGRAM).install_write_tap(0x72d6, 0x72d7, "wr72d6",
+				[this](offs_t, u16 &d, u16){ static int c=0; if(c++<40) logerror("WR72d6 <- %04x pc=%06x @%.5f\n", d, m_cpu->pc(), machine().time().as_double()); });
 		m_cpu->space(AS_PROGRAM).install_read_tap(0x0000, 0xffff, "census",
 				[this](offs_t offset, u16 &data, u16)
 				{ static std::set<u64> seen; static int cn3 = 0;
@@ -4505,14 +4507,14 @@ void multibus_storager_device::device_start()
 			{0x822c, "EVAL-822c"}, {0x82b2, "ENABLE-82b2"}, {0x931c, "SET79ba-931c"}, {0xa476, "SET79ba-a476"},
 			{0x92b4, "FORK-92b4"}, {0x92be, "CONVENTRY-92be"}, {0x9354, "C0WRITE-9354"}, {0x7e1e, "FELEG-7e1e"},
 			{0x7ea4, "SET-7ea4"}, {0x7eb2, "SET-7eb2"}, {0x7e42, "CLR-7e42"}, {0x7e90, "CLR-7e90"}, {0x7e58, "SCAN-7e58"},
-			{0x3bfe, "IRQ4-3bfe"}, {0x3fd0, "CLR7454-3fd0"}, {0x3dbc, "UNPARK-3dbc"}, {0x413c, "SET7454-413c"}, {0x4102, "CHLAUNCH-4102"}, {0x3980, "WRBUILD-3980"}, {0x3920, "DISC-3920"}, {0x392c, "DISC0-392c"}, {0x394a, "SKIP-394a"}, {0x40c2, "MODEFORK-40c2"}, {0x4122, "BULKARM-4122"} })
+			{0x3bfe, "IRQ4-3bfe"}, {0x3fd0, "CLR7454-3fd0"}, {0x3dbc, "UNPARK-3dbc"}, {0x413c, "SET7454-413c"}, {0x4102, "CHLAUNCH-4102"}, {0x3980, "WRBUILD-3980"}, {0x40c2, "MODEFORK-40c2"}, {0x7a30, "TEARDOWN-7a30"}, {0x7a42, "TDCLR-7a42"}, {0x7a62, "DRAIN72d6-7a62"} })
 			m_cpu->space(AS_OPCODES).install_read_tap(ent.first, ent.first | 1, ent.second,
 				[this, name = ent.second](offs_t, u16 &, u16)
 				{ static std::map<std::string, int> ac; double const t = machine().time().as_double();
 					if (ac[name]++ < 20)
 					{ address_space &xs = m_cpu->space(AS_PROGRAM);
-						logerror("AIMCV %-14s 793e=%04x 72d6=%04x uib20=%04x cmd=%02x 7454=%04x @%.5f\n", name,
-							xs.read_word(0x793e), xs.read_word(0x72d6), xs.read_word((xs.read_word(0x799a)+0x20)&0xffff), m_iopb_cmd, xs.read_word(0x7454), t);
+						logerror("AIMCV %-14s 72d6=%04x 7986=%04x 796e=%04x 7a64=%04x 7454=%04x @%.5f\n", name,
+							xs.read_word(0x72d6), xs.read_word(0x7986), xs.read_word(0x796e), xs.read_word(0x7a64), xs.read_word(0x7454), t);
 						logerror("  ^%s D3=%04x 741c=%04x\n", name, u16(m_cpu->state_int(M68K_D3)), xs.read_word(0x741c)); } });
 		// cont.305 (Dave's Part A): read inventory + arming + completion. Control = $89f2 (must fire).
 		// Per PC log m_iopb_cmd (the command) so we can correlate: which cmds reach $9400 (armed) and

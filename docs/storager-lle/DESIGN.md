@@ -7080,3 +7080,28 @@ $40c2") is for a variant the read doesn't use. The read's real setup path ($37ae
 to read. NEXT: what is the $37ae region ($3700 builder), what arm does IT do (bulk/DESCGO or
 per-sector), and is ITS mode-select the bit11 or a different discriminant. The completion is still
 architecturally proven (cont.312); the setup that routes THIS read is the $37ae path, not $3900/$40c2.
+
+## cont.315 (2026-07-21) — the teardown ($7a30/$7a62) never runs; [$72d6] is never drained on the read's path
+
+Traced $3dbc's exact gate (Dave): $3e24 tst.w $72d6; bne exit - needs [$72d6]==0 literally. Census
+(control CTL=20, both baseline and SLOTGEO+BULKRERUN): TEARDOWN-7a30=0, TDCLR-7a42=0, DRAIN72d6-7a62=0,
+and the wr72d6 write-tap = 0 (no [$72d6] write during the run). So the teardown that nulls [$72d6]
+($7a30->$88ac->$7a62, gated [$7986]==0) NEVER runs for the read, and nothing else drains [$72d6]. It is
+built =$727e at setup ($37ae) and stays. $3dbc's [$72d6]==0 gate is thus UNSATISFIABLE on the read's
+current setup path.
+
+HONEST SESSION CONSOLIDATION (cont.281-315): the bulk COMPLETION machinery is PROVEN end-to-end at
+runtime (cont.312: parity->stake, SLOTMAP->encoding, SLOTGEO->full window, BULKRERUN->re-run,
+[$7a64]=1, ledger fully c0, $3dbc reached with 2 of 3 gates satisfied). The single unsolved half is the
+SETUP ROUTING: the read is set up in per-sector mode (builds the op-36-park ladder + watch-records at
+$3790/$37ae, runs the stake) and never reaches ANY of the bulk-completion/teardown paths ($9400,
+$82b2/$836c pump, $40c2 mode-fork, $417a DESCGO, $7a30 teardown) - each traced and confirmed off-route.
+So [$72d6], like [$79ba] and the pump byte-gate before it, is a per-sector-setup artifact with no
+on-route drain. THE ROOT, restated honestly: something at command dispatch routes cmd 0x95 to the
+per-sector ladder builder ($3790) that seeds op-36+watch-records; the faithful finish needs either that
+dispatch to build a bulk ladder (no op-36 park, no watch-records) OR the full bulk-mode hardware
+contract (capture-into-slots + channel-complete that runs the teardown) which the firmware only invokes
+on a path this read's setup never enters. The completion is solved; the setup dispatch (what $3790 is
+reached from for cmd 0x95, and the bulk alternative) is the recurring, still-open root - it has receded
+through 5 off-route layers this session, each real. Recommend a ground-truth dispatch trace (cmd 0x95 ->
+which ladder builder) as the next session's start, not another completion-side gate.
