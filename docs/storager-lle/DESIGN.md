@@ -7105,3 +7105,27 @@ on a path this read's setup never enters. The completion is solved; the setup di
 reached from for cmd 0x95, and the bulk alternative) is the recurring, still-open root - it has receded
 through 5 off-route layers this session, each real. Recommend a ground-truth dispatch trace (cmd 0x95 ->
 which ladder builder) as the next session's start, not another completion-side gate.
+
+## cont.316 (2026-07-21) — UNSTAKE bisect: neither stage boots; [$79ba] NOT the sole blocker - $3dbc exits at [$7a64]=0
+
+Dave's STORAGER_UNSTAKE (write [$79ba]=0 at ledger-full + hold across F000 poll) + STORAGER_DRAIN72D6
+(null [$72d6]=0). Staged bisect (base = cont.312 bulk config):
+  Stage 1 (UNSTAKE): [$79ba]=0 fired 721x (write confirmed via w79ba), [$72d6] reaches 0, UNPARK-3dbc=9,
+    PARK36=20 - NO 0x80, park doesn't exit.
+  Stage 2 (UNSTAKE+DRAIN72D6): [$72d6]=0 forced (178x). $3dbc reached 9x but ALL show [$7a64]=0000 ->
+    exits at $3dee (tst $7a64; beq exit), never reaches $3e30 (+$26=$c post). NO 0x80.
+$3dbc gate order (verified): $3dc6 tst $7462; $3ddc tst (A1)=[$74b4]-node; $3dee tst $7a64 (beq exit);
+$3df6 tst $7454 (bne exit); $3e24 tst $72d6 (bne exit); $3e30 post.
+
+=> Dave's OUTCOME 3: neither posts -> a further blocker downstream of [$72d6]. [$79ba]=1 was NOT the
+sole blocker. With [$79ba]=0 AND [$72d6]=0 forced, $3dbc STILL exits - at [$7a64]=0. cont.312 showed
+[$7a64]=1 (125x, set by $70a6), but at the $3dbc poll here it reads 0: the bulk-re-run's $70a6-set and
+the $3dbc poll are MISALIGNED in time (and the UNSTAKE poke may have perturbed the $70a6 path - Stage 1
+$3dbc=9 vs cont.312's 20). So the real edge is [$7a64] not being HELD to the $3dbc evaluation, not
+[$79ba]. This spent 2 runs (as Dave intended) instead of building a faithful mechanism on the [$79ba]
+assumption - which the bisect just falsified. The [$7a64]<->$3dbc timing (does $70a6 set [$7a64] and
+does it survive to $3dbc's poll) is the next factual read, and it's the same [$7a64] convergence gate
+(cont.310) now with the timing exposed. Recommend: census [$7a64]'s set ($70a6) vs $3dbc-poll timing
+under the pure cont.312 bulk config (no UNSTAKE poke), to see if they EVER align - if $70a6 sets
+[$7a64]=1 and a $3dbc poll lands while it holds, the post fires; if $70a6's set is transient/cleared
+before any $3dbc poll, that clear is the real last edge.
