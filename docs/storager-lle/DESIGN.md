@@ -7157,3 +7157,2663 @@ $3dbc's in-sequence poll ($70f8) reads it 1 and posts +$26=$c. The experimental 
 the path but deliver a flaky/partial window (D3=0/7); the faithful capture-into-slots must deliver all 8
 atomically. NEXT: why does $6f44 compute D3=7 (or 0) not 8 - which window position is not consumable in
 the pass (the off-by-one: position 0 setup-c0 vs the 8 window slots, or a not-yet-captured slot).
+
+## cont.318 — the $3dbc unpark is the PER-SECTOR path; the bulk pre-read never takes it (dead end)
+
+Full-completion test (stake-off + SLOTGEO + BULKRERUN + UNSTAKE + DRAIN72D6) got all three
+late $3dbc gates to hold at the poll (7a64=0001 7454=0000 72d6=0000, 39x) yet STILL no post
+and no boot. Tapping the actual post site $3e30 and the intermediate gate $3dee: **both 0
+hits.** The A64 poll enters $3dbc, passes $3dc6 (tst $7462, =0), then EXITS at $3ddc before
+ever reaching the $7a64/$7454/$72d6 ladder.
+
+Read the firmware ($3dbc..$3f5e). $3dbc is not a 3-gate completion — it is a **two-queue
+relaunch processor**:
+- $3ddc: `tst.w (A1)` / `movea.w (A1),A2` / `bne $3e50`, A1=&$74b4. If **[$74b4]!=0** (the
+  pending-launch queue is non-empty) it diverts to $3e50; the $7a64 ladder ($3dee) and the
+  post ($3e30, `move.w #$c,($26,A0)`, A0=[$71bc]) are reached ONLY when **[$74b4]==0**.
+- Census: [$74b4] = 74c4/74d4/74fc across all 40 polls — never empty. Source: the
+  segment-completion handler at $81a8..$8214 ENQUEUES a node onto $74b4 ($81f8) on every
+  segment, and that same routine falls into the $825c [$7a64] setter at $823c. So each
+  completion both sets [$7a64] AND re-primes the queue the poll must find empty.
+
+$3e50 (the diverted node processor) never drains $74b4 either: DRAIN $3efc = 0 hits. Its
+exits: $3e6e (modecheck) 20x, $3f1e 20x, $4062 20x. The discriminant is **mode bit 11**:
+$3ec4 `btst #$b, D0` where D0 = [[$799a]+$20]. Measured mode word = **8c27 → bit 11 SET**.
+Bit11 set → $3ec8 `bne $3f1e` = the **bulk-descriptor** branch: `bsr $3abc` (re-arm/kick the
+channel, [A0+$12]=[A0+$20]=1, inc [$7a6c]) then mark node [A2+2]=$40 — but it never dequeues
+$74b4 and never posts $3e30.
+
+**Conclusion.** The $3dbc→$3e30 unpark (`+$26=$c`) is the **per-sector** ([$74b4]-empty,
+bit11-clear) completion. The label pre-read runs in **bulk mode** (bit11 set), so every
+$3dbc poll diverts to $3f1e and structurally CANNOT reach $3e30. The entire cont.294..317
+campaign (ONEIRQ5/SLOTGEO/BULKRERUN/UNSTAKE/DRAIN72D6, all the $7a64/$7454/$72d6/$7956
+gate-forcing) was operating on a branch the bulk read never executes — a dead end.
+
+The bulk read's data DOES complete in this config (log: "1024 bytes" / "8 sectors" 41x,
+DESCGO 44x) — consistent with board-notes "DESCDONE, READVERIFY OK". What does NOT happen is
+the **command-status 0x80 → host IOPB** (STAMP80 only 4x, all @~6.4s early boot, none in the
+read window >7.9s). So the boot blocker is NOT per-sector unpark; it is the bulk
+completion's status post ($1a54 per board-notes / the DESCDONE→IRQ4→status chain), a
+different mechanism. STRATEGIC FORK for next pass: (a) trace the bulk completion $3abc →
+DESCDONE → IRQ4 → the $1a54 0x80 status stamp and why it does not reach the host in the read
+window; vs (b) whether mode bit 11 (bulk) is even correct for this UIB — if it should be
+clear, the per-sector path (which we CAN now drive to the gates) would be the intended route.
+All cont.318 taps are read-only and env-gated under STORAGER_A64CENSUS.
+
+## cont.319 — A-vs-B mode ground-truth + the 0x80 stamp pinned to $1320/[$71f0].b==0x8f
+
+Dave's A/B MODECENSUS (taps $3790/$40c2/$4122/$3bfe/$194a, control-checked). Run A = cont.312
+bulk drivers ON (ONEIRQ5+SLOTMAP+SLOTGEO+BULKRERUN); Run B = firmware-native, all drivers OFF.
+
+MODE GROUND-TRUTH (ends fifteen continuations of inference):
+- $3bfe (IRQ4) fires 80x total / 64x in the read window in BOTH runs, cmd=95 — IRQ4 completion
+  arrives natively, identical with or without drivers.
+- $3790 (per-sector builder), $40c2 (mode-fork), $4122 (bulk-arm): ABSENT in both (that fork
+  is not on cmd 95's route).
+- DESCGO: Run A = 3, Run B = **42**; "8 sectors": A = 2, B = **41**. The firmware natively
+  issues the bulk descriptor 42x with ZERO drivers. **Bulk is firmware-native, not
+  model-manufactured** (Dave's option 1). And the cont.294-317 driver stack (ONEIRQ5 in
+  particular) was SUPPRESSING the native read: it collapses DESCGO 42->3 and the read barely
+  runs. Run B (native) streams the whole label; Run A (drivers) does not. The drivers were
+  breaking the thing that already worked. => Retire ONEIRQ5/SLOTMAP/SLOTGEO/BULKRERUN/UNSTAKE/
+  DRAIN72D6 as the delivery mechanism; the native path is correct up to the completion post.
+
+THE LAST MILE, pinned to the instruction (native Run B):
+- IRQ4 $3bfe -> $3c16 cmpa.w $7a14,A0 (A0=[$743a]) -> completion branch $3c1c (fires) ->
+  [$7a76]==0 so bsr $1310 (fires, cmd=95, read window).
+- $1310: A0=[$7a06]=**$71f0** (the primary status block). $1314 writes [71f0+2]=0x81 (busy).
+  $131a `cmpi.b #$8f,(A0)`; $131e `bne $1326` (skip); $1320 `move.w #$80,($2,A0)` = **the real
+  0x80 stamp** (NOT $194a, which is an HD region and never fires for floppy).
+- So 0x80 is gated on **[$71f0].b == 0x8f**. Census: in the read window [$71f0].b = **0x95**
+  (the raw cmd byte) -> bne taken -> stamp skipped -> status stays 0x81 -> monitor spins. The
+  early successful cmd 87/89/95 completions (@6.4s) DID stamp (their $1320 fired), i.e. their
+  [$71f0].b reached 0x8f. There is NO `move.b #$8f` immediate anywhere -> 0x8f is a transformed
+  result the completion flow writes to the status tag on success; the bulk label read's IRQ4
+  path never triggers that transition.
+
+OPEN (next ground-truth fork for Dave): what writes [$71f0].b = 0x8f in a normal completion
+(the "completion-authorized" tag), and why the bulk (DESCGO) label read's IRQ4->$1310 sub sees
+it still 0x95. Likely the model must present the hardware condition (DMA/descriptor-done latch)
+that makes the firmware post 0x8f to the status tag when the bulk transfer truly lands. All
+cont.319 taps read-only, env-gated STORAGER_MODECENSUS.
+
+## cont.320 — RETRACT cont.319: $1320 was a PREFETCH artifact; real stamp is $1a54 (never reached)
+
+Dave's TAGCENSUS ($71f0 write-finder) + A0-direct taps overturned cont.319.
+
+METHODOLOGY CATCH (affects all AS_OPCODES taps near branches): the 68000 core PREFETCHES, so
+an opcode-read tap fires when the prefetch queue reads the word AFTER a taken branch, even
+though that instruction never executes. Proof: at the IRQ4 completion sub $1310,
+  00131a cmpi.b #$8f,(A0) / 00131e bne $1326 / 001320 move.w #$80,($2,A0) [stamp] / 001326 [skip]
+both the STAMP tap $1320 AND the SKIP tap $1326 fired 4x for the SAME four completions
+(cmd 00/87/89/95, identical A0=$71f0, [A0].b = 87/89/95). A completion cannot take both the
+equal and not-equal branch. Since [A0].b is 87/89/95 (never 0x8f), the REAL branch is the
+$1326 skip; $1320 is the prefetch ghost. => $1310 NEVER stamps 0x80, and cont.319's
+"[$71f0].b==0x8f tag gate" is RETRACTED. There is no 0x8f writer because 0x8f is never the
+gate; $1310 is a channel re-launch handler ($3cd4), not the command stamp.
+
+THE REAL STAMP is $1a54 (board-notes; op-ladder walker terminal):
+  001a54 move.b #$80,($2,A0)   ; unconditional 0x80 -> host status, once the walker completes
+Tapped as STAMP80-1A54: fired 2x @6.4s (early commands), **0x in the read window**. Even with
+prefetch, 0 hits => the CPU never comes near $1a54 for the label read: the op-ladder walker
+($156A / jump table $192) never advances the read's data-phase op to the "done" return that
+falls through to $1a54.
+
+RELIABLE (prefetch-immune, model-side data markers) — UNCHANGED and still true:
+- Bulk is firmware-native: DESCGO 42x with drivers OFF (cont.319).
+- Data lands: "8 sectors" / "1024 bytes" 41x native.
+So the data physically arrives; only the op-ladder completion -> $1a54 stamp is missing.
+
+REFRAMED LAST MILE (prefetch-safe method required): the read's data-phase op in the walker
+never returns "done/0x00", so the walker never reaches $1a54. Next census must AVOID opcode
+taps near branches: use DATA-write taps (host IOPB status at m_iopb_addr+2; walker state vars)
+or read the predicate OPERAND at the compare instruction itself (linearly executed, pre-branch)
+and compute the branch offline. Trace: the walker's data-phase op ($192 table entry for the
+read) -> what it returns -> why it never yields the terminal 0x00 despite the data landing.
+All cont.320 taps read-only, env-gated (STORAGER_MODECENSUS / STORAGER_TAGCENSUS).
+
+## cont.321 — park confirmed (prefetch-safe); UIB+$e done-latch never asserted; $73fa is continue-not-terminal
+
+Dave's PHASECENSUS on prefetch-immune instruments (phase-byte WRITE tap + operand reads).
+
+CONFIRMED (phase-byte $7216 write tap, writes only on execution):
+- cmd 87/89: phase 0->4->6->8->**0c** (terminal, $15a4 + $17fe) => complete, $1a54 stamps 0x80.
+- cmd 95 (read): phase 0->4->6->8->**0a** ($15a4 park) and STOPS. Terminal 0x0c NEVER written.
+  op at $15a4 sets 0x0c directly for the degenerate 87/89, 0x0a (park) for the read's data phase.
+
+THE DONE-LATCH (Dave's hypothesis, validated): the terminal lift needs UIB+$e ([$799a]+$e)!=0.
+Census: uib+e = **00** throughout. Never asserted. The data lands (8 sectors/1024B, cont.319)
+but nothing writes UIB+$e, so the park at 0x0a never lifts to 0x0c and 0x80 never posts.
+
+REFINEMENT to the chain: the routine holding $7432/$743e is $73fa (the park-lift). It runs
+EXACTLY ONCE for the read and bails at its FIRST gate: $740a `move.w $7956,D1 / bne` with
+[$7956]==0 -> D0=$69 -> $75a6 (which just sets $727e and rts; $69 is $73fa's return value
+"no work", NOT an error stamp). It never reaches $7432 (phase) or $743e (UIB+$e). Because
+[$7956]==0 is the LEGITIMATE "all 8 blocks transferred" state (cont.310: $70a0 decrements it,
+$7a64 sets at 0), $73fa is the CONTINUE-NEXT-SEGMENT path, correctly returning "nothing more"
+when the transfer is done. It is NOT the terminal lift. So the terminal completion is gated
+purely on UIB+$e, which stays 0 -> park stuck. (Callers $94d8/$9a5e fired 0x; $73fa reached via
+a third path. Minor.)
+
+FAITHFUL-FIX QUESTION (Dave's next read): UIB+$e is written by $17d0 from D0 (packed status ->
+UIB+$d/$e/$f). Is D0 there a gate-array REGISTER read (the model owes the value on
+descriptor/DMA-done) or firmware-internal (a transfer path like $748a the bulk delivery
+bypasses)? Trace D0's source at $17ca/$174e and the condition gating reaching $17d0. That names
+the real done latch the model must assert when the streamed read lands. All cont.321 taps
+read-only, env-gated STORAGER_PHASECENSUS.
+
+## cont.322 — the whole park-stuck chain bottoms out on UIB-options BIT 8
+
+$17d0's D0 source traced (static): $1742 D0 = move.l [$7958] + add.w [$7956]; $174e tst [$791a] /
+bne $17ca. The UIB+$d/$e/$f write ($17ca-$17d6) is on the [$791a]!=0 branch ONLY. So UIB+$e (the
+done-status the park-lift needs) is written iff [$791a]!=0. The done VALUE is firmware-internal
+arithmetic ([$7958].l + [$7956].w) - NOT a gate-array register - so this is not a "model owes a
+register" fix.
+
+[$791a] has exactly ONE writer, $0ed6:
+  000eae move.w ($20,A6),D5   ; D5 = UIB options word (A6=UIB=[$799a])
+  000ed2 andi.w #$100,D0      ; D0 = options & 0x100
+  000ed6 move.w D0,$791a.w    ; [$791a] = UIB-options BIT 8
+cont.318 measured UIB+$20 = 0x8c27; 0x8c27 & 0x100 = 0 => bit 8 CLEAR => [$791a]=0.
+
+COMPLETE PREFETCH-SAFE CHAIN (monitor 0x81 spin -> one bit):
+  0x81 spin <- terminal phase 0x0c never written <- park 0x0a never lifts <- UIB+$e never set
+  <- $174e [$791a]==0 routes status to UIB+$a not UIB+$e <- [$791a] = UIB_options(0x8c27) & 0x100
+  = bit 8 = CLEAR.
+The read's data lands correctly (cont.319); only the completion is mis-routed because UIB-options
+bit 8 is clear.
+
+FAITHFUL-FIX QUESTION (well-posed, one bit): where is UIB+$20 (0x8c27) populated, and is bit 8
+sourced from the host IOPB (CPUAP-supplied - model must convey it) or the firmware command table
+(fixed per command, $152-family constant, cf. cont.318 bit-11 analysis)? And what does bit 8
+mean - "post done-status to UIB+$e on completion." If the CPUAP's label-read IOPB sets bit 8 and
+the model drops it in IOPB->UIB transcription, that is the bug. Same shape as the bit-11 (bulk)
+discriminant. Next: trace UIB+$20's writer and the IOPB->UIB options transcription. Static only,
+no new taps.
+
+## cont.323 — the $8460 bit-8-clear lift handler is NEVER DISPATCHED (not gate-blocked); trigger = [$7b10]
+
+Dave settled the fork from static code: [$791a] = UIB+$20 bit 8 = (table const 0x8c27 & 0x100) =
+0, no host-IOPB OR anywhere. So [$791a]==0 is FIRMWARE-DESIGNED for cmd 0x95, bit 8 must NOT be
+set, and the bit-8-clear terminal lift is $8460 (move.w #$c,($26,A0) = phase 0x0c), selected by
+$844e beq $845c. The $17ca/UIB+$e path (needs [$791a]!=0) was never meant for cmd 0x95.
+
+Static trace of the $8460 dispatch (the $836c/$8416 handler holding $843e->$844e->$8460):
+  $836c ladder (bit-8-clear path): [$74b8]==0, [$7b42]==0, [$7956]==0, [$7a62]==0, [$7958].l==0
+  -> $842e -> $843e (clear $72d6/$72da/$72de/$72e0) -> $844e beq $845c -> $8460 phase 0x0c.
+
+PREFETCH-SAFE RUNTIME (PHASECENSUS, native): LADDER $836c fired **0x** in the whole run. The
+handler is NEVER ENTERED for the read. Not a gate in the ladder - the handler isn't dispatched.
+Corroborated prefetch-immune: PHASE WR $7216 shows 0x `<- 000c pc=008460` (the lift never writes
+phase 0x0c). So cont.311-318's several "reached $8460 / didn't" opcode-tap claims are moot; the
+handler simply never runs.
+
+DISPATCH: $836c is a REGISTERED handler address - stored at $3990 (move.w #$836c,(A3)+) into a
+handler table - and invoked when the [$7b10] one-shot is set ($8320 tst $7b10; beq $8338 / else
+clr $7b10 -> $832c...; and $8352 tst $7b10 -> $835e->$7106). So the bit-8-clear completion lift
+is DISPATCHED BY [$7b10]. For the read, [$7b10] is never armed naturally -> handler never runs ->
+$8460 never lifts -> park stuck at 0x0a.
+
+REFRAMES cont.311: STORAGER_BULKRERUN forced [$7b10]=$ffff and we labeled it "off-route" - but
+that was BEFORE establishing [$791a]==0 is correct. [$7b10] is the DESIGNED bit-8-clear
+completion dispatch, not an HLE hack; BULKRERUN was forcing the RIGHT trigger for the wrong
+(then-unknown) reason. The real question: what NATURALLY arms [$7b10] for a completed bulk read?
+cont.311 noted [$7b10] armed only at $6ed6 (from $948e rw-setup). Next (joint, prefetch-safe):
+trace $6ed6's arm condition and why the native bulk-read completion path doesn't reach it - and
+re-audit the cont.311-318 [$7b10] observations under the prefetch filter. All cont.323 taps
+read-only, env-gated STORAGER_PHASECENSUS.
+
+## cont.324 — parity/stake path is DORMANT on the native bulk read (resolves the cadence question)
+
+Dave's $8a20/$8a38 analysis: [$7950] parity reset ($8a38 clr) fires only on NON-staking rounds;
+on a staking round parity is left to accumulate. So the reset is "in time" only if a clear-round
+falls between each pair of staking rounds - a real per-sector-cadence dependency ON THE STAKE
+PATH. Question posed: is that the "sectors 1-2 land, sector 3 diverges" cause?
+
+Prefetch-immune census (write-taps, native drivers-off): SEC LEDGER ($7654 f0-stake/c0-convert)
++ PAR [$7950] (toggles/ID-clears with PC). Taps VERIFIED working (fire abundantly early), so
+zero-in-read-window is real, not a dead probe:
+- SEC LEDGER: 159 writes, ALL @0-3s. ZERO after @3s. (read window @7.9-8.4s)
+- PAR [$7950]: 600 writes / 256 toggles, ALL @0-5s. ZERO in the read window.
+- Data still lands: 8 sectors / 1024 bytes 66x, DESCGO 67x.
+
+CONCLUSION: the native cmd-0x95 bulk read delivers via DESCGO WITHOUT touching the per-sector
+f0-stake ledger or the [$7950] parity alternator. Those belong to the [$791a]!=0 per-sector
+path (cont.322), dormant here. So the parity-cadence failure mode, though a correct reading of
+the stake code, is NOT the native blocker. The "sector 3 diverges / two revolutions" symptom was
+a cont.294-317 artifact of FORCING the per-sector path with SLOTGEO/ONEIRQ5; with drivers off
+the stake/parity is bypassed and ONEIRQ5's help was incidental (it perturbed a path not used).
+
+So the native blocker stands at cont.323: DESCGO lands the data, [$7956]==0 (cont.321), but the
+[$7b10] one-shot never arms -> the $8460 bit-8-clear lift handler ($836c) never dispatches ->
+phase stuck at 0x0a -> no $1a54 0x80. Next anchor UNCHANGED: what naturally arms [$7b10] at
+$6ed6 (from $948e rw-setup), and why the native DESCGO completion doesn't reach it. All cont.324
+taps read-only, env-gated STORAGER_PHASECENSUS.
+
+## cont.325 — the firmware NEVER issues the E800 bit12 DMA-GO for the label read (refines FAITHXFER)
+
+Dave's redirect: bulk completion is IRQ4/DESCGO, and he suspected the baseline flux->host
+short-circuit pre-empts the fw's $748a transfer. Instrumented the E800 bit12 kick (prefetch-immune
+register write) + FAITHXFER A/B.
+
+DECISIVE (prefetch-immune):
+- XFER-KICK (E800 bit12 rising edge, cmd 94/95): 2 total, BOTH @6.4s (early cmd-95 @pc=3d4a,
+  c000=e70000). ZERO in the read window @8s. Same in baseline AND FAITHXFER on.
+- E800WR read-window census: 120 E800 writes @7.97-9.5, **0 with bit12 set**. 92 are pc=3c0e
+  (the IRQ4 handler: $3c02 andi #$efff,$79f6 clears bit12; $3c08 writes to E800 = the IRQ4 ACK).
+  So in the read window the fw only ever CLEARS bit12 (acks); it never sets it (never GOes).
+- FAITHXFER on: still 0 kicks, and delivery BREAKS (8 sectors 66->1). So the short-circuit is
+  NOT what suppresses the kick - turning it off doesn't make the fw kick. REFUTES the specific
+  "short-circuit pre-empts $748a" framing.
+- DESCGO (67x) is the descriptor-CONSUMPTION marker at $417a, NOT the DMA-GO. The fw consumes
+  descriptors but never launches the transfer.
+
+So: the fw parks at 0x0a and NEVER calls the channel-launch $3cd4 (board-notes: PIT/C000/E800
+bit12 kick; kick tail $3d42 ori #$1000,(A1) / $3d46 move (A1),E800) for the label read's data
+phase. The data reaches host only via the model's baseline short-circuit; the fw's own transfer
++ completion never run. IRQ4 $3bfe (64x) is the short-circuit's DESCDONE, not a fw-commanded
+transfer-complete.
+
+FRONTIER (re-connects to cont.294-318 [$7a64], flagged for re-audit): why is $3cd4 never called
+for the label read? $3cd4 callers = $1342 (inside $1310 IRQ4-completion sub) and $4102 (DESCGO
+launch, gated [$7a64]!=0, cont.318). For the early cmd-95 @6.4s $3cd4 WAS called (kick fired);
+for the @8s label read it is not. The park-at-0x0a-vs-launch relationship is the fw-flow question
+- and it ties back to the [$7a64]/channel-launch gating we spent cont.294-317 on, now to be
+re-read under the prefetch filter + bulk-native understanding. NEXT (joint, prefetch-safe): trace
+$3cd4's callers and the gate that fires it for the early cmd-95 but not the label read. cont.325
+taps read-only, env-gated STORAGER_XFERCENSUS.
+
+## cont.326 — ENDEC verdict: fw WANTS per-sector capture; parity cadence stalls it (cont.324 RETRACTED)
+
+Dave's STORAGER_ENDEC (log-only): does the fw engage the ENDEC (E802 bit11 -> m_serdes_active) in
+the read window? VERDICT (native): YES, decisively.
+- ENDEC-ENGAGE cmd=95 @8s: 116+/bucket, continuing 120/bucket through @15s (fw STUCK re-engaging).
+- ENDEC-CAPTURE (flux IRQ6 marks) @8s: 40/bucket, 321 total, ALL serdes=1 skip=0 (captures fire,
+  NOT window-suppressed).
+- [$7956] decrements 8->7->6->5 (or ->6) then STICKS; never reaches 0. So 2-3 sectors convert,
+  then conversion stalls.
+
+=> Dave's decision tree lands on branch 1 + parity: the fw engages the ENDEC (wants the bitstream,
+per-sector capture is the RIGHT stimulus), captures fire skip=0, but the ledger stops converting
+after 2-3 sectors. That is the parity $8a38 reset-cadence (Dave's earlier analysis), CONFIRMED.
+
+REPRODUCIBILITY (RTC-seeded non-determinism, the smoking gun): run1 [$7956] stalls at 5 (parity
+593 toggles + 22 ledger stakes @8s); run2 stalls at 6 (parity 0 + ledger 0 @8s). Robust every
+run: ENDEC engaged, captures skip=0, [$7956] never 0, no boot. Variable: WHICH sector stalls +
+whether parity stays alive - exactly "whichever sector's ID-IRQ coincides with an un-reset odd
+phase" (2xIRQ5+IRQ6 = odd net flip/sector; $8a38 resets only on non-staking rounds; jitter drops
+a stake).
+
+RETRACT cont.324: "parity/stake path dormant @8s -> redirect to FAITHXFER/IRQ4/DMA-GO" was based
+on a SINGLE non-deterministic run (a run2-like trajectory where parity died early @8s). The ENDEC
+diagnostic proves the fw DOES engage the ENDEC and wants per-sector capture. So the cont.325
+DMA-GO/E800-bit12 thread was the WRONG completion path: the label read completes via per-sector
+ENDEC capture + $92b4 stake (ledger ff->f0->c0, [$7956]->0), NOT the bulk DMA-GO. cont.325's fact
+(no bit12 kick @8s) is CONSISTENT - the read is capture-based, not DMA-GO-based - but its framing
+("fw never launches the transfer") was wrong: the fw IS transferring, per-sector.
+
+So we are back on cont.294-317 ground, now CORRECTLY grounded by the fw's ENDEC-engage: the fix is
+the CAPTURE CADENCE - present the flux IRQs so $8a38's parity reset stays in time for every sector
+(all 8 stake), deterministically. NOT ONEIRQ5's blunt suppression, NOT SLOTGEO's c0-poke, NOT
+descriptor-done, NOT CAPIRQ (captures already fire skip=0). NEXT: the per-sector IRQ cadence that
+keeps [$7950] parity aligned - the faithful gate-array flux timing. All cont.326 taps read-only,
+env-gated STORAGER_ENDEC / STORAGER_PHASECENSUS.
+
+## cont.327 — VALIDATED ROOT: no sector is ever staked (parity cleared before the stake fork)
+
+Dave's PARCENSUS. Two self-caught corrections en route (guardrail: verify the probe fires before
+trusting zero):
+1. $92b4 (Dave's tap) is only ONE of several old-bit=1 handlers - others stake inline ($28ea
+   capture-arm) or route elsewhere; the ACTUAL f0-stake is $92f6 ($9312 move.b #$f0,($7654,aim)).
+   Retargeted the tap $92b4 -> $92f6 (+ $933c convert).
+2. cont.326's "22 ledger stakes @8s" were MISLABELED - they were non-f0 ledger writes (init slot
+   IDs 6b6b-7e7e, converts c0c0, fe/ff), NOT f0 stakes. There were no stakes.
+
+VALIDATED FINDING (two independent prefetch-safe probes AGREE): across 5 runs, PAR STAKE $92f6 =
+0 (all time) AND SEC LEDGER f0-writes = 0. No f0 is EVER written to the ledger. Every capture-IRQ
+parity fork takes $89f2 (skip); the two-event stake/convert contract never BEGINS. So [$7956]
+never reaches 0 and the read never completes. (This is TOTAL, not "sector 3 drifts" - every
+sector skips, consistently across runs. The cont.326 non-determinism in [$7956] came from the
+$83dc sub decrementer, not stakes.)
+
+CADENCE (why old-bit stays 0 at the stake fork): read-window [$7950] toggles 0x0101<->0x0000 via
+$2994/$29c8 (bchg #0), but TWO clears fire after each toggle - pc=008a3e (the $8a38 ID-clear) +
+pc=0088d6 - wiping parity to 0. Counts: 254 toggles-to-0101, 339 writes-to-0000 (clears dominate).
+The alternator is clear-heavy, so the accumulated parity never presents old-bit=1 at the
+$92b4->$92f6 stake handler's fork. (Some inline handlers DO hit old-bit=1 - e.g. $29c8 toggling to
+0x0000 = old-bit was 1 - but those route to capture-arm $28ea, not the f0-stake $92f6.)
+
+ANSWER to Dave's cadence question, measured: currently NEITHER stake nor convert ever lands
+old-bit=1; the model's per-sector IRQ cadence (2xIRQ5 + IRQ6 = clear-heavy) never aligns the
+stake fork. The fix is the flux IRQ cadence: the per-sector IRQ5/IRQ6 count+order that leaves the
+$92b4->$92f6 stake fork on old-bit=1 (and the $933c convert too), WITHOUT the $8a3e/$88d6 clears
+wiping it first. Concrete anchors for the cadence design: toggles $2994/$29c8, clears $8a3e
+($8a38) + $88d6, stake fork $92b4->$92f6, convert $933c. NEXT (joint): map each read-window IRQ5/
+IRQ6 to its $29xx handler + fork, to see which IRQ must move/drop so the stake handler sees
+old-bit=1. All cont.327 taps read-only, env-gated STORAGER_PARCENSUS.
+
+## cont.328 — the handler map: stake handler IS hit, parity always even (toggle-parity, not arm-sync)
+
+MAPCENSUS. Guardrail correction #1: Dave's $9884 tap = 0 everywhere (mis-targeted). The real IRQ
+dispatch is the vector-entry pushers $26a8 (RTS to [$7300]) / $26ae (RTS to [$7304]) - [$7300]/
+[$7304] (LONGs) are the armed-handler selectors, NOT [$7940]; $9884 is unrelated. Fixed tap to
+read_dword([$7300]/[$7304]) at $26a8/$26ae (validated: fire 322/483x).
+
+THE MAP (read window @8s):
+- IRQ-A ([$7300]) = handler $29c0 (322x): bchg $7950; bne $8018 / bra $7ba8.
+- IRQ-B ([$7304]) = handler $298c (483x) = the STAKE handler: bchg $7950; beq $89f2 (skip) /
+  bra $92b4->$92f6 (stake). Hit with [$742c]=0001 (STAKE-ELIGIBLE) but [$7950]=0000 (old-bit=0)
+  every time -> always skips.
+
+=> Dave's decision tree: NOT arm-sync (the stake handler $298c IS armed and hit 483x). It is
+TOGGLE-PARITY: the fork is reached with the wrong parity. The stake handler always sees old-bit=0.
+
+INTERLEAVE (per sector, time-ordered): IRQ-B $298c (bit0=0, SKIP) -> CLR $8a38 -> CLR $88d0 ->
+then [IRQ-A $29c0 + IRQ-B $298c fired ~simultaneously (1us apart), both bit0=0] repeating. The
+IRQ-A/IRQ-B are PAIRED (same capture -> two vector entries): 2 bchg toggles = EVEN net flip, so
+bit0 returns to 0 at the $298c fork. Plus CLR $88d0 fires 476x (~1 per IRQ-B) + $8a38 161x,
+wiping any residual. So the stake fork never sees old-bit=1.
+
+ROOT (measured, validated): the paired IRQ-A+IRQ-B per capture = even toggle parity at the $298c
+stake fork -> always old-bit=0 -> always $89f2 skip -> no f0 stake -> [$7956] never 0 -> read
+never completes. The clears ($88d0/$8a38) reinforce it. This is the two-event contract's stake
+event falling to skip on EVERY sector (cont.327's "total skip"), pinned to the paired-IRQ cadence.
+
+CADENCE-DESIGN HANDOFF (Dave's call): present an ODD toggle count at the $298c fork. The model
+currently raises IRQ-A($29c0)+IRQ-B($298c) paired per capture (2 toggles). Options to weigh:
+drop/re-order one of the pair so $298c's fork lands old-bit=1; or move the $88d0/$8a38 clear off
+the between-toggle-and-fork slot. NOT ONEIRQ5's blunt line-898 suppression (cont.319: collapses
+DESCGO - it dropped the wrong IRQ). Anchors: IRQ-A vector $26a8->[$7300]=$29c0, IRQ-B vector
+$26ae->[$7304]=$298c(stake), toggle bchg in each handler, clears $88d0($88ac re-arm)/$8a38(ID).
+The model's flux IRQ raises: line 651 (IRQ5), 898 (2nd IRQ5), 682/747 (IRQ6). Map those to
+IRQ-A vs IRQ-B to know which raise = which vector. All cont.328 taps read-only, STORAGER_MAPCENSUS.
+
+## cont.329 — VECPIN: stake vector = IRQ6 ([$7304]=$298c), fed by model line 746 (Case 1)
+
+Reconciliation: board.yaml is a synthesis of our own passes, NOT authoritative (only firmware +
+photos are). Retract "board.yaml contradicts cont.328" - its [$7304]=$299A is VERIFY-PHASE, a
+different mode than the @8s bulk read. Settled by write-tap (prefetch-immune), not inference:
+
+CASE 1 CONFIRMED. At $298c stake ENTRY (read window, 161x): [$7304]=00298c ALWAYS, 742c=0001
+(stake-eligible), 7950=0000 (parity even -> skip). [$7940]=29c0 there, so $298c is NOT a [$7940]
+dispatch - it fires from the IRQ6 trampoline $26ae -> [$7304]=$298c. So IRQ6 IS the stake vector
+in the bulk read.
+
+SOURCE of [$7304]=$298c (reconciles both cases): $3292 routine copies [$7940] -> vector slot
+$72ec+[$7942]; when [$7942]=0x18 that slot is $7304. [$7940]=$298c (armed $607a) is copied into
+[$7304]. So $298c is a [$7940] handler AND the live IRQ6 vector - no contradiction; the stake
+fires from IRQ6.
+
+MODEL->VECTOR MAPPING (firmware-independent, confirmed): per sector -
+- IRQ5 #1 (line 651, always) -> 68000 IRQ5 -> $26a8 -> [$7300]=$29c0 (data AM; forks $8018/$7ba8,
+  NOT stake).
+- IRQ6 (line 746, the ID address-mark C/H/R/N) -> 68000 IRQ6 -> $26ae -> [$7304]=$298c (STAKE;
+  bchg $7950; beq $89f2 skip / bra $92b4->$92f6 stake). <-- THE STAKE FEED.
+- IRQ5 #2 (line 901, data-done; ONEIRQ5-suppressible) -> IRQ5 -> $29c0.
+- (line 682 IRQ6 = IAM index-gap, different path; 3503/etc off-route.)
+
+So the stake handler $298c is fed by model line 746 (ID mark IRQ6). It fires parity-even
+(old-bit=0) -> skips (cont.328). The cadence lever is line-746 IRQ6 timing relative to the IRQ5
+raises (651, 901) and the clears ($8a38/$88d0), so [$7950] bit0=1 (odd) when IRQ6/$298c forks.
+Dave's original "IRQ6 -> toggle-parity" instinct was correct; ONEIRQ5 (line 901) was the wrong
+lever (drops an IRQ5, not the parity-at-746 alignment; and collapses DESCGO, cont.319).
+
+LEAD (not verdict): board.yaml ~408 cont.246 STORAGER_IDX5 (raise IRQ5 at IAM when en&0x0200)
+claims a measured 0x82->0x80 sense flip. OFF natively. Re-check against firmware + a fresh run as
+a lead, not face value. NEXT: design the line-746 IRQ6 cadence (count/order vs 651/901 + clears)
+to leave the $298c fork odd. All cont.329 taps read-only, env-gated STORAGER_VECPIN.
+
+## cont.330 — ARMCENSUS: parity is ARMED not toggled; [$796e]=0 (NO-SET) is why no stake
+
+Dave's static find: the $29c0 old-bit=0 leg ($7ba8) is a re-arm that at $7bc0 sets [$7950]=1 IFF
+[$796e]<0 ($7bb4 tst; bge $7bcc no-set). So the stake parity is an explicit ARM, not a toggle
+race: an IRQ5 landing on $7ba8 with [$796e]<0 sets [$7950]=1, making the NEXT ID-IRQ6 ($298c) see
+old-bit=1 -> stake. The two IRQ5s are non-interchangeable (one -> $8018 DESCGO slot, one -> $7ba8
+parity arm); that's why ONEIRQ5 breaks it (deletes one of two different jobs).
+
+MEASURED (ARMCENSUS+MAPCENSUS, native): at $7ba8 in the read window, [$796e]=0 -> NO-SET, 319x
+(all-time; never <0). ARM-SET $7bc0 fires 0x ever. $8018 (DESCGO slot / old-bit=1 fork) 3x. So
+the parity is NEVER armed -> $298c always old-bit=0 -> skip -> no stake. This is Dave's branch-1
+bet CONFIRMED: [$796e]>=0 @8s, a STATE question not an IRQ-count one. (Guardrail: the arm path is
+valid - [$796e] writers can set it negative, $8018 fires - so NO-SET is a real finding, not a
+dead probe.)
+
+[$796e] MODE-MAP ($1052-$1134, gated on D0 bit5/bits3-4 + (A0)==0x99):
+  +1  = D0 bit5 set, D0&0x18==0            ($1066)
+  -1  = bit5 clear / D0&0x18==0x08         ($109a/$10b0)  <- ARMS
+  -16 = D0&0x18==0x10                      ($10d6/$10f6)  <- ARMS
+   0  = the $110a->$1134 leg               ($1134)        <- NO-SET (bulk read lands here)
+So [$796e] is mode-derived (like bit11 bulk / bit8 [$791a]); the bulk read's mode routes it to 0.
+
+OPEN (Dave's discriminant call, per the cont.322 lesson - don't assume a mode value is "wrong"):
+is [$796e]=0 CORRECT for the bulk read (=> the $7ba8 parity-arm is NOT this read's stake trigger;
+the stake comes another way) OR should the mode yield [$796e]<0 (=> the mode-setup/D0 discriminant
+is mis-derived and the model mis-presents it)? Anchor: trace D0 at $1052 for the bulk read - where
+its bit5/bits3-4 come from (UIB options? the same $8c27 word?), and the (A0)==0x99 descriptor
+byte. That names whether [$796e]=0 is intent or a dropped condition. All cont.330 taps read-only,
+env-gated STORAGER_ARMCENSUS.
+
+## cont.331 — MODE796E: the arm discriminant reads a FIRMWARE node field, not the CPUAP IOPB (fork 1)
+
+The [$796e] arm gate is $103e move.b ($12,A6),D0 / $1042 andi #3 / $104a bne (needs &3==3). Dave's
+premise: A6+$12 is inside the 0x18 host-fetched IOPB -> a CPUAP field. TESTED (MODE796E), and the
+premise does NOT hold:
+- At the discriminant (@6.412914, cmd=95): A6=$6e60, fetch(A6+$12)=0x40 (&3=0 -> NO-ARM). The
+  CPUAP source IOPB+$12 (m_bus[m_iopb_addr=$fe780 +$12]) = 0x0f (&3=3 -> would ARM). They DIFFER.
+- BUT A6=$6e60 = [$799a] = a firmware CCB/UIB NODE, not the raw host IOPB. Write-tap on the
+  discriminant byte $6e72: written by FIRMWARE - pc=$3d4a (channel-launch/node-setup) writes 0x40
+  high @6.40 (just before the discriminant), pc=$086e writes 0x44/0x32 in init. NOT copied from
+  the CPUAP IOPB. So node+$12=0x40 is a firmware-managed status field; the CPUAP's IOPB+$12=0x0f
+  is unrelated to this discriminant (red herring).
+- Also: $1042 runs ONCE @6.4s, never @8s -> [$796e] is latched at the early channel setup; the @8s
+  bulk read inherits it (does not re-derive).
+
+=> FORK 1: [$796e]=0 is FIRMWARE state, derived from the firmware's own node field (set at the
+channel-launch ~$3d4a), not a dropped/misfetched CPUAP field. The model is NOT losing a host
+field. So the $7ba8 parity-arm is gated on firmware node state that reads NO-ARM (node+$12=0x40,
+&3=0) for this launch.
+
+OPEN (the real question, now correctly framed): is node+$12=0x40 the CORRECT firmware state for a
+bulk label read (=> the $7ba8 parity-arm genuinely isn't this read's stake trigger; the bulk stake
+comes another way - back to the cont.319-325 DESCGO/IRQ4 completion, or a not-yet-found path), OR
+should the channel-launch at ~$3d4a have set node+$12 with &3==3 for a staking read (=> the launch
+node-setup is the miss)? The channel-launch $3cd4/$3d4a region is the same one cont.325 found never
+issues the bulk DMA-GO. Both threads converge there. NEXT (Dave's call): what determines node+$12
+at $3d4a (0x40 vs a &3==3 value) - is it mode/command-derived, and what SHOULD a bulk read set?
+All cont.331 taps read-only, env-gated STORAGER_MODE796E.
+
+## cont.332 — the ledger is NEVER converted @8s; #4 refuted; bulk completion reaches $1310 but stalls
+
+Testing Dave's "four-way per-sector exclusion + descriptor-done -> ledger-convert" redirect
+(PHASECENSUS+MODECENSUS, native):
+
+#4 REFUTED (not a clean exclusion): IRQ4 $3bfe -> $1310 (completion sub, reached only on the
+[$743a]==[$7a14] identity MATCH) fires ~12x @8s. So the IRQ4 completion IS reached under the bulk
+identity - it does not reject the transfer-complete. ($3c1c/$3c32 both 40 = prefetch noise; $1310
+is the real signal.) => 3-way firmware-intent exclusion (bit-11, bit-8, [$796e]), not 4.
+
+LEDGER NEVER CONVERTED @8s (challenges the redirect): SEC LEDGER ($7654 write-tap, prefetch-immune)
+= ZERO writes in the read window @>7.9. No f0 (stake), no c0 (convert), nothing. Reproducible
+(cont.324: 159 writes all @0-3s, 0 after). The tap works (fires 159x early), so the zero is real.
+cont.327's c0c0 values were @0-3s init, NOT @8s converts. => there is NO ledger conversion during
+the bulk read - per-sector OR descriptor-done. So "trace $3bfe's bulk branch for a ledger write"
+comes up empty; the ledger->[$7a64] chain is DORMANT @8s.
+
+HONEST DIVERGENCE from the redirect: the un-excluded path is not "descriptor-done -> ledger-convert"
+(no ledger write happens @8s). What DOES happen @8s: ENDEC engaged + captures fire but skip
+(cont.326/328); [$7956] decrements via $83dc (not the ledger); IRQ4 $3bfe fires -> $1310 REACHED
+(~12x); but $1310 does not stamp (tag != 0x8f, cont.320) and the terminal $1a54 (via the [$7b10]-
+dispatched $8460 lift) never fires because [$7b10] never arms (cont.323). So the completion is
+ATTEMPTED (reaches $1310) and STALLS before the terminal stamp - with the whole ledger/[$7a64]/
+DMA-GO machinery dormant.
+
+So the sharp question is NOT the ledger convert; it is: the IRQ4 completion reaches $1310 ~12x but
+never advances to the $1a54 terminal stamp. WHY does $1310 (reached) not finish - what state does
+it check ([$7a76]? the [$7b10] arm?) that the bulk read never satisfies. That is the bulk read's
+own completion, reached-but-stalled, isolated at last from BOTH the per-sector machinery (excluded)
+AND the ledger convert (never happens). NEXT: trace $1310's post-entry path @8s - the 12x that
+reach it, where they exit short of the stamp. All cont.332 taps read-only.
+
+## cont.333 — $1310/$1320 is a DEAD stamp path for ALL commands; real 0x80 is $1a54 (closes the tag thread)
+
+Dave's reframe: maybe cont.319's $71f0 write-tap watched the wrong byte - $1310 gates on [$7a06]+0,
+and [$7a06] might be the $141e DESCGO node, not $71f0. MEASURED (MODECENSUS mc_tag, $1310 entry
+reads [$7a06] + its tag byte - value reads, $1310 is a bsr target so reached-is-valid):
+
+- [$7a06] = 71f0 for EVERY $1310 call: cmd 87, 89, 95; early @6.4s AND read window @7.9s. NEVER a
+  DESCGO node. So cont.319's $71f0 write-tap WAS the correct byte; the reframe is refuted by
+  measurement.
+- The tag at [$7a06]+0 is NEVER 0x8f (0 occurrences, any cmd, any time) - always the raw cmd byte
+  (87/89/95). So $131a cmpi.b #$8f is never satisfied -> $1320 is a DEAD path for EVERY command.
+- Completing commands 87/89 stamp 0x80 via $1a54 (STAMP80-1A54 2x @6.4s), NOT $1310/$1320.
+
+=> The reached-but-stalled $1310 (cont.332) is a RED HERRING: it never stamps for anyone. cont.320's
+retraction stands and is now complete - $1320 is dead universally, not a bulk-specific miss. The
+real 0x80 is $1a54 (the walker terminal), as Dave's fallback predicted.
+
+CONVERGENCE (all threads now closed except one): per-sector staking excluded 3 ways (cont.331);
+ledger never converted @8s (cont.332); $1310/0x8f stamp dead for all (this). Everything reduces to
+the SAME un-excluded question, exactly cont.321-323: the bulk read PARKS at phase 0x0a and never
+lifts to 0x0c/$1a54, while 87/89 reach 0x0c immediately (degenerate). The 0x0a->0x0c lift is $8460
+(the bit-8-CLEAR path, CORRECT for the bulk read per cont.322), dispatched by the [$7b10] one-shot
+($836c handler), which never arms (cont.323: LADDER $836c fired 0x). NEXT, decisive + prefetch-
+immune: WRITE-tap [$7b10] - is it ever armed in the read window, and by whom ($6ed6 per cont.311)?
+That is the single gate the whole exclusion funnel points at. All cont.333 taps read-only.
+
+## cont.334 — RETRACT cont.323: [$7b10] DOES arm; $6f44 runs but the ledger has no positive slots
+
+Write-tap on [$7b10] (prefetch-immune), native:
+- B10 WR $7b10 <- ffff pc=$6edc 7956=0000 cmd=95 @7.963409 -> ARMED in the read window (the $6ed6
+  arm site, cont.311). Consumed at pc=$6f40 (cmd=95).
+So [$7b10] IS armed once @8s. cont.323's "[$7b10] never arms -> $836c LADDER 0x -> $8460 lift never
+dispatches" is RETRACTED - the one-shot fires. (The cont.323 $836c opcode tap reading 0 was the
+mis-read; the write-tap is authoritative.)
+
+WHAT [$7b10] DISPATCHES: $6f40 (the consume) is the $6f44 stocker (cont.311: the bulk transfer-queue
+builder - scans the ledger, converts POSITIVE-slot# bytes to c0, resets NEGATIVE to ff), NOT the
+$8460 lift. So [$7b10] gates $6f44 (cont.311 correct), and $6f44 RUNS @7.963.
+
+THE GAP (converges with cont.332): $6f44 runs but the ledger is never written @8s (cont.332: 0
+ledger writes) -> $6f44 scans an empty/all-ff ledger and converts NOTHING (no positive slots ->
+no c0 -> [$7956] never decremented via the ledger -> completion never reached). So the stocker
+(converter) fires correctly; its INPUT - positive slot#s in the ledger - is never populated.
+
+THE REMAINING QUESTION, now sharp (Dave's cont.332 open item, refined): WHO writes the POSITIVE
+slot#s to the ledger for the bulk read's delivered sectors? $6f44 only CONVERTS positive->c0; it
+does not write the positive slots. Per-sector $92b4/$298c stake is excluded (cont.331). $417a
+doesn't (cont.323). So a descriptor-done slot-writer is missing - exactly what SLOTGEO/FILLMAP
+faked (cont.311/312: poke slot# at $7654+n). The faithful mechanism: on each DESCGO sector
+delivered, the positive slot# must appear in the ledger so $6f44 converts it. NEXT: trace $6f44's
+ledger scan @7.963 (confirm it reads all-ff / no positive slots), and find where the firmware
+EXPECTS the positive slot written on DESCGO delivery - the gate-array signal the model owes. All
+cont.334 taps read-only, env-gated STORAGER_B10WR.
+
+## cont.335 — SLOTCUR: the ledger is NOT empty (stale c0 from @6.4s); and a methodology reckoning
+
+SLOTCUR ($6f56 scan cursor, native FWDONE+AAFIX): at $6f44 @7.963 the scan window
+$7654+[$7954]=$7655..+7 = ALL c0 (not empty). Cursor [$7954]=1, count [$7abc]=8, aim=0.
+- The c0 is FIRMWARE-written (pc=$1280, 68 ledger writes @6.401) - the @6.4s cmd-95's own
+  conversion - and STALE into the @8s read. NOT the LASTC0 HLE poke (that env is OFF), NOT SLOTGEO
+  (off). So the "empty ledger / missing slot-writer" of cont.332/334 was a NON-REPRESENTATIVE run:
+  cont.324/332 happened to catch a run with 0 ledger writes; this run has 68 @6s. RTC non-determinism.
+- The sec_led tap's displayed address (0x162fc..) is a computation bug (0x7654+off*2, off=absolute);
+  the writes are genuinely in [$7654,$7667].
+
+METHODOLOGY RECKONING (honest): this session has overturned its own "decisive" findings repeatedly -
+cont.320 (prefetch ghost $1320), cont.324 (parity "dormant" = capped/non-det run), cont.323
+([$7b10] "never arms" = write-tap says it does), cont.332/334 ("empty ledger" = stale c0 this run).
+The common causes: (a) RTC-seeded NON-DETERMINISM (cont.326: runs diverge - ledger empty vs c0,
+[$7956] stalls at 5 vs 6, parity active vs dead), so single-run censuses flip run-to-run; (b)
+residual HLE in the "native" baseline (LASTC0/FIXEDSLOT/IOPB80 pokes exist, FWDONE/LASTC0-gated;
+plus the memory's read95/IOREG/BYPASS/m_sectors) - "native" (FWDONE+AAFIX) is not provably fully LLE.
+
+So single-address micro-census has hit diminishing returns / thrash. PREREQUISITES before more
+completion tracing: (1) characterize the RTC non-determinism - is it a real HW race the firmware
+tolerates, or a model timing artifact? until runs reproduce, each census can flip; (2) audit the
+residual storager HLE per the LLE mandate - enumerate exactly what FWDONE+AAFIX still pokes, so
+"native" means native. THEN re-establish the ledger->[$7956]->phase-0c->$1a54 completion picture on
+a clean deterministic baseline, with MULTI-RUN distributions not single runs. This is the honest
+higher-value step vs another single-address overturn. All cont.335 taps read-only.
+
+## cont.336 — BREAKTHROUGH: the synthetic IRQ4 storm was the disruptor; IRQ4CLEAN completes the read
+
+Dave's IRQ4 seven-raise map + STORAGER_IRQ4CLEAN (gate #1 FLUX-DESCDONE, #7 DESCDONE-POS, #2
+chancomplete-tick for cmd 0x95) + STORAGER_SVEC state-vector A/B matrix, 6 seeds each.
+
+DETERMINISM: BOTH A (baseline) and B (IRQ4CLEAN) are PERFECTLY reproducible (6/6 identical). So the
+"non-determinism" of cont.326 was OVERSTATED / config-artifact - the baseline is deterministic. The
+read-window IRQ4 comes ONLY from #1 (FLUX-DESCDONE 20x) + #2 (chancomplete-tick 961x) - both
+synthetic HLE; #5/#7 never fire natively.
+
+A vs B (deterministic difference, not jitter):
+- A baseline: 981 synthetic IRQ4/read-window -> ledger STUCK c0=3 ff=5, [$7956]=0005, phase parked
+  0x0a, no $1a54 (last stamp @6.4s).
+- B IRQ4CLEAN: synthetic storm gone -> ledger FULLY CONVERGES c0=8 ff=0, [$7956]=0000, phase reaches
+  terminal 0x0c ($15a4/$17fe 6x), $1a54 STAMPS 0x80 @7.701 (+@10.3/@12.9).
+
+=> The model's synthetic chancomplete IRQ4 storm (961x) was DETERMINISTICALLY STALLING the read:
+re-entering $3bfe repeatedly, resetting the ledger/phase, holding it at 0x0a/c0=3. Suppress it and
+the STANDARD walker completes (0->4->6->8->0c->$1a54), LADDER $836c=0 (the $8460/[$7b10] lift was a
+red herring all along - cont.321-334). This is an LLE-faithful removal of an HLE disruptor, exactly
+the mandate: the model must NOT fire synthetic completion IRQ4s; the fw's own kick drives it.
+
+REMAINING: B stamps 0x80 at $1a54 (local status node) but re-issues the read (~2.6s cadence: @7.7,
+@10.3, @12.9) and no boot - so the 0x80 likely does not reach the HOST IOPB (m_iopb_addr+2). Under
+FWDONE the fw transcribes its own status; need to confirm the $1a54 stamp propagates to the host so
+the CPUAP monitor advances past testend. NEXT: tap the host IOPB status write - does 0x80 reach
+m_iopb_addr+2 after $1a54, and if not, why the transcription stalls. This is now on a CLEAN,
+DETERMINISTIC, ledger-complete baseline. IRQ4CLEAN is A/B-gated (no baseline change when off).
+
+## cont.337 — the last mile isolated: read completes at $1a54 but never posts the mailbox/host
+
+Two fixes + a host-side probe on the cont.336 clean baseline:
+- Fixed IRQ4CLEAN over-suppression: #1 now keeps the state updates (m_read_pending=false) and gates
+  ONLY the synthetic IRQ4 raise (the mailbox->host transcribe gates on !m_read_pending; the old
+  whole-block gate masked completion).
+- STORAGER_NOHOSTPOST (suppress-flag, default off = baseline unchanged) gates the model's host-IOPB
+  transcription (lines 5308-5318). STORAGER_HOSTTAP = multibus write-tap on 0xfe782 (host status).
+
+MEASURED (IRQ4CLEAN, native):
+- $1a54 stamps the LOCAL status 0x71f2=0x80 (5x: the 87/89 @6.4s + the bulk read @7.7/10.3/12.9).
+- With NOHOSTPOST: HOST 0xfe782 writes = 0. So the FIRMWARE does NOT write the host status itself.
+- IOPB-FWSTAT (the model's mailbox->host transcribe) = 0. The transcribe fires only when the fw
+  writes the mailbox 0x7fe8 with bit7 (done) - and the fw NEVER does in the read window.
+=> The read completes INTERNALLY ($1a54 local stamp, ledger c0=8, phase 0c) but the completion does
+NOT propagate: the fw neither writes the host IOPB directly NOR posts the mailbox-completion. The
+CPUAP monitor (polls 0xfe782) never sees 0x80 -> re-issues every ~2.6s.
+
+So the model host-POST is NOT a redundant disruptor here (Dave's "yes" fork is OUT): it CAN'T fire
+because the fw never posts 0x7fe8. This is the "No" fork: a fw post-$1a54 step is not running. The
+completion protocol: walker terminal $1a54 (local stamp) -> [missing] -> mailbox post $7fe8-w/done
+(fw @~$2604) -> model transcribes -> host 0xfe782 -> monitor advances. The gap is $1a54 -> $2604.
+
+NEXT (the real last mile, on the clean deterministic baseline): trace the fw's path from $1a54 to
+the mailbox-completion post ($2604 / wherever 0x7fe8|0x80 is written). Why does the walker terminal
+NOT lead to the mailbox post for the bulk read (does it for 87/89 @6.4s)? Compare the completing
+87/89 path vs the stuck 95 path from $1a54 onward. IRQ4CLEAN/NOHOSTPOST/HOSTTAP all A/B-gated.
+
+## cont.338 — ANNOUNCE census: uniform $1a54 route; read reaches $1a54 but not the announce/done-post
+
+Dave corrected his bit-6 claim; the announce is $76c4->$76e0([$7a74])->$7fe8-post, not $1a54's own
+byte. ANNOUNCE census (IRQ4CLEAN+NOHOSTPOST, time-gated >5.9s to dodge the init cap-flood that
+capped the first run):
+
+- ROUTE uniform: RTE taps show 87, 89, AND 95 all hit $1a54 (walker). Dave's 87/89->$1348 split
+  REFUTED - same completion route for all.
+- ANNOUNCE update = $1ab4 (the move.w -> [$7a74] on the bit-6-CLEAR tail of $1a54: $1a88 btst #6;
+  $1a8c beq $1ab2 -> $1ab4). Fires for cmd 87 (@10/@12s) but NOT for the read 95 @8s.
+- DONE mailbox post = $28b0 (posts 0xb2/0xba, bit7=DONE) + $2604 (0x0101 ACCEPT, bit0). The EARLY
+  cmd 95 @6s DID post done (0xb2 @ $28b0); the @8s read 95 does NOT.
+- Timeline @7.7: read 95 reaches $1a54 @7.701 (stamps local 0x80) but the mailbox posts right after
+  are cmd-87 ACCEPTs; 95 never posts its own done.
+- host 0xfe782 writes = 0 (NOHOSTPOST): firmware never writes host status directly - consistent.
+
+=> The read @8s REACHES $1a54 (walker terminal, local stamp) but does NOT reach $1ab4 (the [$7a74]
+announce) or $28b0 (the done mailbox post). The divergence is INSIDE the $1a54 tail ($1a54->$1ab4)
+or a separate IRQ-driven done-post ($28b0) that the read misses. The early cmd-95 @6s took the full
+path (posted 0xb2 done @$28b0); the @8s read stalls after the local stamp.
+
+NEXT: trace the $1a54 tail for the @8s read - does it execute $1a5a/$1a60/$1a88 through to $1ab2->
+$1ab4, or divert (interrupt, a gate at $1a5a cmpi #$86 / $1a88 btst #6)? And what drives $28b0 (the
+IRQ-region done-post) - why the early 95 reached it and the @8s read doesn't. That is the last mile,
+now between the local stamp and the announce, on the clean baseline. All cont.338 taps read-only.
+
+## cont.339 — TAILTRACE: divert is $1ab6 (bit5, universal) -> $1b64; completion = the $1b98 result-copy
+
+TTSTAMP (IRQ4CLEAN+NOHOSTPOST): $1a54 stamps reached by cmd 87 @6.4 (opt=08 7a34=0), 89 @6.4
+(opt=00 7a34=1), 95 @7.7 (opt=00 7a34=1 7968=0000). The EARLY cmd-95 @6s does NOT reach $1a54 (it
+completed via a non-walker path); only the @8s read reaches the walker terminal. TT7A34/TTE802/
+TTE807 ALL EMPTY @8s -> the read never reaches $1b22, never posts $e802, never gets the $28b0 post.
+LAST MILE CONFIRMED: completion never reaches the host.
+
+DISASM corrected the divert (Dave's $1b22 was never reached): $1ab6 btst #5,D0 (D0=opt) - bit5 is
+CLEAR for ALL of 87/89/95 (0x08/0x00 both lack 0x20) -> beq $1b64 diverts EVERYONE, skipping the
+walker $e802 post ($1aca) AND $1b22. So the walker host-post is never taken by anyone; 87/89 must
+complete another way.
+
+THE REAL COMPLETION PROPAGATION: $1b64 -> ... -> $1b98..$1bae = a 6-long (0x18B) copy of the node
+$71f0 -> the mailbox [$7b20] (which the model transcribes to host). Gated by:
+- $1b78 tst.l ($1c,A0); bne $1c72
+- $1b80 tst $7454; beq $1b90 (else channel-busy -> $16c6)
+- $1b90 btst #0,$7a1a; bne $1b90 (SPIN while [$7a1a] bit0 set)
+The read 95 @8s reaches $1a54 but does NOT reach the $1b98 result-copy (no mailbox post, no host).
+The re-issue is ~2.6s (soft), so likely NOT the hard $1b90 spin - more likely $1b78 ([A0+$1c]!=0
+-> $1c72) or $1b86 (channel busy -> $16c6) diverts it.
+
+NEXT: trace which gate stops the read @8s - tap $1b78/$1b80/$1b90/$1b98 and log [A0+$1c], [$7454],
+[$7a1a], for the @8s read vs a completing command. The first that 95 fails but 87/89 pass is the
+divert. The completion propagation ($1b98 node->mailbox copy) is now the precise target - not the
+walker $e802 post (dead for all) and not the per-sector machinery. All cont.339 taps read-only.
+
+## cont.340 — TAILGATE: $1b98 refuted; walker tail -> $1c72 -> $1e34 -> $1e44 relaunch (divert recedes)
+
+TAILGATE (IRQ4CLEAN+NOHOSTPOST). TTGATE @$1b78, all commands: a1c=0x0030ffff, 7454=0000, 7a1a=0000,
+71b2=0001. One differing column: a18=[A0+$18] = 0x18 (cmd 95) vs 0x00 (87/89), set at $14da.
+
+CONTROL FLOW (all commands identical): $1b78 a1c!=0 -> $1b7c bne $1c72. $1c72 btst #0,[$71b2]=0001
+-> bne $1e34. $1e34 tst [$7454]=0 -> beq $1e44. $1e44 bset $7a1a (was 0, no spin) -> $1e4c..$1e58 =
+a CHANNEL RELAUNCH (writes [A0+$1e] -> A3-$4000, the C000 DMA buffer), NOT a mailbox post.
+- $1b98 (Dave's result-copy hypothesis) NEVER reached by ANY command - refuted.
+- TT1C72/TT16C6 fire 5x (the shared exits); TT1B90/TT1B98 = 0.
+- a18=0x18 gates $1e3a (tst ($18,A0); beq $1e34 wait) ONLY when [$7454]!=0; TTGATE has 7454=0, so
+  a18 never control-flow-diverts in the traced paths. It's a persistent STATE difference, not (yet)
+  a demonstrated cause.
+
+HONEST META: the completion/announce chain has receded layer by layer this and last turn -
+$1a54 -> $1ab6(bit5, universal divert) -> $1b64 -> $1c72 -> $1e34 -> $1e44 (relaunch) - and at each
+layer 87/89/95 take the SAME path. Single-path descent is not isolating the divergence; the read
+reaches the same completion/relaunch code as the completing commands. So the difference is NOT a
+control-flow gate in the walker tail - it is either (a) what the $1e44 relaunch does downstream
+(does it eventually post for 87/89 but loop for 95), or (b) a higher-level protocol difference best
+seen from the CPUAP-visible mailbox/status timeline, not deeper walker descent.
+
+RECOMMENDATION: stop descending the walker tail. Either trace the $1e44 relaunch outcome (95 vs
+87/89 - does it converge to a mailbox post) OR - better - characterize the completion at the
+CPUAP-visible boundary: what the completing 87/89 write to the mailbox/host that the stuck 95 does
+not, measured at the $7b20 mailbox ring + host, across the full boot. The IRQ4CLEAN internal
+completion (cont.336) stands; this is purely the announce boundary. All cont.340 taps read-only.
+
+## cont.341 — MBOX census: the read posts ACCEPT but NEVER the DONE announce (CPUAP-boundary diff)
+
+Dave's mailbox-ring census (write-tap 0x7e00-0x7fff, IRQ4CLEAN+NOHOSTPOST). Completing cmd (87/89
+@6.4s) vs read (95 @8s), at the CPUAP-visible boundary:
+
+COMPLETING (87/89) writes: [7fe8]<-0101 (ACCEPT, $2604) + **[7fe8]<-00b2 DONE ($28b0)** +
+**[7fe0]/[7fe8]<-00b1 ($7744/$7754)** + ring [7e22] + [7fe2]/[7fea].
+READ (95) writes: [7fe8]<-0101 (ACCEPT, $2604) ONLY + its own cmd echo [7ff8]/[7ffa]. NO 00b2 DONE,
+NO 00b1 channel-status, NO ring write.
+
+=> THE DIVERGENCE, measured at the boundary: the read posts ACCEPT but NEVER the DONE announce. The
+completing commands post [7fe8]<-00b2 ($28b0, per-command DONE) and [7fe0]/[7fe8]<-00b1 ($7744/$7754,
+the periodic [$7a74]-bitmap broadcast). The read reaches NEITHER.
+
+MECHANISM (from cont.338): 00b1 = the [$7a74] announce bitmap (0xb0 = channels-done bits 4/5/7, set
+at $76c4->$76e0->$76e4) OR bit0, broadcast by $7754. So a channel announces DONE only when its bit
+is set in [$7a74] via $76c4 (D7 = the channel's done flag, [$79fe] = its index). The read completes
+internally ($1a54, ledger c0=8, cont.336) but its channel-done bit is NEVER set in [$7a74] -> $7744/
+$28b0 never broadcast it -> CPUAP never sees DONE -> re-issues.
+
+So the last mile is now a single bit at the boundary: what sets the read's channel-done bit in
+[$7a74] (via $76c4's D7 set-vs-clear decision) for 87/89 but not 95? The walker announce $1ab4 is
+bypassed for all (cont.340, $1ab6 bit5 clear), so [$7a74] is driven only by the periodic $76c4 build
+- whose D7 (done flag) for the read's channel is never set. NEXT: trace $76c4's D7 source (what
+marks a channel done) and why the read's channel is never flagged despite completing at $1a54.
+All cont.341 taps read-only.
+
+## cont.342 — ROOT: the read's node class (A0+$12)&3 = 0 -> announce-build never flags it done
+
+Dave's ANNBUILD ($7a74 write-tap, IRQ4CLEAN+NOHOSTPOST). The done decision ($766x-$76c4) cross-tab,
+D7(done) vs class (A0+$12)&3:
+  &3=0 -> D7=0000 (NEVER done), 40 rows   |   &3=1/2/3 -> D7=00ff (done), ~40 each.
+The READ's channel (idx=2, A0=$6e60 = its UIB) has class=0x44 (&3=0) -> D7=0000 ALWAYS, independent
+of the $F000 bits (b0/b3/b4/b5 identical for done and not-done channels). So Dave's FORK 1: the
+discriminant is CLASS, not a $F000 gate-array status bit.
+
+UNIFIES with cont.330/331: (A0+$12)&3 is the SAME node byte as the parity-arm discriminant
+([$796e]<0 needed (A0+$12)&3==3, cont.331). &3=0 blocks BOTH the parity-arm AND the announce-build
+done-flag. It is set by the node TEMPLATE copy at $086a (cont.331), selected per-command; 87/89 get
+&3=1/2/3, the read (95) gets &3=0.
+
+So the last mile bottoms out on ONE node field: (A0+$12)&3 = 0 for the read's channel. The read
+completes internally ($1a54, ledger c0=8, cont.336) but its node class routes BOTH the arm and the
+announce to the never-done branch. The walker announce ($1ab4) is bypassed for all (cont.340), so
+the periodic class-based build ($76c4) is the only announce path, and class 0 is excluded from it.
+
+TENSION with cont.331 (flag, don't gloss): cont.331 concluded &3=0 was firmware-INTENT for the
+parity-arm (the read uses a different completion path). But cont.342 shows &3=0 ALSO excludes the
+read from the ONLY working announce path, with no alternative found. So either (a) there is a &3=0
+announce path not yet located, or (b) &3=0 is genuinely wrong for the read's node and the template/
+IOPB class-build is the root bug. DECIDING QUESTION (Dave's ground-truth): what SHOULD the bulk
+read's node class be, and does the $086a template / the IOPB->node build assign &3=0 correctly for
+cmd 0x95, or drop the class the CPUAP requested? This is the same "is the mode value intent or a
+dropped field" question as bit-11/bit-8/[$796e] - now for the class nibble, and it is THE root.
+All cont.342 taps read-only.
+
+## cont.343 — SEEKDONE: settle DOES complete ([$7a36]=1) + F000 b0=0, but the announce-build goes IDLE
+
+Dave's SEEKDONE + ANNBUILD (read-window focused), IRQ4CLEAN+NOHOSTPOST:
+- SKSET: [$7a36] <- 1 at pc=$2b8a @7.962077 (read window). The SEEK-SETTLE COMPLETES for the read.
+  Dave's "nothing drives the settle chain to set [$7a36]" is REFUTED - it IS set.
+- SK651C ran @6.4 (node=6e60, 7a34=1 settle, f000 b0=0); SKGATE reached settle-set.
+- F000 bit0 = 0 in the read window (idx=3 rows @10/12 show f000=08a0[b0=0]). Step line IDLE, NOT
+  stuck at 1. Dave's "F000 b0 stuck" also REFUTED.
+=> The class-0 done condition (F000 b0==0 AND [$7a36]!=0) IS SATISFIED in the read window. The read
+   SHOULD be flagged done if the announce-build evaluated its channel.
+
+THE ACTUAL GAP: the announce-build $76c4 does NOT process the read's channel (idx=2 / A0=6e60) in
+the read window. It runs only 2x @10/12s, both idx=3. Its frequency CRASHED after @6s (147 @5s ->
+2 @>7.5s). So the read's done-decision is never RE-COMPUTED with the now-satisfied condition; the
+channel drops out of the [$79fe]-driven announce iteration.
+
+SUSPECTED IRQ4CLEAN SIDE-EFFECT (flag, verify): the announce-build ran densely @5-6s (147/s) then
+went nearly idle @>7.5s - the same period IRQ4CLEAN suppresses the synthetic chancomplete IRQ4
+storm (961x, cont.336). IRQ4CLEAN fixed the WALKER completion (read reaches $1a54) but may have
+ALSO removed the periodic drive that runs $76c4 for each channel. So IRQ4CLEAN could be a
+two-edged change: it un-stuck the walker but starved the announce-build.
+
+NEXT: (1) confirm - does $76c4 run for idx=2 in the read window WITHOUT IRQ4CLEAN (baseline)? If yes,
+IRQ4CLEAN starved it. (2) find what drives $76c4 periodically (the caller / timer) and whether it
+was the suppressed IRQ. The fix then preserves that drive (or triggers $76c4 on settle-complete)
+while keeping the walker un-stuck. The read's completion is READY ([$7a36]=1, F000 b0=0); only the
+announce evaluation is missing. All cont.343 taps read-only.
+
+## cont.343b — CORRECTION: not an IRQ4CLEAN side-effect; it's a completion->announce TRIGGER gap
+
+A/B (ANNBUILD @>7.5s): BASELINE total=0, IRQ4CLEAN total=2 (idx=3). Both near-idle. So the
+announce-build going quiet @>7.5s is NOT an IRQ4CLEAN artifact - it is the same in both. Retract the
+cont.343 "suspected IRQ4CLEAN side-effect."
+
+The settle-complete site $2b8a ([$7a36]<-1) does: A0->$7374; bsr $2aba (a timer/callback dispatch);
+it does NOT run the announce-build $76c4 for the completed channel.
+
+SO THE CONSOLIDATED STATE (this is the honest frontier):
+- The read's completion is READY: [$7a36]=1 (settle done @7.962), F000 b0=0 (step idle), so the
+  class-0 done-condition (F000 b0==0 AND [$7a36]!=0) IS satisfied in the read window.
+- The read completes INTERNALLY (walker $1a54, ledger c0=8, cont.336).
+- BUT the announce-build $76c4 is idle @>7.5s and nothing re-triggers it for the read's channel
+  (idx=2). The settle-complete does not drive it. So the read's satisfied done-condition is never
+  EVALUATED -> [$7a74] bit never set -> $7744/$28b0 never broadcast DONE -> CPUAP re-issues.
+
+=> The last mile is a completion->announce TRIGGER: something must run $76c4 for the read's channel
+after its settle completes ([$7a36]=1), and nothing does @8s (the build ran densely @5-6s during
+boot-init activity, then quiesced). On real HW a completion event (the seek-complete IRQ / status
+change) would drive the status handler that runs $76c4. The model/fw does not connect the read's
+@8s completion to that handler.
+
+OPEN (Dave's completion-protocol ground-truth): what drives $76c4 (the periodic status/announce
+handler) - a timer, an IRQ, or the command dispatcher - and what event should re-run it when a
+channel's seek-settle completes? The read's state is ready; only the trigger to evaluate+broadcast
+it is missing. This is the same class as the IRQ4 finding (a missing/absent model-driven event),
+now for the announce handler rather than the completion IRQ. All cont.343b analysis static/A-B.
+
+## cont.344 - the pair (IRQ4CLEAN+FAITHXFER): link 1 FAILS - read's kick unarmed + wrong C000 target
+
+Dave's chain run (IRQ4CLEAN+FAITHXFER+PHASELOG+MODECENSUS+IDLESCAN+NOHOSTPOST). Read in order; the
+first broken link is the gap.
+
+LINK 1 FAILS (the arming, as Dave predicted cont.325/6173). FAITHXFER kick fires only 2x, both
+<7.9s, both NOT-ARMED. XFERCENSUS on the same config:
+  @6.x: cmd=95 pc=$3d4a 743a=748a 7a14=748a c000=e70000  (identity latched)
+  @7.x: cmd=95 pc=$3d4a 743a=748a 7a14=0000 c000=e70000  (read-time: identity NOT latched)
+Both fail the FAITHXFER DMA condition (m_c000 in host window [hbase,0x100000)) because c000=0xe70000
+>= 0x100000 - the read's C000 DMA target is NOT a host address. AND the read-time (@7.x) kick has
+[$7a14]=0000 - the descriptor identity is not latched when the fw issues its kick. So Piece 2's
+win_buf->host DMA + identity IRQ4 never fire for the read; $3bfe's identity branch has nothing to
+run from FAITHXFER. (The 12x $1310 / 2x $3c1c seen are from other/early IRQ4s, not the read's
+faithful kick.)
+
+TWO SUB-PROBLEMS at the read's transfer kick ($3cd4/$3d4a):
+1. IDENTITY not latched: [$7a14]=0000 at the @7.x kick (should be 0x748a). The fw issues the E800
+   bit12 kick before [$7a14] is armed to the descriptor. (The @6.x kick HAS 7a14=748a, so the
+   latch does happen - just not synchronized with the read-time kick.)
+2. C000 TARGET wrong: c000=0xe70000 for both kicks - outside the host window. Either the channel-
+   launch presets C000 to a non-host address for the read, OR 0xe70000 is a legitimate
+   intermediate/local target and FAITHXFER's <0x100000 host-window check wrongly excludes it.
+
+So the read completes INTERNALLY via the walker (cont.336, IRQ4CLEAN) but the FAITHXFER announce
+path (Piece 2) can't start because the read's own transfer kick is unarmed + mis-targeted. This
+is the convergence of cont.325 (no valid host DMA-GO @8s) with the announce gap (cont.341-343).
+NEXT (Dave's ground-truth): at $3cd4/$3d4a for the read, (a) why [$7a14] isn't 0x748a at kick time
+(descriptor arm vs kick ordering), and (b) what C000 SHOULD be (is 0xe70000 the read's real target
+or a mis-preset?). That is the last sub-problem - the read's faithful host-transfer arming.
+All cont.344 taps read-only.
+
+## cont.345b - KICKIRQ4 test: doesn't reliably engage; the read's kick edge is the deeper problem
+
+STORAGER_KICKIRQ4 (deferred one-shot IRQ4 on the E800 bit12 kick edge, cmd 0x94/0x95, through the
+IRQ4CLEAN suppress via m_kickirq4_pending). Multi-run:
+- KICKIRQ4 SCHEDULED = 0 in 3/3 explicit runs (2 in 1 earlier run @6.412). The read's bit12 RISING
+  EDGE is not reliably present - kick = BIT(data,12) && !prev, and the read's bit12 writes are not
+  clean edges (or the kick fires at a non-deterministic time / not at all this run).
+- CPUAP re-issues cmd 95 x33 (the read never completes to the CPUAP). No boot.
+- Control (IRQ4CLEAN alone) reproducible: STAMP80 x6, re-issue @7.7/10.3/12.9/15.5.
+
+So the deferred-IRQ4 fix does not reliably fire, because the read's OWN transfer kick is unreliable
+(cont.325: kicks @6.4 not @8s; cont.344: @7.7 kick has c000=0xe70000 wrong + [$7a14]=0 cleared).
+Responding to the kick can't help when the kick edge is absent/inconsistent.
+
+=> Dave's SECOND failure mode is the live one: the real issue is upstream - the firmware CLEARS
+[$7a14]=0 right before its kick (cont.344 @7.700994) and the kick itself is unreliable/mis-targeted.
+This wants UNDERSTANDING (why the fw clears [$7a14] and issues that kick for the read), not just an
+interrupt bolted onto an edge that often isn't there.
+
+HONEST STATE: the cont.336 breakthrough stands (IRQ4CLEAN un-sticks the walker; read completes
+internally ~sometimes, STAMP80 @1a54). But the completion->announce path (FAITHXFER Piece 2 / the
+deferred IRQ4) can't be driven reliably because the read's host-transfer kick is itself broken
+(unreliable edge, wrong C000, self-cleared identity). The last mile is NOT "add the completion
+interrupt" - it is "why is the bulk read's transfer kick malformed," which is the cont.325/344
+channel-launch ($3cd4) question. All cont.345b analysis multi-run/static.
+
+## cont.346 - HONEST RECKONING: the read is NOT IRQ4-starved; the block is the ANNOUNCE, not the IRQ4
+
+XFERDONE test (window-complete -> 1 deferred IRQ4 under IRQ4CLEAN): boot=0, read re-issues same as
+control. Debug found:
+- XFERDONE scheduled 0x: the window #1 (m_read_hostmap full) never fires (FLUX-DESCDONE total=0) -
+  the @7.7+ re-issues are the CPUAP RE-REQUESTING; the storager doesn't re-deliver flux (data landed
+  once). So the hook point never triggers on re-issue.
+- BUT the read ALREADY gets its own matching completion IRQ4: MC $3c1c IRQ4-COMPLETE with
+  743a=748a 7a14=748a (the READ's identity) fires @11.6 and @14.2 - and the read STILL re-issues.
+
+=> DECISIVE: the read is NOT starved of a matching IRQ4. It completes internally (walker $1a54) AND
+receives its own identity-matched completion IRQ4 ($3c1c -> $1310) - and does not complete to the
+CPUAP. So the entire IRQ4-based fix direction (cont.336 IRQ4CLEAN, cont.345 KICKIRQ4, cont.346
+XFERDONE) targets the WRONG thing. Adding/timing an IRQ4 cannot help when a matching one already
+fires and the read still doesn't announce.
+
+The A14WIN go/no-go ("a mid-poll IRQ4 -> $3c1c -> poll wins") is REFUTED empirically: $3c1c fires
+with the read's identity and the poll does NOT win. The block is DOWNSTREAM of $3c1c/$1310.
+
+THE REAL BLOCK (back to cont.341-343, now confirmed by elimination): the ANNOUNCE. The read
+completes + gets its IRQ4, but the announce-build $76c4 never evaluates the read's channel (idx=2)
+to set its [$7a74] done-bit -> $7744/$28b0 never broadcast DONE -> CPUAP never sees completion ->
+re-issues. The done-CONDITION is satisfiable ([$7a36]=1 cont.343, F000 b0=0), but $76c4 doesn't RUN
+for the read's channel post-completion, and neither the walker ($1ab4 bypassed, cont.340) nor the
+IRQ4 handler ($3c1c/$1310) triggers it.
+
+REDIRECT (honest, after the IRQ4 detour): stop adding/timing IRQ4s. The last mile is: what DRIVES
+$76c4 (the announce-build), and why does neither the read's walker-completion NOR its matched IRQ4
+cause $76c4 to run for the read's channel? That is the cont.343 question, now isolated by ruling
+out the IRQ4 as the missing piece. All cont.346 analysis multi-run/static; XFERDONE env-gated (off
+by default, no baseline change).
+
+## cont.347 - POST95 test fails; EXHAUSTIVE elimination: the read isn't missing a SIGNAL
+
+HOSTINT run: $18e0 E802-bit7 path never fires (HISET=0, all cmds) - refuted. The host 0x80 is the
+model's L8123 edge-post, which DELIBERATELY excludes 0x95 (a past race-fix: posting instantly
+short-circuited the fw's ~2s window -> CPUAP issued read-2 early). POST95 (force the 0x95 post +
+bypass FWDONE skip): boot=0, still re-issues. Because L8123 fires for 95 only ONCE @6.4 (premature,
+before the @7.7 CPUAP read) and the edge (data-op path) is NEVER reached @7.7+ (DATAOP=0).
+
+EXHAUSTIVE ELIMINATION across cont.336-347 - none boot:
+- IRQ4CLEAN: un-sticks the walker; read completes internally ($1a54). KEEP (gated).
+- KICKIRQ4: kick edge absent/unreliable -> doesn't engage.
+- XFERDONE: window #1 doesn't fire on re-issue -> doesn't hook.
+- POST95: host-post fires @6.4 premature, not @7.7 -> no effect.
+- cont.346: the read GETS its own identity-matched IRQ4 ($3c1c, 743a=7a14=748a) and re-issues anyway.
+
+=> DECISIVE, by elimination: the read is NOT missing a completion SIGNAL. It completes internally,
+receives its matching IRQ4, and (POST95) even gets a host 0x80 - and still re-issues. Every fix that
+INJECTS a signal (IRQ4, host-post) fails, because the gap is not an absent signal - it is the
+missing CONNECTION from the read's completion to the ANNOUNCE ($76c4 -> [$7a74] -> $7744/$28b0
+mailbox-DONE -> model transcribe -> host). $76c4 doesn't run for the read's channel (cont.343), and
+neither the walker ($1ab4 bypassed) nor the IRQ4 handler triggers it.
+
+HONEST STATE (cont.294-347): IRQ4CLEAN is the one durable, faithful gain (removes the HLE IRQ4
+storm; read completes internally; env-gated, no baseline regression). The announce is a separate,
+deeper problem that signal-injection cannot solve. The remaining question is unchanged and specific:
+what invokes $76c4 per-channel on completion, and why the read's channel is never processed - OR
+whether the model presents a wrong/incomplete completion to the fw such that the fw itself never
+runs its announce for 0x95. That wants a fresh look at the model's completion presentation, not
+another injected interrupt. POST95/XFERDONE/KICKIRQ4 all env-gated OFF by default - baseline intact.
+
+## cont.348 — the micro-program FULLY DECODED; the stall is op-42/36 waiting the final-launch completion
+
+Dave's directive: review the docs, then fully decode the micro-program. board.yaml already held
+the read's ladder (`24 28 56 58 1A 18 54 4A 42 36 00`, builder $5FC0) and cont.254's open frontier
+(final-launch-channel-completion); the gap was that the individual states were never decoded.
+
+DECODED the $192 jump table from storager_v260.bin (op N -> WORD at [$192+N]) and mapped every op
+in the read's ladder. Full table + state-by-state in `microprogram-decode.md`; board.yaml
+op_ladder.jump_table_decode + read_command.ladder_states updated. The read's 11 states:
+
+  24 $651C status/mode setup | 28 $6788 seek | 56 $A392 xfer/desc setup | 58 $7346 setup
+  1A $3182 setup | 18 $308C setup | 54 $A356 settle | 4A $6ED2 ARM [$7B10] | 42 $6BC2 COMPLETION
+  WAIT | 36 $159C data-phase PARK (phase 0x0A) | 00 $1590 DONE (phase 0x0C, $1A54 0x80)
+
+THE UNIFICATION: op 4A = $6ED2/$6ED6 IS the [$7B10] arm - so the observed `[$7b10]<-ffff pc=$6edc
+@7.963` is a DESIGNED micro-program state, not an anomaly (retires the cont.323 red-herring worry).
+The ladder runs 1-8 cleanly, then WAITS at op 42 ($6BC2: advances when node+$18==0 = channel/DMA
+done, [$7454] clear) and PARKS at op 36 (phase 0x0A). It never reaches op 00 ($1A54 0x80) because
+the FINAL channel launch's DMA-transfer completion never fires in the model. That same un-fired
+event leaves [$7B10] unconsumed ($8320 ISR never runs $8460 to lift 0x0A->0x0C). So the phase-park,
+the [$7B10]/$8460 dispatch, and the host 0x81 spin are ONE stall, not three.
+
+OWED (converges with cont.254, board.yaml final-launch-channel-completion): PIT ctr1 (mode 5, DMA
+transfer counts, loaded by $3CD4) reaches TERMINAL COUNT -> gate array raises the channel-done
+interrupt -> [$7454] clears -> op 42 advances -> pump lifts the park (op 36->00) -> $1A54 0x80 ->
+host. The entire cont.336-347 interrupt campaign (IRQ4CLEAN/KICKIRQ4/XFERDONE/POST95/E802-bit7)
+targeted DOWNSTREAM symptoms of this one missing PIT-ctr1-terminal / channel-done stimulus. The
+micro-program is correct and linear; the model owes the final launch its transfer-count completion.
+
+NEXT: model PIT ctr1's terminal-count completion for the read's final DESCGO/DMA launch (the $3CD4
+count program + the ctr1 mode-5 strobe), raising channel-done so [$7454] clears at op 42. All
+cont.348 work is doc/static (board.yaml, board-notes.md, microprogram-decode.md); no model change.
+
+## cont.349 — CORRECTION (PIT resolved) + the micro-program's last step is FWDONE publication
+
+Dave: search the history for the PIT counter (he recalled it was resolved), then properly implement
+the micro-program's path.
+
+PIT RESOLVED (cont.156-158, RUN284-286): the $3ce4-$3d00 program ctrl 0x7A / mode 5 / count $024A=586
+is the SEEK-SETTLE one-shot (PIT0 ctr1), NOT a DMA transfer counter. board.yaml's cont.242 "ctr1 =
+DMA transfer counts" is a stale attribution. => cont.348's "owed: PIT ctr1 terminal-count" is WRONG.
+The real transfer counter is [$7956] (firmware, $70a0/$92b4-decremented per captured sector).
+
+RE-EVALUATION with that correction: under IRQ4CLEAN the read's transfer COMPLETES internally -
+[$7956]=0, ledger c0=8, phase 0x0C, op 00 ($1A54) stamps 0x80 into the LOCAL IOPB ($71f2). (DESIGN
+~line 7749: baseline storm -> [$7956]=0005 parked; IRQ4CLEAN -> [$7956]=0000, phase 0x0C.) So the
+DMA/transfer is NOT the gap; the ladder reaches op 00 and the local completion stamp fires.
+
+THE MISSING LAST STEP = PUBLICATION. The model's faithful §5.1 write-through already exists:
+- storager.cpp:5735 - on the fw posting $7fe8 (mailbox) with bit7, transcribe local $71f2/3 -> host
+  IOPB (m_iopb_addr+2/3) + fixed 0xFE782/3 (the monitor's poll cell). GATED on STORAGER_FWDONE.
+- storager.cpp:3825 `fwstamp_iopb` - a write-tap on $71f2 that, when the fw stamps at pc $1A54 (or
+  $184E) with 0x80/0x81/0x82, calls mirror() -> same host transcription. GATED on STORAGER_FWDONE.
+The default (no FWDONE) path is the HLE ($7fe8 -> model writes 0x80). The $7fe8 mailbox post is the
+bit-8-SET announce path; the bit-8-clear read (0x8c27) reaches $1A54/$71f2=0x80 but never posts
+$7fe8 - so ONLY the fwstamp_iopb tap (keyed on the $1A54 stamp itself) can publish it, and that tap
+lives under FWDONE.
+
+=> The micro-program's path is COMPLETE as: IRQ4CLEAN (transfer converges, op 00 $1A54 stamps 0x80)
++ FWDONE (the $1A54/$71f2 stamp transcribes to the host IOPB + fe782). NEXT TEST: run IRQ4CLEAN +
+FWDONE together and watch `FWSTAMP-MIRROR 80 -> host` fire for the stuck @8s read + the monitor
+advance. If it fires but the monitor still re-issues, check m_iopb_addr freshness for the re-issued
+read (the fixed fe782 mirror should cover it regardless). Docs corrected: microprogram-decode.md
+(CORRECTION section), board.yaml (ctr1 role + read_command.stall). No new model code this turn.
+
+## cont.350 — CONSOLIDATION: the root is the un-launched channel (settled, two convergent threads)
+
+The 0x82-error thread (cont.347+) and the [$7a64]-launch thread (cont.294-318) have converged on a
+single, end-to-end root, confirmed by direct measurement this session:
+
+THE CHAIN (measured, each link this session):
+  monitor re-issues  <-  read completes with 0x82 ERROR (not 0x80)  [$184E, FWSTAMP-MIRROR 82 @7.7]
+  <-  walker terminal $17FE reads node+$18 != 0 -> 0x82 (==0 would be 0x80)  [cont.340: node+$18=0x18
+      for the read vs 0x00 for 87/89]
+  <-  the 0x18 timeout is never CANCELED  [$3afe -> $2aba cancel]
+  <-  $3afe early-returns: tst $7a6c; beq (before $2aba), and [$7a6c]==0 for the read  [cont.349 N18TRACE]
+  <-  [$7a6c] (in-flight-op counter, ++ at $3AD0) was never incremented: the read NEVER LAUNCHES
+      [cont.349 LAUNCHTRACE: LAUNCH/LAUNCHER cmd=95 = 0; only 87/89 launch]
+  <-  the read's control flow never reaches the launch machinery AT ALL: $70a0 (the [$7a64] set-
+      decision), $4102 (the [$7a64] launch gate), $3ad0/$3cd4 (launch), $6f44 (stocker), $7e58
+      (verify), $92f6 (stake) ALL fire 0x for the read  [cont.350 A64GATE/STOCKFORK/VFYSERVE]
+  <-  the model's flux->host SHORT-CIRCUIT (storager.cpp:781-798) stands in for the read's entire
+      DATA-PHASE (op 36 pump + its channel launch), so the fw's ladder (24 28 56 58 1A 18 54 4A 42
+      36 00) walks straight to the terminal without ever launching a channel.
+
+WHY THE 5 FIX ATTEMPTS FAILED (all downstream of this): IRQ4CLEAN (un-sticks walker but read still
+never launches), KICKIRQ4 (kick edge absent - fw never kicks), XFERDONE (window hook never fires on
+re-issue), POST95 (host post fires premature @6.4, not @read), FWDONE (publishes 0x80 but the read
+stamps 0x82 - errors, not stalls). Every one injected/published a signal downstream of the missing
+LAUNCH; none could work because the read genuinely errors (uncanceled 0x18), it does not stall
+waiting for a signal.
+
+ENTANGLEMENT (why "delete the short-circuit" is not the fix): FAITHXFER already removed it (cont.
+281/324) -> "0 kicks, delivery breaks 8->1". The launch is not PRE-EMPTED by the short-circuit; the
+fw never enters the data-phase to launch EITHER WAY. Removing the short-circuit only starves the
+data; it does not make the read launch. The owed thing is upstream of both: whatever gate-array
+state makes the fw ENTER the read's data-phase and launch its DESCGO channel.
+
+SHIPPABLE WIN (independent of the above): STORAGER_IRQ4CLEAN removes the synthetic chancomplete IRQ4
+storm (961x/read-window, an HLE artifact) - deterministic, env-gated, no baseline regression, and it
+makes the walker complete internally. It is a genuine faithful-model improvement submittable on its
+own, separate from the un-launched-channel root.
+
+SINGLE OPEN FRONTIER (renamed): "the bulk read's channel-launch bookkeeping (DESCGO path)". The read
+is a bulk/DESCGO read ([$796a] read-ahead class, cont.318) - so it is NOT supposed to take the
+per-sector $70a0/$4102 launch; its launch/[$7a6c]++/0x18-arm bookkeeping lives on the DESCGO path,
+which the model's short-circuit replaces. The unresolved question, same as cont.294/325: what makes
+the fw enter the DESCGO data-phase and launch its channel (the E800 bit12 DMA-GO it never issues,
+cont.325), and how the model must present that so the fw launches for real. This is the named
+frontier; the root above is SETTLED. All cont.350 taps read-only; no baseline change.
+
+## cont.352 — LADWALK: the read (cmd 0x95) is NEVER DISPATCHED — frontier relocated to intake
+
+STORAGER_LADWALK (walker-entry $156A tap, logs every dispatched op per pass — the one instrument
+that survives the non-determinism because it taps the walker, not a bet-on op). Native+IRQ4CLEAN:
+
+- cmd=95 appears at the walker $156A ZERO times, any pass, any time. The read NEVER walks a ladder.
+- The walker's working set is cmd 87 (3x) + cmd 89 (3x) only. Node $71f0 is walked ONLY with op 24
+  and op 00, always under cmd 87/89 - never the full read ladder (24 28 56 58 1A 18 54 4A 42 36 00).
+- DCENSUS TBLLOOK fires for cmd 89/87 (nodecmd=8901, $0dd6) but NEVER for cmd 95. The read never
+  reaches the dispatch table lookup.
+
+=> DECISIVE REFRAME: the read (cmd 0x95) is NEVER DISPATCHED. It is received (busy 0x81 set), the
+CPUAP polls and re-issues, but the fw never routes 0x95 to its builder $5FC0 / the walker. So it
+never builds a ladder, never walks, never launches, never completes. This matches the buried
+board.yaml note ("0x95 never dispatched; no TBLLOOK for 95; fw idles forever") walked past ~50 conts.
+
+CORRECTION to this session's downstream analysis (cont.336-351): the walker/launch/completion
+activity analyzed @7.7+ (op 24->00, $1a54 stamps, the 0x82 error, un-launched channel, [$7a64],
+[$7968], op 42/36) was cmd 87/89 activity on the SHARED node $71f0 - NOT the read. The read's DATA
+delivers via the model short-circuit (s_desc armed - "READVERIFY OK / 8 sectors" is real), but the
+FIRMWARE never processes the command. That split (model delivers data / fw never dispatches) is the
+actual fault.
+
+FRONTIER RELOCATED (the true, earliest root): "why the fw never dispatches cmd 0x95" - $0BF2 intake
+-> $0D54/$0DD6 TBLLOOK. NOT the walker/launch (downstream, and on the wrong commands). The fresh
+session starts here: trace intake/dispatch for cmd 95 vs 87/89 - what intake state the read fails
+that keeps it from reaching TBLLOOK. IRQ4CLEAN remains the banked shippable HLE-removal (independent
+of this). LADWALK/cont.352 taps read-only; no baseline change. The cont.350 chain is symptom-level;
+THIS is the root.
+
+## cont.353 — CLEAN RE-AUTHOR (option B): storager.cpp rebuilt from the spec; two over-prune fixes
+
+Decision (Dave): the HLE accretion (9060 lines, ~40% HLE experiments) "made it totally impossible
+to truly debug to present correct state." Rebuild storager.cpp cleanly from VGC7219-GATE-ARRAY-SPEC.md
++ the firmware understanding; the 9060-line version is the github safety net.
+
+DONE this session — **storager.cpp: 9060 -> 824 lines, builds green, validates, boots the storager
+firmware healthily to its main command loop.** Kept the faithful core: the frame (config/maps/ROM/HD
+image device/floppy), the flux/PLL physical read over get_next_transition() as the SOLE read path,
+the gate-array register decode (E000 window/E800/E802/E804/E807/F000/C000/C800/D000/D800), the host
+doorbell + 0x18-byte IOPB auto-fetch (register-per-word), the PIT (system tick IRQ1 + the mode-5
+seek-settle one-shot -> F000 bit1), the IRQ machinery. Built the faithful DMA-on-kick + IRQ4
+completion as a first cut (the data-path frontier). DROPPED all HLE: storager_getenv + every env
+gate, s_grind/s_desc statics, read95_deliver + m_sectors + read_verify_window, ioreg_r/w + m_ioreg_*,
+the seek oracle, chancomplete/hd_chan/pcsamp/idcap/dataop/stepdone/... timers, m_fw_driven, the ledger
+/window/verify HLE, and the mbox_w status-transcription taps. Also removed the storager_trkdec hack
+(subclassing floppy_image_format_t to expose the protected generate_bitstream_from_track) +
+decode_track_ids + m_dc_ids: the flux/PLL over get_next_transition() IS the official read; density
+(FM 4us/cell vs MFM 2us/cell) now comes from E800 bit10 (firmware-programmed, spec §3.1/§3.2), not a
+track pre-scan. storager.h (DECLARE_DEVICE_TYPE(MULTIBUS_STORAGER, device_multibus_interface) +
+DEFINE_DEVICE_TYPE_PRIVATE) is the official private-card idiom - kept as-is.
+
+Runtime bring-up found + fixed TWO over-prunes (things I mis-classified as HLE that are faithful
+gate-array behavior):
+
+1. **R0 status register (spec §5) restored.** host_win_r for pio 0x73F8 must GENERATE the board
+   status the CPUAP polls before each GO (bit0 Idle / bit1 Busy / bit2 OPER-DONE-INT / bits4-7 unit
+   ready), not echo the dual-port mailbox. + the R0 command latch (GO->busy, CLR-INT->clear) and the
+   DONE-edge observation in bus_mem_w (the fw's own host-IOPB status stamp, spec §5.1). Without it the
+   CPUAP never issues GO (mailbox stays zero).
+
+2. **Command-gated ENDEC arming (spec §4, the cont.188 arming gate) restored.** THE crash: the clean
+   storager hung at boot spinning at $24e (a tight `move.w #$0e1b,$e800 / bra $24e` loop inside the
+   $222 jump-table DATA region = the firmware crashed into a table). Root: IRQ5 vector $26a8 =
+   `move.l $7300,-(A7); rts` and IRQ6 $26ae = `move.l $7304,-(A7); rts` are SOFT-VECTOR DISPATCHERS -
+   they jump through [$7300]/[$7304], which the firmware installs ONLY during a read. My m_serdes_active
+   latched on ANY E802 bit15 / E000 bit11 (incl. the power-on ENDEC self-test), so the flux pump raised
+   IRQ5/IRQ6 before the soft vectors existed -> rts through null -> crash. Fix: m_serdes_active is set
+   only when m_iopb_cmd is a READ (0x94/0x95), and cleared at each doorbell. The firmware then boots
+   healthily to its main loop (dominant PC $0b00, matching the 9060-line reference's profile;
+   previously stuck 92% at $24e).
+
+STATE: clean substrate boots the storager firmware to healthy idle at $0b00; the CPUAP reaches
+"testend". The read still doesn't drive the full ladder as much as the HLE reference (HLE showed more
+$22xx dispatch / $67xx op-handler / $15xx walker activity) - the read data-phase (DMA-on-kick +
+completion, and whether cmd 0x95 dispatches per cont.352) is the frontier, now on a CLEAN model.
+The 9060-line version is backed up (scratchpad + Dave's github).
+
+## cont.354 — READ DATA-PHASE without shortcuts: the read is RECEIVED + ACCEPTED but never dispatched
+
+First read-path investigation on the clean substrate (cont.353), no HLE shortcuts. RTC-flaky boot
+(the doorbell fires ~2/5 boots; retry, as runstorager.sh does). Traced the read's doorbell end to end
+via opcode-fetch taps on the storager CPU (spaces: cpu_space/opcodes/program):
+
+GROUND TRUTH (CPUAP side): the CPUAP writes the full doorbell - IOPB pointer 0f e7 80 (=0x0FE780) to
+0x73F9/FA/FB, then GO 0x13 to 0x73F8 last (32-bit MOVD split into byte cycles). It then spins at
+$FE3E90 (`CMPB 0x81, EXT(6)+0x22`) polling the fixed status slot 0xFE782 for the read to leave 0x81.
+
+STORAGER side, the dispatch chain (each stage a reliable opcode tap):
+  GO 0x13 -> IRQ2 taken (autovector $68) -> handler $24AA -> $2540 mailbox FF-check -> ACCEPT $255E
+  -> host command queue walk ($7E1E head/tail, entry $7B20 = $7E20+idx*0x10, $7B1A=node) -> $2634
+  descriptor-ring check -> ring EMPTY ($7376==0) -> $2694 -> $24C6 -> RTE.
+  **intake $0BF2 = 0, dispatch $0D54 = 0, read builder $5FC0 = 0, walker $156A = 0. Every read run.**
+
+TWO faithful pieces restored this session to get this far (both spec-grounded, both were pruned as
+"HLE"): (1) R0 status register $host_win_r pio 0x73F8 (spec §5) - without it the CPUAP never issues
+GO; (2) **the FF-triple stamp** - after the gate array auto-fetches the IOPB it stamps 0xFF over the
+consumed pointer registers ($7FFA/$7FFC/$7FFE = mbox+2/+4/+6); the firmware's $2540 doorbell checker
+(`cmpi.b #$ff,($2/$4/$6,A1)`) accepts ONLY with that triple (spec §6). With it the read is now ACCEPTED
+(reaches $255E), where before it was rejected at $2540.
+
+THE RESULT (what the shortcuts hid): the read is received (IRQ2), passes the FF-check, and is ACCEPTED
+into the host command queue [$7B20] - but the firmware NEVER dispatches it. intake $0BF2 is reached
+only via $2034 (`bsr $BBA`, "the launch"), gated by the main loop $0B20 (`tst $71B2; bne $BB2`) on the
+command-pending counter [$71B2]. The doorbell ACCEPT path does NOT bump [$71B2] (the bump is $1FFA
+`addq #1,$71B2`, on the $1F82/$2000 launch path) and does NOT enter the descriptor ring - it finds the
+ring empty and RTEs. So [$71B2] stays 0, the main loop never launches, intake/builder/walker/ladder
+never run, and the data phase never begins.
+
+This CONFIRMS cont.352 ("0x95 never dispatched") is a GENUINE firmware fact, not an artifact: the old
+read95_deliver/HLE95-DONE shortcut posted 0x80 to the host IOPB directly, so the CPUAP saw "read done"
+and moved on - entirely masking that the storager firmware never processed the command. On the clean
+substrate the firmware's real behavior is exposed: RECEIVED + ACCEPTED, NEVER DISPATCHED.
+
+FRONTIER (precise): the doorbell-dispatch -> launch handoff. The accepted command sits in the queue
+([$7B20]/$7B1A) but nothing bridges it to [$71B2]++ / the $2034 launch / the descriptor ring. What
+gate-array-provided state (or firmware path) turns an ACCEPTED queue entry into a LAUNCHED command
+(cont.204's queue->ring->dispatch)? That handoff is what the shortcuts bypassed. NEXT: trace the
+$1F82/$2000 launch path's entry condition and what enqueues the descriptor ring [$7376]/[$737C] for a
+host command, vs what the doorbell accept leaves unset. (R0-status + FF-triple are committed to the
+clean model; builds green; storager still boots healthy to $0b00.)
+
+## cont.355 — CORRECTION: the FF-triple was BACKWARDS; removing it makes 87/89 dispatch (clean substrate)
+
+cont.354's FF-triple stamp was WRONG (it was derived from cont.204, itself HLE-era). Decisive A/B on
+the clean substrate, doorbell-firing boot, opcode taps:
+
+WITH the FF-triple stamp ($7FFA/FC/FE <- 0xFF after auto-fetch):
+  $2540 -> ACCEPT $255E -> claim into host queue [$7B20] -> $2634 ring-empty -> RTE.
+  bump $262C=0, launch $2000=0, intake=0, TBLLOOK=0, walker=0.  NOTHING dispatches.
+WITHOUT the FF-triple (pointer regs keep the fresh IOPB pointer):
+  $2540 -> REJECT $25F6 -> bump-arm $2626 -> **[$71B2]++ $262C** -> launch $2000/$2034/$BBA
+  -> **TBLLOOK $0DD6 fires, walker runs 3x, INIT_87 + RESTORE_89 BOTH reach their builders,
+  done80 ($1A54) fires.**  Commands DISPATCH - matching the 9060-line reference profile.
+
+So the $2540 "FF-check" is: pointer regs == FF => already-consumed re-claim (accept into queue);
+pointer regs != FF (a FRESH IOPB pointer) => NEW command => reject-path launch. The gate array must
+NOT stamp FF on a fresh doorbell - the fresh pointer IS the launch signal. cont.204's "FF-triple =
+doorbell dispatch" is inverted. FF-triple REMOVED from the model (the doorbell now just auto-fetches
+the IOPB + raises IRQ2). R0-status + command-gated arming stay.
+
+RESULT: the clean model now boots + dispatches 87/89 (walker runs, one completes 0x80) - the general
+host-command handshake works with zero HLE. The boot still sits at "testend" and **READ_95 = 0**: the
+read (0x95) still does NOT reach its builder $5FC0. This is cont.352 EXACTLY, now reproduced on a
+clean substrate: 87/89 dispatch, 95 does not.
+
+FRONTIER (unchanged from cont.352, now clean-substrate-observable): why cmd 0x95 specifically fails to
+reach dispatch ($0D54/$0DD6 TBLLOOK -> $5FC0) when 87/89 succeed. Both share the intake/launch path
+just proven working for 87/89; the read diverges somewhere in intake ($0BF2 processing of [$7B20]) or
+the main-class table lookup ($92[0x25]). NEXT: with 87/89 as the working control, trace the read's GO
+-> node -> intake -> $0D54 and find where 0x95 forks away from the 87/89 path. (Boot RTC-flaky ~2/5;
+opcodes-space taps; never read CPU state in a tap.)
+
+## cont.356 — the read is NEVER ISSUED: boot stalls at the 0x87 HD-probe; multibus decode differs (Dave)
+
+Traced the read's real path on the clean substrate (post-cont.355, general dispatch working). Reliable
+finding via a doorbell logerror + opcode taps, multiple RTC-flaky boots:
+
+**The CPUAP issues ONLY cmd 0x87 (HD identify/INIT), at IOPB 0x0FE780, then stalls.** No 0x89 RESTORE,
+no 0x98 SEEK, no 0x95 READ. So the read (0x95) does NOT "fork away" in dispatch - it is never issued.
+The earlier "87/89 dispatch" reading was wrong: the $5E64/$5F74 hits were the 0x87 ladder's own
+micro-ops (op-02 $5E64 INIT-builder, op-0E $5F74 RESTORE-builder are dual-use $192-table handlers),
+not separate command dispatches. Only 0x87 is ever received (STGDOOR tap).
+
+The 0x87 does not complete either: $1A54 (0x80 done) fires 0 times in the measured boots, and the
+storager posts nothing to the host IOPB region (0x0FE780-0x0FE79F write tap empty). The CPUAP spins
+at $FE3E90 (`CMPB 0x81, EXT(6)+0x22`) + a $FE02D3 loop, never falling through to the floppy commands.
+
+**Dave's key architectural insight (the likely root): the multibus-decoded address space is DIFFERENT
+between the CPUAP and the Storager.** Confirmed by the setup:
+- cpuap.cpp: `m_bus->space(AS_PROGRAM).install_ram(0x000000,0x0FFFFF, m_ram)` puts CPUAP RAM on the
+  multibus at 0x000000-0x0FFFFF, but the CPUAP CPU reaches that RAM THROUGH the NS32082 MMU
+  (`set_mmu`). cpu_map: `map(0x000000,0x0FFFFF).ram().share("ram")`.
+- The storager's `bus_mem_r/w` drives the multibus 1:1 (storager addr == multibus addr).
+- cpuap.cpp cont.174 comment (Dave's own): "the monitor's status poll (EXT(6)+0x22 = 0xFE782) reads
+  LOCAL RAM, invisible to the bus." So the CPUAP polls CPU-logical 0xFE782 -> MMU -> physical m_ram
+  cell; the storager posts to multibus 0xFE782 = m_ram[0xFE782]. If the MMU is not identity there,
+  those are DIFFERENT cells: the storager reads/writes the wrong m_ram location relative to the
+  CPUAP's logical view. That breaks the IOPB fetch (command byte the CPUAP wrote != what the storager
+  fetched) AND the status post (never lands where the CPUAP polls) -> the 0x87 handshake never closes.
+
+FRONTIER: resolve the CPUAP-logical <-> storager-physical (multibus) address correspondence. The
+storager, as a bus master, must reach the SAME m_ram cells the CPUAP's MMU-translated logical accesses
+use - for both the doorbell IOPB fetch (the 0x0FE780 pointer) and the completion status post
+(0x0FE782). Determine the MMU translation for the 0x0FE7xx region (identity or offset/paged) and
+correct `bus_mem_r/w` (and the doorbell fetch address) accordingly. Then re-check: does 0x87 complete,
+post, and the CPUAP fall through to 0x89/0x95 (the floppy read - the original target)?
+
+State: clean model builds green; FF-triple removed; only the doorbell auto-fetch + IRQ2 + R0-status +
+command-gated arming (all faithful). The read data-phase (flux/DMA) is downstream of getting the read
+ISSUED, which is downstream of the multibus-decode fix.
+
+## cont.357 — the IOPB-fetch mapping is CORRECT; the blocker is the missing completion WRITE-THROUGH
+
+Per Dave's steer (multibus decode differs; study the manuals + correlate the HLE). Findings:
+
+MANUALS (Interphase 2180, direct 3030 predecessor): the IOPB pointer registers R1/R2/R3 "must be
+loaded with a 20-BIT memory pointer" and "must always point to the ABSOLUTE address" - so the IOPB
+pointer is a 20-bit ABSOLUTE multibus address (no relocation). The DATA/UIB BUFFER addresses inside
+the IOPB use the XMB/REL scheme: REL=0 absolute (XMB[3:0] = 4 MSBs of a 20-bit addr), REL=1 relative
+(segment address << 4, 8086-style paragraph relocation) - matching spec §3.4's $36E6 "+$12/$13 << 4".
+The mailbox (pio 0x7200-0x73FF host <-> $7E00-$7FFF storager) is the dual-port command channel.
+
+MEASURED (STGDOOR dump + cpuap.cpp iopbhost tap, same instant): the storager fetches the CPUAP's IOPB
+CORRECTLY. CPUAP builds `87 01 .. .. 02 ..` at logical 0x0FE780 (pc=fe3c0x, @6.39985); storager reads
+`87 01 00 00 02 00 ..` from multibus 0x0FE780 (@6.4003). Bytes match (cmd=0x87, byte4=0x02). So the
+IOPB-fetch decode is 1:1/identity and WORKING - the 20-bit absolute pointer resolves to the same
+m_ram cell on both sides. The MMU is effectively identity for the 0x0FE7xx region (consistent with
+the HLE having posted status to multibus 0x0FE782 and the CPUAP seeing it, cont.205).
+
+HLE CORRELATION: the working 0x87 completion went via the **$2626 bump** ([$71b2] 0->1) - the exact
+reject->bump path the FF-triple removal (cont.355) restored - and the HLE MODEL posted status to both
+m_iopb_addr+2/+3 and the fixed slot 0x0FE782/3 (lines 4022-4023, 5974-5982). i.e. the HLE's model
+did the IOPB status write-back; it did NOT rely on the firmware doing it.
+
+THE BLOCKER (measured on a completing boot, RTC-flaky): 0x87 DOES complete internally - it reaches
+$1A54 (done1a54=1) via the $2626 bump and stamps the LOCAL node status (node+2 = 0x80). **But the
+storager posts NOTHING to the host IOPB** (0x0FE780-0x0FE78F write tap empty on the completing boot).
+So the firmware's $1A54 stamps only its local node; the completion never reaches the host IOPB, so the
+CPUAP (which waits unbounded, §5.1) never sees 0x87 done and never proceeds to the floppy read.
+
+=> The missing piece is the IOPB **STATUS write-back** (2180: "the STATUS CODE and ERROR CODE bytes of
+the IOPB are updated by the SMD"). On the clean substrate the model has no shim doing this and the
+firmware's local $1A54 stamp is not transcribed to the host IOPB. Two readings to disambiguate next:
+(a) the GATE ARRAY writes the host IOPB status back on completion (a hardware bus-master write-back the
+clean model must implement - transcribe the local completion stamp $71F2/3 to the host IOPB at the
+20-bit absolute pointer), OR (b) the firmware itself stores it via a bus-master path that isn't
+running here (cont.205's claim) - if so, find why the write-through code doesn't execute. The measured
+fact favors (a): $1A54 fires, no host write follows. FRONTIER: model the faithful completion
+write-back (gate-array updates host IOPB STATUS/ERROR at the absolute pointer) and re-check 0x87 -> the
+CPUAP proceeds. The read (0x95) is downstream of the boot getting past the 0x87 HD probe.
+
+State: clean model builds green (824 lines); doorbell = auto-fetch + IRQ2 + R0-status + command-gated
+arming; FF-triple removed; 0x87 dispatches + completes internally; IOPB fetch verified 1:1.
+
+## cont.358 — completion WRITE-BACK implemented + verified firing; CPUAP's post-0x87 wait is not a fixed poll
+
+Dave confirmed the completion needs a multibus write. Implemented the faithful gate-array bus-master
+write-back (device_reset): on the firmware's local completion stamp of the ch1 node status $71F2
+(done 0x80 / error 0x82, bit7-set/bit0-clear; 0x81 busy not published), transcribe node+2/+3 to the
+host IOPB +2/+3 at the 20-bit absolute pointer (m_iopb_addr), via m_bus. VERIFIED: `STGWB status 80 ->
+host IOPB 0fe780+2 @6.4081` - the write-back fires on the 0x87 completion and posts 0x80 to physical
+0x0FE782. (A Lua tap on the STORAGER cpu space saw 0 writes because it is a direct m_bus write, not a
+CPU-space store - correct.)
+
+BUT the CPUAP still does not proceed (no 2nd GO). Histogram of ALL CPUAP RAM reads (0x000000-0x3FFFFF)
+during the 0x87 wait: NO cell read more than ~2x; the activity is scattered through m_ramext
+(0x3FD35A/0x3FF34A... - the top of the 0x100000-0x3FFFFF expansion RAM, the $FE02xx RAM-size-probe
+region). So after issuing 0x87 the CPUAP is NOT spinning on a fixed status cell (not 0x0FE782, not the
+IOPB) - it is ranging through the expansion RAM. Its PC alternates $FE3E90 (the CMPB 0x81 disk-status
+compare) and $FE02D3 (a MOVD R7,(R7)/CMPD/BEQ loop over m_ramext). So the post-0x87 wait is NOT a
+simple IOPB-status poll; the write-back to 0x0FE782 is currently inert (the CPUAP does not read it).
+
+Two threads for next: (1) is $FE02D3 a legitimate (RTC-flaky, slow) RAM sizing/test the CPUAP does
+while the 0x87 is outstanding, or is it STUCK (the disasm there is misaligned by the "testend" string
+data - resolve whether the PC is real code or a crash into data)? (2) where does the CPUAP ACTUALLY
+consume the 0x87 completion - a status cell it reads once (edge), an interrupt (the storager->CPUAP
+INT via E802 bit7 / int_w), or a mailbox in m_ramext? Determine that, then aim the write-back (and/or
+the host-completion interrupt) at the real consumer. The write-back MECHANISM is correct and kept
+(2180: "STATUS/ERROR bytes updated by the SMD"); only its being SEEN by the CPUAP remains.
+
+State: clean model builds green; write-back added + verified firing; RTC flake (~1/7 boots issue AND
+complete 0x87) is the binding constraint on verification - reducing it (or a deterministic seed) would
+speed this whole thread.
+
+## cont.359 — BREAKTHROUGH: boot is DETERMINISTIC; doorbell status handshake fixed; the READ is ISSUED
+
+Dave's steer: the CPUAP is correct + deterministic; it comes back to the doorbell - the IOCB address
+must be captured so the storager firmware knows where it is; trace the CPUAP->Storager comms, validate
+vs the Multibus disk-controller manuals, then instrument the multibus and diagnose.
+
+**#1 - THE FLAKE WAS MY LUA TAPS.** With logerror-only instrumentation (no Lua install_read/write_tap),
+the boot is FULLY DETERMINISTIC - 3 identical runs, doorbell at exactly @6.40026. The RTC "flake" that
+plagued every prior session was Lua taps perturbing CPU timing. **Rule: trace via logerror in the model
+or C++ opcode taps, NEVER Lua memory taps** (they both perturb timing AND can segfault on CPU-state reads).
+
+**CPUAP doorbell decoded (cpuap_rev9 fe3c01-fe3ec3, matches Interphase 2180):** builds the IOPB at
+EXT(6)+0x20 (=host 0x0FE780); `ADDR EXT(6)+0x20` -> writes the 20-bit ABSOLUTE IOPB pointer big-endian to
+R1/R2/R3 (0xF073F9/FA/FB = high/mid/low); GO 0x13 to R0; then spins at fe3e90 `CMPB 0x81, EXT(6)+0x22`
+(=0xFE782) until it first sees 0x81 (busy/accepted), then TBITB bit0 (fe3ebe) for the 0x80 done.
+
+**Multibus instrumentation (host_win_r/w, bus_mem_w, doorbell) - the transactions:**
+- Doorbell captures dbi=0x0FE780 correctly (R1/2/3=0f/e7/80; IOPB `87 01 00 00 02..`). Fetch mapping 1:1.
+- The 0x87 completes internally ($1A54 -> node $71F2 = 0x80).
+- BUT the firmware writes NOTHING to host RAM near completion (0 bus_mem_w in the window), because
+  `[$7B20]` (the "fetched-IOPB ptr" the intake/completion use: `A2=[$7B20]; ($2,A2)=0x81 busy`) = 0 -
+  the reject/bump path (post-cont.355) never sets it (only the accept path $25C6 does). So the accept
+  0x81 stamp lands on garbage and never reaches the host, and the CPUAP spins forever waiting for 0x81.
+
+**THE FIX (three faithful pieces at the doorbell + completion):**
+1. Capture the fetched-IOPB ptr: `[$7B20] = dst` at the doorbell (Dave's "capture the IOCB address").
+2. Stamp host IOPB STATUS = 0x81 (busy/accepted) at claim time (2180: "STATUS/ERROR bytes updated by
+   the SMD"; the monitor waits to see 0x81 first).
+3. Completion write-back flips it: on the fw's $71F2 done/error stamp, transcribe 0x80/0x82 to host
+   IOPB+2/+3 (cont.358, now correct because the accept 0x81 precedes it).
+
+**RESULT: the CPUAP proceeds through the full sequence - 0x87 @6.40026 -> 0x89 (RESTORE) @6.40847 ->
+0x95 (READ) @6.41014** (0x87+0x89 both complete 0x80; matches cont.208's "87->80, 89->80, 95->80").
+**The floppy READ (0x95) is finally ISSUED** - the whole session's "why won't the read dispatch"
+question was blocked UPSTREAM by this status handshake, not by the read path itself.
+
+The read (0x95) does not yet complete (no 0x95 status stamp) - that is the genuine read data-phase
+(flux read -> SRAM -> host DMA -> $1A54 completion), now reachable on a working handshake and a
+deterministic boot. NEXT: trace the 0x95's dispatch ($5FC0 builder / walker / read ladder) and its
+completion path, with C++/logerror instrumentation. State: clean model builds green (852 lines).
+
+## cont.360 — READ DATA-PHASE ACTIVE: the flux now reads the disk (autonomous SERDES delivery)
+
+Deterministic read-path trace (C++ opcode taps + model logerror, no Lua). After cont.359 the 0x95 read
+is issued; traced its data-phase:
+
+- The read DISPATCHES ($5FC0 builder @6.41089) and walks op24-select -> op28-seek. But it then STALLS
+  in an op28-seek(14086x) <-> op42-complwait(14085x) loop; op4A-readfld runs ONCE, op56/58/54 never.
+- ZERO IRQ6/IRQ5: the flux capture never delivered a single interrupt. op4A armed the read, op42 waited
+  forever for a data record, op2C re-seeked endlessly. Chicken-and-egg deadlock.
+
+ROOT (Dave's hypothesis - "a missing state for the complete stimulus/response of the read"): the model
+only STARTED the 74LS1812 flux live-run when the firmware READ E000 - but the firmware won't read E000
+until it gets the first ID interrupt. The real SERDES runs AUTONOMOUSLY off the rotating disk once armed.
+
+FIX (start_flux_read()): when the read window arms (E000 bit11 engagement / E802 bit15 capture-arm,
+command-gated to 0x94/0x95), start the flux live-run + the 200us pump immediately, so IRQ6 (ID) / IRQ5
+(data) fire as the disk rotates, independent of E000 reads.
+
+RESULT: **the flux now reads the disk** - IRQ6=1764, IRQ5=1764 over 30s (~110 revolutions), recovered
+IDs correct (C=00 H=00 R=01,02,03,04,05,06.. = the FM label track). The read DATA-PHASE is ACTIVE for
+the first time on the clean substrate.
+
+REMAINING (the next frontier): the read does NOT converge to completion - the firmware reads the same
+track over and over (110 revs) without staking its $7654 ledger ($f0/$c0) and posting done ($1A54 for
+0x95 never fires; terminal still "testend"). This is the read-completion convergence (the aim [$7428],
+the two-event $92B4/$92F6 stake, the IRQ5/6 cadence + parity) - the cont.242-353 territory, now
+reachable on a deterministic boot with real flux data. Also note: the flux arms LATE (~7.96s vs the
+6.41 dispatch) - the firmware's ENDEC engagement write comes ~1.5s into the seek loop; worth checking
+whether that delay/the seek loop is itself a cadence artifact. NEXT: instrument the ledger/aim/stake
+($7654, [$7428], $92B4/$92F6/$933C) and the IRQ5/6 cadence vs the firmware's $7950 alternator.
+
+State: clean model builds green (869 lines). Faithful fixes in place: doorbell captures [$7B20]+stamps
+0x81 accept, completion write-back flips 0x80/0x82, autonomous flux delivery on arm.
+
+## cont.361 — read completion: the ID-mark recognition works, but the $7950 alternator parity never reaches the STAMPER
+
+Examined the read completion per Dave's three questions (ID recognition/validation; data-phase arm;
+the gate array's completion + CRC signalling). Deterministic C++ opcode + model taps.
+
+ID RECOGNITION/VALIDATION: the read does NOT hijack the $9884 comparator ($9602/$3dbc never run in the
+read window). IRQ6 goes to the DEFAULT alternator fork $298C (`bchg #0,$7950; beq $89F2 (was 0 -> ID
+round); bra $92B4 (was 1 -> STAMPER)`). So the ID is processed by the per-ID round $89F2, not $9884.
+The flux delivers correct IDs (R=01..16 wrapping, aim [$7428]=1, want-cyl [$7438]=0).
+
+DATA-PHASE / TWO-IRQ5 CONTRACT (FIXED this session): the FM data path needs TWO IRQ5 (spec cont.262):
+the data-AM (at the DAM) + the data-record end. The model raised only the data-end IRQ5; added the
+data-AM raise (flux_data_am() at DAM detection). Now BOTH are taken: IRQ6-handler=24, IRQ5-handler=48
+(2 per sector), so the two-IRQ5 contract runs.
+
+THE COMPLETION FAILURE (Dave's "cadence not ordered correctly", = cont.195 unresolved): the $7950
+alternator parity is STUCK - EVERY IRQ6 reads parity 0 (-> $89F2 ID-round, 96x), EVERY IRQ5 reads
+parity 0 (-> $7BA8 setup/miss, 48x). **$92B4 (STAMPER) = 0, $8018 (data-consume) = 0, $92F6 STAKE-f0 =
+0, $933C CONVERT-c0 = 0.** The read reads the disk forever (IRQ6/5 delivering) but never stakes its
+$7654 ledger / posts $1A54. Note $89F2 runs 96x (4x the 24 IRQ6) - the ID round toggles/clears the
+phase extra, so the data IRQ5 always lands on "setup/miss" ($7BA8) and never reaches "consume" ($8018)
+or the stamper. This is EXACTLY cont.195: "Per-ID IRQ6 delivery is the wrong mark cadence for the
+floppy class; the ID round ends in the phase-clear pen ($89FA bypass), so the data mark's IRQ5 always
+reads phase 0 and misses." The HLE eventually solved it via POSPTR + pointer-directed capture + the
+carry-IRQ6 (cont.199-201), on a NON-deterministic boot with the shortcut stack.
+
+CRC: the 74LS1812 does CRC-16/CCITT on receive - the gate array's per-sector "data valid" signal is
+part of the completion cadence (the second IRQ5 / E01E status). The model currently always signals OK
+(no CRC compute); whether the firmware's convergence needs a genuine CRC-valid signal vs just the
+cadence is open.
+
+FRONTIER (Dave's adjudication question, now on a DETERMINISTIC boot with REAL flux): what IRQ5/6
+cadence (and what E01E/CRC completion signal) the real VGC7219 produces per floppy sector so the $7950
+parity reaches $92B4 -> $92F6 (stake $f0) -> $933C ($c0) and the read converges. The mechanism is fully
+instrumented and deterministic now - the exact cadence is the remaining unknown. State: clean model
+builds green (879 lines); autonomous flux + two-IRQ5 contract in place.
+
+## cont.362 — the FIRST missing state: the firmware was in MFM not FM (stale UIB); the host->local UIB fetch fixes it
+
+Dave: the firmware should be looking for FM (AM = 0xfe), not MFM - the first missing state. Traced it.
+
+At the read's ID round, UIB@$6E60 +$12 = 0x44 -> bit1/HD=0 (floppy) but **bit2/MFM=1 (MFM)** - the
+firmware was in MFM mode for the FM label track. But UIB+$11 = 0x02 (-> E800 bits10-11 = 0, so the flux
+picks FM), so the two density indicators DISAGREED - the UIB was never populated with the real geometry.
+
+ROOT: `run_channel_dma` only handled read (0x95, local->host) and write (0x96, host->local) via the
+C800[0] SRAM chunk; it did NOTHING for the 0x87 INIT's host->local UIB FETCH. The kick census showed
+the fetch plainly: `cmd=87 E800=d22d(dir13-14=10) c000=0fe948 d000<<1=6e60`, and the HOST UIB at 0fe948
+is genuine FM - `+$12 = 0x40 (bit2=0 FM)`, SPT=0x10=16, sector-size=0x80=128, gaps 07/07. So the local
+$6E60 held stale MFM (0x44) because the fetch never ran.
+
+FIX: `run_channel_dma` now performs the host->local fetch when E800 bit14 set / bit13 clear (spec §3.2
+|$4000 = "write to local"): copy 0x20 bytes from the host (C000) into the D000-addressed local work area
+(D000<<1). The 0x87 INIT now pulls the FM UIB into $6E60. VERIFIED: UIB+$12 = 0x40 (bit2/MFM=0 FM),
++$11 = 0x97 (fully populated).
+
+RESULT (progress, per Dave "the first missing state"): with the firmware in FM, the data-consume $8018
+now runs **16x** (one per sector; it was 0 before - every IRQ5 previously landed on $7BA8 miss). So the
+FM fix + the two-IRQ5 contract got the data IRQ5 reaching the consume path. STILL 0: the STAMPER $92B4,
+STAKE-f0 $92F6, CONVERT-c0 $933C, DONE-1a54 - the ledger stake / completion. So the read now READS +
+CONSUMES the FM data but does not yet stake/complete. NEXT missing state (per Dave, there are more): why
+$92B4 (the ledger stamper) still never runs - the completion-side of the cadence, downstream of the
+now-working consume.
+
+State: clean model builds green (895 lines). Fixes: doorbell capture+0x81 accept, completion write-back,
+autonomous flux, two-IRQ5 data-AM contract, and the host->local UIB fetch (FM/MFM state). Deterministic.
+
+## cont.363 — address-match convergence PROVEN; residual fault isolated to the 0x95 host transport
+
+Answering Dave's "what does that code do when it sees a matching address?" — traced the full match:
+  $7BA8 (data-AM IRQ5 setup): reads captured H via [UIB+$cc], C via [UIB+$ca]; cmp vs wanted
+       [$7436]/[$7438]; sets [$7302]=$7FEE + [$7950]=1 (arms the 2nd IRQ5 -> $8018 consume). match -> $7CE6.
+  $7CE6: reads captured POSITION via [UIB+$ce]; indexes ledger[$7654+POSITION]; branch on the cell
+       (0xff empty / 0xfe wanted / else).  ledger==0xfe -> $7E1E.
+  $7E1E (the WANTED sector): **sets aim [$7428]=POSITION** and falls to $7EE0 (arm data phase).
+  $7EE0 arm: publishes [$741e] = LOCAL data-buffer word-addr (from $7696 table, idx [$7424]*6), sets
+       [$741c]=1, then spins on $f001 bit6 / [$7b18] for the gate array to deliver, else trap #1.
+
+RUNTIME (post-FM-fix, deterministic C++ taps):
+  - capture pointers RESOLVE: UIB+$ca/$cc/$ce -> $7dad/$7dae/$7daf (my capture cells), C/H match 00/00.
+  - **aim [$7428] IS set** (advances 1..16 across the 16 data-AMs); ledger stakes 0xfe->0xc0.
+  - per-sector capture destination is CORRECT: c800[0] == [$741e] exactly (0x2000,0x2040,... ->
+    <<1 = local SRAM 0x4000,0x4080,...); flux_data_capture writes each FM field into 0x4000+.
+  - CH1_COMPLETE st=80 (DONE) posts to host IOPB 0fe780 for cmd=87 (INIT, +UIB fetch) and cmd=89.
+
+RESIDUAL FAULT (cmd=95 only): the read matches/aims/stakes/stages, but:
+  1. the bulk run_channel_dma for cmd=95 fires with m_c000=0fe780 (the IOPB itself, NOT the CPUAP data
+     buffer) and a stale m_c800[0]=0 -> the staged label never reaches the host.
+  2. cmd=95 posts NO completion (only 87/89 do).
+  Next: source m_c000 from the IOPB data-pointer field the CPUAP built; DMA the staged local SRAM
+  (0x4000+, per [$741e]) to it; wire the 0x95 done stamp.  Minor: doorbell must stop pre-stamping
+  iopb+3=0x81 (leaks into the completion err byte; only iopb+2 status should be pre-stamped).
+
+## cont.364 — the CRC check + status, located (and a model conflict it exposes)
+
+THE STATUS/CRC TEST (where the read verdict becomes command status):
+  result handler $1800-$1810: reloads the per-record status word D1 = node+0x28 (== UIB+0x20; both
+  written together at $0e7e/$0e82), then `btst #4, D1`:
+     bit4 SET  (read-OK / CRC-good) -> success -> $1966/$184a -> eventual 0x80 DONE.
+     bit4 CLEAR (CRC error)        -> error   -> $184e stamps node+2 = 0x82.
+  Same btst #4 verdict pattern recurs at $16e4/$1724/$1804/$1966 (the retry/branch ladder).
+
+THE STATUS REGISTERS:
+  - $f000 = live gate-array status word (read pervasively).  Known bits: bit1 record-flag ($6d94),
+    bit5+bit9 (mask 0x220==0x20 = drive READY/seek-complete, $6d62), bit7 BUSY (polled $4e16/$4e48),
+    bit13 trk0, bit10 wprot, bit11 PIT-out.  $f001 bit6 = data-buffer-ready (the $7EE0 arm spins on it).
+  - E01E = latch-CLEAR strobe.  Read-and-discarded EVERYWHERE ($1520/$7cda/$7d8e/$7f94/$88ca/$8a42),
+    each preceded by an E802 bit9 toggle + NOP settle; the value is never tested.  The READ advances
+    the SERDES/CRC latch to the next record; it is NOT the verdict.
+
+WHAT I HAVE NOT nailed: the LIVE per-record source of bit4.  node+0x28 is written at command DISPATCH
+from the $92 micro-table constant ($0dea D6=(A1); $0e82) - a command-CLASS "expects-data/CRC" flag, NOT
+a live read.  So for GOOD media bit4 defaults SET (from the template) -> 0x80 done; a real CRC error must
+be the path that CLEARS it during the data phase, which I have not yet found (the second writer of
++0x28/+0x20, downstream of flux_data_capture's IRQ5).  => CRC is NOT the SINIX-boot blocker (good media
+defaults good); the blocker remains the 0x95 transport.  But the faithful model still needs it wired.
+
+MODEL CONFLICT this exposes (real bug):
+  - storager.cpp:485 drives $f000 bit4 from the INDEX PULSE, while the firmware's result path treats
+    bit4 as read-OK/CRC-good.  These collide on the same bit.
+  - storager.cpp:464 hardwires E01E bit4 = 1 ("read-OK") - but E01E is a strobe, value never tested;
+    harmless but misleading (comment is wrong).
+  Neither is driven by a CRC-16/CCITT over the recovered flux.  Faithful fix: the 74LS1812 computes
+  CRC-16/CCITT over data+2 CRC bytes (residual 0 = good); the gate array reflects busy(bit7)/ready/
+  data-ready and the per-record read-OK; the firmware reads that, not the index bit.
+
+## cont.365 — arm/latch handshake MODELED + 1812 CRC validated (per Dave's E01E-latch steer)
+
+Dave's insight: the E01E read CLEARS a latch we never modeled, and (era note) NO gate-array access is
+un-needed - every read/write is load-bearing.  Acted on both.
+
+ARM SOURCE (found empirically - my first guess of E802 bit15 was WRONG, deadlocked at REC#0):
+  after DOORBELL cmd=95 the firmware writes E000=0x0a6d (bit11=1 = open the read window, primes the FIRST
+  record) then E802 with bit11 toggling (the `ori #$800` each read ISR issues = per-record RE-ARM).  bit15
+  is NOT the arm; it appears only later within servicing (circular if gated on).
+MODEL (arm/latch):
+  - m_armed primed on the RISING edge of E000 bit11 (window open) OR E802 bit11 (per-record re-arm),
+    consumed at the record end - a persistent one-shot (the 200us pump can't sample an instantaneous
+    arm the CPU pulses in us; a level/edge one-shot decouples arm-time from mark-time).
+  - a record delivers only while (m_armed && !m_rec_latch); flux_data_capture sets m_rec_latch.
+  - E01E read = the ACK: clears m_rec_latch so the next record can be delivered (this is the latch Dave
+    flagged; the read's VALUE is discarded but the ACCESS is the clear - "every access significant").
+RESULT: records now flow through the gated path - 16 real FM sectors, c800[0] walking [$741e]
+  (0x2000..0x23c0 -> local 0x4000..0x4700), no regression (87/89 still DONE).
+
+74LS1812 CRC-16/CCITT - MODELED + VALIDATED: preset 0xFFFF, fold the data-AM byte (0xFB/0xF8) THEN the
+  field THEN its 2 on-disk CRC bytes => residual 0000 on EVERY good FM sector (was 0x83a5 before I added
+  the DAM byte).  m_rec_crc holds it, ready to drive read-OK once the access that carries the verdict into
+  node+0x28 is pinned.  (CRC test itself = result handler $1800-$1810 btst #4 on node+0x28; cont.364.)
+
+STILL OPEN (the real convergence blocker, NOT the pacing): cmd=95 posts no completion, so the firmware
+  keeps re-arming (E802 bit11) => phantom records past 16.  The two E800 bit12 kicks at cmd=95 start fire
+  with m_c000=0fe780 (the IOPB, not the CPUAP data buffer) + stale m_c800[0]=0 - the staged label never
+  reaches the host.  NEXT: honor every access - trace what those two bit12 kicks + the $8028 E000 read do,
+  source m_c000 from the IOPB data-pointer, DMA staged SRAM(0x4000+) to it, wire the 0x95 done.
+
+## cont.366 — faithful IOPB transport: node<->host DMA + endian word-swap; tap hack RETIRED
+
+Pressed into the transport treating every gate-array access as significant (Dave's era note).  The two
+E800 bit12 kicks at cmd=95 start are NOT sector data - they are node<->host-IOPB transfers.  Decoded the
+bus-master engine:
+  - LOCAL addr = D000<<1 (the node/IOPB work area $71F0; the UIB fetch used the same reg -> $6E60).
+  - HOST addr  = C000.
+  - direction (E800 bits 14/13, confirmed across 87/89/95):
+      bit14 set               = host -> local  (read IOPB $6000 / fetch UIB $4000).
+      bit13 set (bit14 clear) = local -> host  ($2000 = write node back to host = the 2180 status
+                                handshake).  len 0x18 (IOPB) / 0x20 (UIB).
+CPUAP handshake (exact, cpuap fe3e90/fe3ebe): spin until IOPB+2==0x81 (accept), then TBITB #0 IOPB+2 -
+  while bit0 set = busy, clear = done, then bit1 = error.  So +2 goes 0x81 (accept/busy) -> bit0-clear (done).
+ENDIAN: the firmware writes the status as its 68000 BE low byte (node+3); the CPUAP reads IOPB+2.  The
+  gate array bridges BE local <-> LE Multibus, so the local->host DMA byte-SWAPS each 16-bit word
+  (host+(k^1)=node+k).  Verified: accept node`00 81`->host`81 00` (+2=0x81 busy); done node`80 00`->host
+  `00 80` (+2=0x00 bit0-clear=done, bit1=0 no error).  host->local fetches copy straight (firmware
+  consumes UIB/IOPB byte-wise; the FM density UIB+$12 stays put).
+RETIRED the HLE hacks: the doorbell 0x81 pre-stamp AND the $71F2 ch1_complete write-tap are GONE - the
+  firmware's own node->host DMA now carries STATUS/ERROR to the host, faithfully.
+RESULT: the boot flows 87 -> 89 -> 95 through the firmware's own handshake (accept 0x81 -> done).  cmd=95
+  (label read) is ACCEPTED and processing but does not yet post DONE.
+STILL OPEN: cmd=95 completion.  The 16 FM sectors stage into local SRAM 0x4000+ but never DMA to a host
+  label buffer (no such kick fires yet), so the firmware never finishes + keeps re-arming (phantoms).
+  NEXT: find the sector-data transport (D000=sector buf, C000=host label buf, a bit12 kick) OR confirm
+  the label read returns a processed result via the node; then the completion path ($1A54 -> node+2=0x80
+  -> DMA) fires.  Also pending: wire m_rec_crc (validated) into the read-OK verdict (node+0x28 bit4).
+
+## cont.367 — the read-loop shape (Dave's framing); the WANTED half never completes
+
+Dave's architectural correction (saved as memory storager-gate-array-principle): the VGC7219 is
+STIMULUS/RESPONSE only, no program - the firmware drives every read step; model only what the firmware
+commands.  The normal path AM->addr->DM->data->CRC sets the shape; data is read in SECTOR-ID order (not
+media order).  Per-sector logical loop to support: match ID -> stage data in SRAM -> CHECK CRC -> if good
+transfer to host via Multibus DMA -> increment host ptr by xfer size -> increment sector ID -> decrement
+sectors-remaining; loop until 0, then complete.
+
+CPUAP contract (ground truth, cpuap fe4484 "sys-floppy label read setup"): cmd=95 reads the label into a
+host buffer, then fe448e `CMPB 0x53, 0x69(R6)` = the SINIX gate (byte 0x69 == 'S'); miss -> "no
+sys-floppy, going to harddisk".  So cmd=95 MUST transfer good label data to the host buffer + complete.
+
+RUNTIME FINDING (ledger $7654[1..16] evolution, cmd=95): stalls and loops 58x at
+   1-8 = c0 c0 c0 c0 c0 c0 c0 c0   (DONE)      <- these were 0xff (UNwanted) initially
+   9-16 = 07 08 09 0a 0b 0c 0d 0e  (NOT 0xc0)  <- these were 0xfe (WANTED); now hold ~their captured IDs
+So the read completes the WRONG half: the wanted sectors (9-16) get their ID captured but never
+data-complete to 0xc0 -> firmware never sees "all wanted done" -> loops (the phantoms).  The host-transfer
+step is never reached (C000 is only ever written with the IOPB address, never a sector-data buffer).
+
+=> The gate array is not presenting the per-sector state the firmware's loop needs (step 3 CRC / the
+"correct surrounding state") for the WANTED sectors, so they never pass match+CRC to reach step 4 (host
+xfer).  m_rec_crc is validated (0=good) but NOT wired to any firmware-readable response yet.  NEXT: locate
+the exact per-sector loop (sectors-remaining decrement + sector-ID increment + C000 host-ptr increment +
+the CRC-verdict read) in the firmware, and supply exactly those gate-array responses - nothing autonomous.
+
+## cont.368 — CORRECTION (Dave): the read WORKS; wanted data = sectors 1-8; the problem is COMPLETION
+
+Checked the media (mx2-001.imd, cyl0 head0, FM mode1, 128B):
+   sid 1-6  = all zeros (empty)
+   sid 7    = "VOL1SINIX0 ... SIEMENS"   (volume label)
+   sid 8    = "HDR1 NSC Boot  00256"     (boot file header)
+   sid 9-16 = all zeros (empty)
+=> the WANTED data is sectors 1-8 (label in 7-8), NOT 9-16.  cont.367's "read completes the wrong half"
+   was WRONG.  ledger 1-8 -> 0xc0 is the read SUCCEEDING on the wanted sectors.
+VERIFIED at runtime: the label lands in local SRAM - 'VOL1SINIX0' @0x4280, 'HDR1 NSC B' @0x4300; ledger
+   1-8 = 0xc0.  So match->stage->CRC works for the real data; the per-sector read is CORRECT.
+
+The REAL problem is COMPLETION, not the per-sector read: after 1-8 stage to 0xc0 the firmware does NOT
+transfer the staged label to the host buffer + post done - it keeps going to 9-16 (07-0e) and loops.
+Open: does cmd=95 request 8 or 16 sectors, and why doesn't the firmware recognize the wanted set done +
+run the host transfer?  NEXT (reason from code): find the read builder that sets the ledger ff/fe + the
+sectors-remaining count, and the completion recognition + the C000 host-buffer transfer of the staged
+label (the step that was never reached).
+
+## cont.369 — INTERRUPT ROLES + why the count never decrements (Dave's question)
+
+68000 autovector table (ROM 0x60-0x7c):
+  IRQ2 -> $24AA (doorbell).  IRQ3 -> [$72F8].  IRQ4 -> $3BFE.  IRQ5 -> [$7300].  IRQ6 -> [$7304].
+  IRQ7 -> $26B4 (hard gate-array re-init / panic).
+IRQ5/6 are SOFT-VECTORED stubs ($26A8: `move.l $7300,-(sp); rts` / $26AE via $7304) - the firmware
+RE-INSTALLS the handlers PER READ PHASE.  Known installs: [$7300]=$9884 (ID comparator) during ID-hunt
+($9602/$95xx); =$29C0 (data setup/consume) during the data phase.  [$7304]=$298C (ID-round $89F2 /
+stamper $92B4).
+IRQ4 ($3BFE) = DMA/channel-DONE: clears E800 bit12, then $1310/$1348 write the IOPB status into the node
+(node+2 = 0x81 busy, 0x80 done when node[0]==0x8f).  IRQ4 DRIVES COMPLETION.  => roles: IRQ6 = address-
+mark/record events (ID + stamp), IRQ5 = data-field bytes, IRQ4 = host-DMA transfer done.
+
+THE COUNT (Dave: "IOCB requests exactly 8 sectors; the decrement isn't running"):
+  sectors-remaining = [$79A8].  Runtime: [$79A8]=0x0008 (CONFIRMS 8), done [$79AA]=0, and it NEVER moves.
+  Decrement lives in the stamper STAKE path $92F6 ($932C `subq #1,$79A8`), double-gated:
+    (a) $92B4 `tst $742c; bne $92f6` - needs [$742C]!=0 to REACH $92F6; else convert-only ($933C, stakes
+        ledger 0xC0 but no count).  Runtime [$742C]=0 -> always convert, never stake.
+    (b) $92F6 `tst $79b6; beq $9370` - needs [$79B6]!=0 for the subq.  Runtime [$79B6]=0.
+  => BOTH gates 0, so ledger converts to 0xC0 (looks done) but the count stays 8 forever -> read loops.
+  [$742C] is armed by the E01E processor $7106 ONLY when aim in the window [$7954, $7954+$7ABC); and by
+  the phase-setup $95xx.  These are gate-array/phase-driven state my cadence never reaches.
+
+ROOT: the read is a PHASED state machine re-installing IRQ5/6 soft vectors per phase; my gate array's
+mark cadence keeps it in a convert-without-count loop and never advances to the phase that arms [$742C]/
+[$79B6].  NEXT: map the read phases + the exact interrupt each phase expects (ID-hunt: IRQ5=$9884 compare;
+data: IRQ5=$29C0; IRQ6=$298C stamp; IRQ4=host-DMA done), and the [$7954]/[$7ABC] window, then drive the
+interrupts in that cadence.  m_rec_crc + host-buffer transfer feed into IRQ4's completion.
+
+## cont.370 — THE PHASE MACHINE + command/response protocol (Dave: understand the complete path)
+
+The gate array is commanded via E000 codes; it responds with an interrupt to the phase's installed
+soft-vector handler.  The COMPLETE per-sector path (floppy read):
+
+  PHASE A - ID HUNT ($9602):
+    - push [$7300]/[$7304]; install BOTH = $9884 (ID comparator).
+    - command gate array: E802 clear{15,13,11}; E000=0x22F (arm); E802 |bit15 (capture-arm); read E000
+      x16 (SERDES flush/sync); E000=0x23F; E000=[$7A48].
+    => gate array must now hunt the ID address mark and, on finding it, stage the ID at [$7A66] and raise
+       an interrupt (-> $9884).
+  PHASE B - ID MARK -> $9884 compare:
+    - A3=[$7A66] (captured ID); $9934 (FM): byte0==0xFE (IDAM), cyl==[$7438], then R vs [UIB+1]+1:
+      `addq #1,D2; cmp.b D1,D2; bcs $9978` => accept when threshold >= captured R.  [UIB+1]=7 -> accept
+      R=1..8, reject R>8.  ACCEPT: aim [$7428]=R.  (window base [$7954]=1 for floppy, $9462.)
+    - on match ($9850): write E000 4-value sequence (command the DATA read), toggle E802 bit14/bit12,
+      RESTORE [$7300]=$29C0 / [$7304]=$298C (the data-phase handlers).
+  PHASE C - DATA READ:
+    - gate array reads the data field into SRAM; IRQ5->$29C0 (setup $7BA8 / consume $8018), IRQ6->$298C
+      (ID-round $89F2 / STAMPER $92B4).
+    - stamper $92B4: if [$742C] (armed by $7106 when aim in [$7954,$7954+$7ABC)) -> $92F6 STAKE ledger
+      0xF0 + `subq #1,$79A8` (count--).  else convert-only $933C (0xC0, NO count).
+  PHASE D - count==0 -> IRQ4 ($3BFE) host-DMA-done writes IOPB status 0x80 done; command completes.
+
+E000 command codes seen: 0x0A6D(open read window, bit11) / 0x22F,0x23F(ID hunt) / 0x2AF,0x2FF(data class,
+$7FC6) / the 4-value seq(data read).  E802 bit15=capture-arm, bit11=per-record re-arm, bit14/bit12 pulses.
+
+MY MODEL'S ERROR (the wrong cadence Dave flagged): the flux path free-delivers ID(IRQ6)/data(IRQ5) marks
+by flux position, IGNORING the E000 command codes and the phase.  So the firmware receives interrupts out
+of phase; it never cleanly advances A->B->C in the order that arms [$742C]/[$79B6], so the count never
+decrements and it loops (convert-without-count).  Also the ID capture must land at [$7A66] (comparator
+reads there), not just my fixed $7DAC.
+
+NEXT (the refactor): make the gate array STIMULUS/RESPONSE, command-driven -
+  - decode E000 writes: 0x22F/0x23F(+E802 bit15) => ID-hunt-armed; the 4-value seq / 0x2AF/0x2FF => data-
+    read-armed.  Track the current command.
+  - deliver interrupts by COMMAND, not free flux: in ID-hunt, on the next ID AM, stage the ID at [$7A66]
+    (and the cells) and raise the interrupt -> $9884; in data-armed, read the data field into SRAM and
+    raise the data-phase IRQ5 then IRQ6-complete.
+  - keep the arm/latch + E01E ack as the one-record pacing; feed m_rec_crc + host-buffer transfer into
+    the IRQ4 completion.
+
+## cont.371 — command-driven flux (increment 1) + the ID-hunt bootstrap blocker
+
+Implemented the stimulus/response refactor increment 1: decode E000 command codes and gate flux interrupt
+delivery on them (m_cmd = CMD_IDHUNT on E000 0x22F/0x23F; CMD_DATA on 0x2AF/0x2FF).  flux_id_capture
+delivers IRQ6 only in CMD_IDHUNT (consumes the command); flux_data_* only in CMD_DATA.  RESULT: the
+out-of-phase accidental data staging is GONE (no SRAM label now) - the model no longer free-runs; it only
+responds to commands.  This is the correct foundation.
+
+BUT the firmware is stuck in ID-hunt from the FIRST sector, and it is NOT my new gating (same before):
+  - E000 command trace (cmd=95) loops: 0A6D(open window) 022F 023F  0A6D 022F 023F ... forever.
+  - [$7A66] = 0 always (the comparator $9884 reads its captured-ID pointer here).
+op44 = $748E: `bsr $9602; tst D0` (blocking arm+verify).  $9602 SHOULD, after arming ID-hunt (0x22F/0x23F),
+write a 4-value SERDES config to E000/E002/E004/E006 ($96E8) and fall through $9700->$9758->$9796->$97C2
+which sets [$7A66]=0x7DAC (my capture cells) and then command E000=0x2AF (data).  It NEVER reaches any of
+that - the E000 trace stops right after 0x23F.  So $9602 bails between arming ID-hunt and the config/
+[$7A66]/data-command tail => [$7A66]=0 => $9884 can never match => ID-hunt re-arms forever.
+
+So the true blocker is EARLIER than the data phase: $9602 (op44) does not complete its arm.  Something it
+reads/expects from the gate array between E000=0x23F and the 4-value config ($9688..$96E8) is not
+satisfied, so it exits (returns D0 nonzero -> op44 $749A retry -> re-open window 0A6D -> re-arm).  NEXT:
+instrument $9602's internal progression (the E000 x16 read loop $9682, the [$7A48] write $968E, and what
+gates reaching $96E8/$97C2) to find the exact gate-array read/response $9602 waits on and is not getting.
+
+## cont.372 — increment-1 finding: a CONFIG-WRITE phase precedes the ID-hunt arm (decode is one layer deeper)
+
+Command-driven gating (m_cmd from E000 0x22F/0x23F=IDHUNT, 0x2AF/0x2FF=DATA) BUILT + isolated the truth,
+but it STALLS the firmware, so it is not yet the sole gate.  What it showed:
+  - The ID marks ARE recovered by the flux (flux_id_capture sees sectors 1..16, C/H/R=00/00/01..).
+  - But under command-only gating m_cmd=IDLE at every ID mark -> never delivered, because the firmware
+    NEVER issues 0x22F/0x23F in that build.  Instead it writes an 8-word SERDES config to E000-E00E
+    (E000=0A6D,E002=0829,E004=0033,E006=0A6D,E008..E00E=0A09; [$7A48]=0A6D) and then HANGS.
+  - The paths diverge right AFTER E000=0A6D: free-running next writes E000=022F/023F (the arm); command-
+    driven moves to E002=0829.. and stalls.  So a CONFIG/SETUP phase (E000-E00E) must complete - via a
+    gate-array interrupt/response the firmware waits on - BEFORE it issues the 0x22F/0x23F ID-hunt arm.
+So the command protocol is deeper than {0x22F/0x23F, 0x2AF/0x2FF}: there is an earlier config-write phase
+whose completion the firmware awaits.  Decoding "ID-hunt = 0x22F/0x23F" alone is insufficient.
+
+INTERIM: reverted the three flux gates to the m_armed pacing (functional again: label stages, ledger
+1-8=0xC0), KEPT the m_cmd decode as infrastructure.  Model builds green, runs, diagnosable.
+NEXT: trace the routine that writes E000-E00E (is it $96E8 or another), what [$7A48]=0A6D means, and the
+gate-array interrupt/status the firmware waits on after the config, THEN gate the ID-hunt arm on that.
+
+## cont.373 — the config-phase response: F000 bit10 handshake + [$7A48] operating word
+
+Traced what the firmware waits on around the E000 config:
+  - [$7A48] = the operating-mode word 0x0A6D written to E000 (fw $8B12/$8B4A `move.w $7A48,$e000`),
+    loaded from node/UIB +$56 ($7B72 `move.w ($56,A1),$7A48`).  So E000=0x0A6D is [$7A48], the channel
+    operating word, not a literal.
+  - A SERDES byte-transfer handshake polls **F000 bit10 (0x400)**: $8DD4 spins for bit10 SET (timeout ->
+    $8F28 error code 0x28/0x27), then reads **E00A** + writes E01A/E01E, then $8E10 spins for bit10 CLEAR
+    (timeout -> error).  A DRQ-style per-byte set/clear handshake; the data byte port is E00A, not E000.
+  - MODEL CONFLICT: storager.cpp ch_r maps F000 bit10 = write-protect (=0 for this disk).  If the read
+    path reaches $8DD4, bit10 never sets -> timeout -> error.  bit10 is (also?) a transfer/DRQ status the
+    gate array must drive during a data transfer, NOT (only) write-protect.
+
+So the config-phase / data-transfer the command-driven build stalls into likely hinges on F000 bit10 (and
+the E00A data port) - a handshake the model doesn't drive.  NEXT: confirm $8D80/$8DD4 is on the cmd=95
+read path (vs the write/format path), then model F000 bit10 as the SERDES transfer/DRQ status (set when a
+byte is available at E00A, cleared on read) instead of write-protect, and route the read bytes through
+E00A per that handshake.  This is the gate-array response the ID-hunt->data cadence waits on.
+
+## cont.374 — F000 bit10 lead RULED OUT for the read (write/format path); reassessment
+
+Verified before implementing: E00A and E018 are read ZERO times during cmd=95.  So $8D80/$8DD4 (the F000
+bit10 + E00A byte handshake) is the WRITE/FORMAT path, NOT the floppy read.  The read uses the E000 data
+port (as modelled).  F000 bit10 = write-protect stays correct for reads.  Good that we probed first.
+
+WHERE THIS LEAVES THE READ (honest state):
+  - FUNCTIONAL: cmd=95 reads the wanted sectors 1-8, stages the label correctly (VOL1SINIX0@0x4280,
+    HDR1@0x4300), ledger 1-8 -> 0xC0.  Transport handshake (accept 0x81 / done 0x80 via node<->host DMA +
+    endian swap) works for 87/89.  1812 CRC validated (residual 0).
+  - NOT CONVERGING: the count [$79A8]=8 never decrements (its gates [$742C]/[$79B6] never arm), so cmd=95
+    never posts done; the phase machine (ID-hunt $9602 -> $9884 compare -> data) does not run in the
+    faithful order because my flux free-delivers marks.
+  - Command-driven increment 1 (gate delivery on E000 0x22F/0x23F / 0x2AF/0x2FF) STALLS: the firmware
+    writes an E000-E00E config and waits on a gate-array response BEFORE issuing 0x22F/0x23F - and that
+    response is NOT F000 bit10/E00A (ruled out).  Reverted to m_armed pacing (functional) for now.
+
+OPEN QUESTION for the next session: what gate-array read/response does $9602 spin on between the E000-E00E
+config write and issuing the 0x22F/0x23F ID-hunt arm?  Candidates still open: an E000/E01x status read, an
+F000 bit other than 10, or an interrupt the config-arm should raise.  Needs a PC-level trace of $9602's
+internal wait (or a e000-e01f + f000 read census during the command-driven stall) to pin the exact poll.
+
+## cont.375 — census result + three failed arm hypotheses; recommend instruction-level trace
+
+Census (command-driven build, cmd=95): the firmware does <500 gate-array reads then idles - it is NOT
+polling a register; it is WAITING FOR AN INTERRUPT after the E000-E00E config write.  So the config IS the
+arm and the gate array should raise the ID-mark IRQ; my 0x22F/0x23F decode waited for codes that never come.
+Tried arming ID-hunt on the operating-word engage (E000 bit11 / 0x0A6D): the firmware went active (E000
+reads 18k, E01E 1.9k) but staged NOTHING (label hits 0, ledger stays ff/fe) - it read the data stream in a
+loop without matching/staking.  So the operating-word is not the ID-hunt arm either.
+
+THREE arm hypotheses now falsified: {0x22F/0x23F} (stall), {F000 bit10/E00A} (write path, 0 reads on read),
+{operating-word 0x0A6D} (reads-but-no-stage).  Black-box register instrumentation has hit diminishing
+returns: it shows WHICH registers are touched but not the firmware's exact branch decisions inside $9602 /
+the read loop, which is what determines the cadence.
+
+REVERTED to the functional m_armed baseline (label stages VOL1SINIX0@0x4280 / HDR1@0x4300; builds green).
+m_cmd decode kept as infrastructure.
+
+STANDING STATE (whole read): FUNCTIONAL read+stage of the wanted 8 sectors; faithful transport (accept/done
+via node<->host DMA + endian swap, 87/89 complete); 1812 CRC validated.  BLOCKER: count [$79A8]=8 never
+decrements ([$742C]/[$79B6] never arm) because $9884 (ID compare) never runs with a valid [$7A66] in the
+faithful cadence.  RECOMMEND NEXT: deterministic INSTRUCTION-LEVEL trace of :slot1:storager:cpu across the
+cmd=95 read (MAME debugger `trace` / -trace, filtered to $9602/$9884/$7106/the read ladder), NOT more
+black-box register taps - to read $9602's exact wait+branch and the precise IRQ ordering it expects.
+
+## cont.376 — INSTRUCTION TRACE: stuck in op42 (completion-wait); null vectors + disarmed at the wait
+
+Deterministic opcode-fetch trace of :slot1:storager:cpu across cmd=95 (C++ AS_OPCODES tap, not Lua):
+  - The read ladder LOOPS forever: $156A (walker) -> $6BC2 (op42) -> $156A -> $6BC2 ...
+  - op4A read-field ($6ED2) NEVER runs (0 hits); NONE of $298C/$29C0/$89F2/$92B4/$8018 (the IRQ forks +
+    data handlers) run.  Only $7106 (E01E proc) ran once.  So the firmware's interrupt-driven read path is
+    NOT executing at all - the label in SRAM is the model's flux path dumping data, not fw processing.
+op42 ($6BC2) floppy path: reads node+0x18 (node=$71F0); `beq $6cde` -> returns 0xFE = "wait/retry" when
+  node+0x18==0; the walker re-runs op42.  node+0x18 is the completion word, written by the RESULT handlers
+  ($1A4C by the $1A54 DONE; $120A error epilogue).  So op42 waits for the read completion.
+STATE AT THE WAIT (dumped at $6BC2): node+0x18=0; **IRQ5vec[$7300]=0, IRQ6vec[$7304]=0 (NULL)**;
+  serdes_active=0; armed=0; aim[$7428]=0; window [$7954]=1/[$7ABC]=0.
+=> op42 is reached with NO interrupt handler installed and the gate array DISARMED - so nothing can post
+   node+0x18.  The problem is EARLIER than op42: the read-setup op(s) before op42 (which must install
+   [$7300]/[$7304] + arm the SERDES + drive the read) are NOT establishing that state, so op42 waits on a
+   completion that can never arrive.
+
+REFRAME (answers "which interrupt/when" one level up): the interrupt CANNOT be the fix in isolation - at
+op42 the vectors are null and the channel disarmed.  First the read-setup must run (install the IRQ5/IRQ6
+handlers + arm the gate array via the E000 command); THEN the data IRQ drives the read; THEN completion
+posts node+0x18 and releases op42.  NEXT: trace the ladder ops BEFORE op42 (walker $156A dispatch; op54/
+op58/op4A) to find which one installs [$7300]/[$7304] + arms - and why it is not running before op42.
+
+## cont.377 — THE HANG: op28 spins on [0x14] bit4, which my map serves as ROM (0x00)
+
+The ladder is stuck at op28 (the 2ND op, ptr $7252), NOT op42 - its handler is $6788 (which reaches the
+$6BC2 wait code I mislabelled op42).  Walker $156A dispatch confirmed: op24 ($651C) runs ONCE (configures
+E804 drive/head control) then advances; op28 ($6788) then LOOPS forever.
+
+op28 ($6788) floppy path: class=UIB+$12 & 3 (=0 for our 0x40 FM), [$7A36]==0, then
+   $67A8: `move.b $14.w,D0; btst #4,D0; bne $67ba` -> bit4 SET proceeds, CLEAR -> $67B2 returns 0xFE (WAIT).
+Runtime: UIB+12=40, 7a36=0, **[0x14]=00 (bit4=0)** -> op28 returns 0xFE every time -> walker re-runs it.
+op28 ALSO reads [0x14] low bits as a class ($68F0 `move.b $14,D2; andi #3`).  The firmware NEVER writes
+$14 (only 2 reads: $67A8, $68F0).  ROM 0x10/14/18/1C all = 0x0000024A (shared exc vector) so [0x14]=0x00.
+
+=> [0x14] is a BOARD CONFIG/STATUS register at a LOW address (bits0-1=media/drive class, bit4=ready/
+present) that the MODEL DOES NOT MAP - my mem_map serves ROM at 0x0000-0x3FFF, so [0x14] reads the vector
+byte 0x00, bit4 never sets, op28 hangs.  This is the ACTUAL hang - upstream of everything else (the ID
+compare / count / completion never get a chance because op28, the 2nd op, never passes).
+
+So the answer to "which interrupt / when" is: NOT an interrupt at all - a MISSING low-address status
+register.  op28 polls [0x14] bit4 = "drive/channel ready".  NEXT: determine what [0x14] is (a config/
+status latch; bit4=ready, bits0-1=class) from op24/op28's use + the CPUAP/board, and map it so bit4 reads
+ready for the present floppy - then op28 passes and the ladder advances to the actual read ops.
+
+## cont.378 — ROOT CAUSE CHAIN: op28 hangs on a SETTLE timer that is re-scheduled before it fires
+
+Full deterministic-trace chain (all via C++ opcode/mem taps), why cmd=95 never reads:
+  1. Ladder walker $156A loops on op28 (2nd op, $6788) forever; op4A/read + all IRQ5/6 data handlers
+     never run.  (op28's handler $6788 reaches the $6BC2 wait code.)
+  2. op28 floppy path: proceeds only if (UIB+$12&3) or [$7A36] or [0x14]-bit4; all clear -> returns 0xFE
+     (WAIT).  [0x14] is a red herring (a low HW status byte, ROM 0x00 in the model); the REAL gate is
+     [$7A36] = the seek/settle-done flag.
+  3. op24 ($651C, the 1st op) reads UIB+0x14 low nibble (=6) and SCHEDULES a settle timer via $29F8:
+     count = nibble*10 = 60, value = 1, target = $7A36, into the tick queue [$736C] (slot $733C).
+  4. IRQ1 system tick ($2B58) FIRES fine (gate0=1, hundreds of times) and DECREMENTS the timer: the
+     count goes 60,59,...,1 monotonically - CONFIRMED at $2B7A ([head+0]).
+  5. BUT at count 1 it JUMPS to 0x46 (70) and counts down again -> it NEVER reaches 0 -> the fire path
+     $2B84 (write value 1 -> [$7A36]) never runs for it -> [$7A36] stays 0 -> op28 waits forever.
+  => The settle timer is RE-SCHEDULED just before firing (60 then 70 = nibble 6 then 7).  Something
+     re-arms the seek/settle in a loop: a SEEK/RECALIBRATE that is not completing, so each step re-arms
+     the settle and the "settle done" flag never latches.
+
+So the model gap is in the SEEK/RECALIBRATE completion (not the read cadence, not the interrupt vectors,
+not [0x14]): the firmware steps + re-arms the settle each step and never sees "seek complete", so op28's
+[$7A36] gate never opens and the read ladder never advances past its 2nd op.  NEXT: trace what re-schedules
+the settle (op24 re-run? a per-step re-arm?) and the seek-complete/track-0 condition the firmware needs -
+that is the actual missing gate-array/drive response.  (Model still builds green; functional m_armed
+baseline intact; opcode-trace instrumentation temporary.)
+
+## cont.379 — CORRECTED (Dave): op28 (settle DELAY) passes; op42 (completion-wait) TIMES OUT
+
+Dave: the IRQ1 timer is generic timekeeping = DELAYS (normal: spin-up/head-load) + TIMEOUTS (NOT valid in
+this config; a timeout means the gate-array model failed to provide state).  I had conflated the two.
+
+Op-TRANSITION trace (dedup) - the true cmd=95 flow:
+  LADDER[7250..] = 24 28 56 58 18 54 4A 42 36 00
+  op24 (config) -> op28 (settle DELAY, count 60) PASSES after ~1.5s -> ... -> op42 (completion-wait) STALLS.
+So op28's 60-count was a normal settle DELAY that fires; the 70-count I saw next is the op42 TIMEOUT.
+
+op42 ($6BC2) state over time:
+  early: node+18=0, vec[7300]=0, vec[7304]=0, serdes=0, armed=0, cnt=0.
+  later: node+18=0, vec[7300]=0, vec[7304]=0, serdes=1, armed=1, **cnt=0x0008**.
+=> By op42 the gate array is ARMED (serdes=1) and the sector count is 8, but the IRQ5/IRQ6 SOFT VECTORS
+   [$7300]/[$7304] are STILL NULL.  So the read marks my flux raises hit null vectors - the firmware never
+   services the read, node+0x18 (completion) never latches, and op42's TIMEOUT expires.  This is the
+   "gate array failed to provide state" timeout: the missing state is the SERVICED read completion.
+
+So the gap: the read-setup ops between op28 and op42 (op56/op58/op18/op54/op4A) must install [$7300]/
+[$7304] (the data ISR handlers) + arm, and in the model the vectors are never installed.  NEXT: trace
+op56/op58/op54/op4A ($192 table handlers) - which one installs [$7300]/[$7304], and why the model's cadence
+leaves them null at op42.  (op4A=$6ED2 read-field earlier showed 0 hits - a prime suspect.)
+
+## cont.380 — CORRECTION: vectors ARE installed; op42 timeout = read not SUSTAINED (cadence)
+
+Earlier "null vectors" was a WORD-vs-LONG misread.  $3292/$328e installs the handler as a LONG (move.l)
+into $72EC+[$7942]; $72EC+0x14 = $7300.  So the LONG at $7300 = 0x0029C0 (=$29C0 IRQ5 fork), $7304 =
+0x00298C (=$298C IRQ6 fork).  My op42 dump read the WORD (high half = 0x0000) and looked null - WRONG.
+Read-setup DOES run: $328E x2, $6074 ($298C pick), $60B6 ($29C0 pick).  vectors CORRECT.
+
+op42 state (vectors as longs): [7300]=0029C0, [7304]=00298C, serdes=1, armed=1, cnt=0x0008.  So the read
+IS set up: handlers installed, gate array armed, count=8.  And the IRQ handlers DO fire: $298C x1, $29C0
+x1, $89F2 (ID round) x2.  BUT $92B4 (stamper) and $8018 (consume) NEVER run; only 1-2 IRQs arrive, not the
+16+ a real 8-sector read needs.  So the read STARTS (ID round runs a couple times) but is NOT SUSTAINED,
+and op42's completion-timeout expires.
+
+=> The problem is back to INTERRUPT DELIVERY CADENCE, but now with vectors/arm/count all CONFIRMED correct:
+the flux raises IRQ5/6 (label even gets staged by the model's flux path) but only 1-2 reach the firmware's
+$298C/$29C0 handlers - the rest are lost/masked, so the per-sector consume+stamp chain never sustains and
+the ledger/count never completes.  NEXT: find why only 1-2 flux IRQs are serviced (masking during the
+ladder/op4A SR=$2700? the m_armed one-shot consuming after 1 record? the HOLD_LINE vs pulse?) - the read
+needs a sustained IRQ5/6 stream that the firmware services 2/sector x8.  This is the real cadence gap,
+finally with everything upstream (op28 settle, vectors, arm, count) proven correct.
+
+## cont.381 — event-driven IRQ pacing IMPLEMENTED (fixes the merge); dataEND ack precision remains
+
+Dave: the read is an interleaved IRQ4/5/6 handshake, NOT single-shot; fix masking/re-arm/HOLD_LINE.
+Diagnosis (interleaved RAISE-vs-SERVICE trace) CONFIRMED the merge: flux raised IRQ5-dataAM AND
+IRQ5-dataEND in one pass, both HOLD_LINE -> they MERGE -> only dataAM serviced ($29C0->$7BA8), dataEND
+lost, $8018 consume never runs, op42 times out.
+
+IMPLEMENTED event-driven pacing (m_int_pending): raise ONE interrupt, hold, and do NOT advance the flux /
+raise the next until the firmware SERVICES it.  Ack = E802 bit11 re-arm rising edge OR E01E read; on ack,
+release the next.  flux_advance_to returns while pending; each capture sets pending on raise.
+RESULT: raises are now PACED one-at-a-time (no flood/merge): IRQ6-id -> $298C/$89F2 (serviced),
+IRQ5-dataAM -> $29C0/$7BA8 (serviced), then IRQ5-dataEND.  BUT dataEND is STILL not serviced ($8018=0,
+$92B4=0), and the NEXT record's IRQ6-id raises right after -> so the ACK (E802 re-arm) cleared m_int_pending
+BEFORE dataEND was serviced, letting the flux skip ahead.
+
+=> The pacing architecture is right (Dave's interleave); the remaining gap is ACK PRECISION: which exact
+register access acks WHICH interrupt.  Open: is the per-record contract IRQ6(id)+IRQ5(dataAM)+IRQ5(dataEND)
+[2 IRQ5], or IRQ6+single-IRQ5 with the data read via E000 PIO (so my 2nd IRQ5 is spurious)?  $7BA8 re-arms
+E802 AND its path reads E01E ($7CDA); $8018 reads E000+re-arms.  NEXT: pin each handler's precise ack
+(E802-rearm vs E01E-read vs E000-read) so dataEND's ack is $8018's, not $7BA8's - or confirm the true
+per-record IRQ contract from the $298C/$29C0 alternator + $7950 parity.
+
+## cont.382 — arm+mark model (Dave: bit-change prior to each IRQ); E802 bit11 is TOO BROAD an arm
+
+Dave: only ONE interrupt live at a time; a state-eval/bit-change precedes each; try both paths; experiment.
+Implemented the arm+mark model: the flux HOLDS at a recovered mark (m_mark_pending=5/6, no free-run), and
+the firmware's arm bit-change delivers exactly that one IRQ (deliver_mark: arm && mark -> raise, consume
+both).  Arm = E802 bit11 rising (the ISR re-arm).  flux_advance_to holds while a mark is pending.
+
+RESULT (Path A, 2 IRQ5/record): DELIVER fires 80x (53 IRQ5 + 27 IRQ6) but the CPU SERVICES only 2
+($298C x1, $29C0 x1, $89F2 x2, $8018=0, $92B4=0).  So E802 bit11 rising happens ~80x - FAR more than the
+2 handler runs - i.e. NON-handler code (op4A / the ladder / a loop) also toggles E802 bit11, so my arm is
+spurious most of the time and the delivered IRQs land in MASKED windows (op4A SR=$2700 / op42) and are
+never taken.  The read services only the FIRST record's ID+dataAM, then stalls -> op42 timeout.
+
+=> E802 bit11 rising is NOT the specific per-interrupt arm (too broad).  Dave's "bit-change prior to each
+interrupt" must be a DISTINCTIVE write the read ISR does right before it expects the next IRQ - AND the
+delivery must land when the CPU is unmasked to take it.  NEXT: examine the read ISRs' ($89F2 ID-round,
+$7BA8 data-setup, $8018 consume) FINAL gate-array write before RTE - the exact arm for the next IRQ - and
+whether op42's wait is the intended service window (unmasked).  Then gate deliver_mark on THAT specific
+write, not any E802 bit11.  (Also to try: Path B - single IRQ5/record + data via E000 PIO.)
+
+## cont.383 — arm+mark PROGRESS (1 sector stakes 0xC0); masking ruled out; E802-bit11 arm too broad
+
+Read the CPU IPL-mask at each deliver_mark: 21 takeable vs 9 masked -> MASKING IS NOT THE BLOCKER (the
+IRQs are delivered when takeable).  And the arm+mark model made real progress: ledger now stakes POSITION 1
+to 0xC0 (ff->c0), up from all-ff/fe stuck.  So one full record (ID->dataAM->complete->stamp) now gets
+through, then it STALLS on sector 2.
+
+But E802 bit11 rising (my arm) fires ~80x while only 1 sector completes -> the arm is TOO BROAD: non-ISR
+code (op4A ledger-walk / the ladder) also toggles E802 bit11, so ~80 deliveries fire but most are spurious
+(wrong time), and the read cannot advance past sector 1.  Handler-PC trace is unreliable (undercounts;
+$92B4 clearly ran since ledger hit 0xC0), so trust the LEDGER as ground truth.
+
+OPEN (per Dave, reason it out): (1) the SPECIFIC per-interrupt arm bit-change (E802 bit11 is not it - find
+the distinctive write each read ISR does right before it expects the next IRQ).  (2) the true per-record
+IRQ sequence: IRQ6(id)+IRQ5(dataAM)+IRQ5(dataEND->$8018) [2 IRQ5], OR IRQ6(id)+IRQ5(dataAM)+IRQ6(complete->
+$92B4) [Path B]?  $29C0 parity1->$8018, $298C parity1->$92B4 - both are "parity-1" completers, so which the
+gate array raises for the data-end is the experiment.  NEXT: examine $89F2/$7BA8/$8018 final gate-array
+write before RTE (the arm) + try dataEND as IRQ6 vs IRQ5.  Progress is real: 0 -> 1 sector staked.
+
+## cont.384 — STATE-FLOW DIAGRAM of gate-array writes vs interrupts (Dave's suggestion)
+
+Traced every E000-E80F WRITE interleaved with MARK/DELIVER/handler entries for cmd=95.  The diagram:
+
+SETTLE (pre-read): tight busy-wait toggling E800 bit9 (2A5D<->285D) - the seek/settle delay; exits OK.
+Then a second E800 loop (2ABD x N) - drive/head select stabilise.
+
+READ, sector R=01 (WORKS - stakes ledger[1]=0xC0):
+  E000=0A6D,0829,0033,0A6D,0A09..,023F (SERDES config into E000-E01E) ; E000=0A6D(bit11 open) ; E802=42D3
+  -> MARK-ID(6) R=01 -> DELIVER IRQ6 -> $298C -> $89F2 (ID round)
+  $89F2: E802=40D3,40D3,C2D3 ; E000=022F ; E000=023F ; E802=42D3 ; E000=0A6D ; E802=AAD3(bit11 rising)
+  -> DELIVER IRQ5 -> $29C0 -> $7BA8 (data setup)
+  $7BA8: E802=A2D3 ; E802=AAD3(bit11) -> DELIVER IRQ5(dataEND)   [ledger[1] -> 0xC0]
+
+READ, sector R=02+ (FAILS):
+  $7BA8-ish: E802=A2D3 ; E802=AAD3(bit11) -> MARK-ID(6) R=02 -> DELIVER IRQ6 **CPU IPL=7 MASKED** -> LOST
+  then E802=A8D3,20D3,A2D3 ; E000=022F,023F ; E802=22D3 ; E000=0A6D ; E802=AAD3(bit11) -> more DELIVERs, no service.
+  Flux keeps finding R=03..0A, delivering, but NO handler runs after R=01 -> only 1 sector stakes.
+
+KEY READS OF THE DIAGRAM:
+  - Each real interrupt IS preceded by a bit-change, BUT E802 bit11 (A2D3<->AAD3) is TOGGLED MANY TIMES per
+    record (a per-byte/strobe, not a per-interrupt arm), so gating deliver on "bit11 rising" OVER-DELIVERS.
+  - R=02's IRQ6 is delivered while the CPU is MASKED (SR=$2700 inside the R=01 ISR chain) -> the firmware
+    arms (bit11) from *inside* a masked ISR; my immediate deliver lands masked and is lost/merged.
+  - The E000 command codes 022F/023F (ID-hunt) + 0A6D (window/operating) reappear before each ID - these,
+    not raw E802 bit11, look like the real per-record ID arm.
+
+NEXT EXPERIMENTS (reason from the diagram): (A) gate the ID arm on the E000=022F/023F/0A6D command sequence
+(one per record) instead of E802-bit11 toggles; (B) do NOT deliver into a masked CPU - keep the mark held
+and deliver on the NEXT bit-change while unmasked (or rely on HOLD_LINE persistence + stop re-delivering);
+(C) Path B - single IRQ5/record with the data read via E000 PIO (the A2D3/AAD3 toggle = per-byte strobe),
+so flux_data_capture stages but does not raise a 2nd IRQ5.  R=01 already proves the interrupt path; the fix
+is stopping the over-deliver + masked-deliver for R=02+.
+
+## cont.385 - Path A vs B verdict + the real block: R=02+ IRQs delivered but NEVER serviced
+
+Experiments off the state-flow diagram:
+  - Masked-hold (don't deliver into IPL>=level; deliver held marks from the pump): halved deliveries
+    (80->40) but still only 1 sector.  Good hygiene, not the fix.
+  - Path A (2 IRQ5/record): ledger[1] -> 0xC0 (DONE/converted).
+  - Path B (1 IRQ5/record, no data-END IRQ): ledger[1] -> only 0xF0 (staked, NOT converted).
+  => Path A is CORRECT: the data-record-END IRQ5 ($8018 consume) drives the 0xF0->0xC0 convert.  Reverted
+     to Path A.  So the record contract is NOT the blocker.
+
+THE REAL BLOCK (both paths, from the handler trace): sector R=01 is FULLY serviced -
+  MARK-ID R=01 -> DELIVER IRQ6 -> $298C -> $89F2 ; DELIVER IRQ5 -> $29C0 -> $7BA8 ; DELIVER IRQ5(dataEND).
+  ledger[1] -> 0xC0.  Then for R=02..0A: MARK-ID -> DELIVER IRQ6 -> **NO handler runs** (nor for the IRQ5s),
+  even though the delivery is takeable (IPL=0).  So after R=01 the CPU stops SERVICING the read IRQs
+  entirely, though they are delivered and unmasked.
+
+So: R=01 proves the whole interrupt path (vectors, arm, mark, handlers, stamp, convert) is RIGHT.  The
+block is that after the FIRST record the firmware no longer takes/services the delivered IRQs.  Hypotheses
+to test next: (1) the firmware moved on (op4A did ONE ledger-walk then advanced to op42-wait, which does
+NOT re-enter the per-record ISR path - so R=2..8 must be serviced during op42 but are not); (2) a merged/
+stuck HOLD_LINE from R=01's un-acked dataEND blocks later takes; (3) the read is meant to loop op4A per
+sector (op4A should re-run), not run once.  NEXT: trace the ladder walker around R=01->R=02 (does op4A
+re-run per sector? does op42 mask? is an IRQ line stuck asserted?) - the state-flow diagram is the tool.
+
+## cont.386 — DAVE'S REDIRECT: "resolved with the parity of the read" — root CONFIRMED LIVE in the clean model
+
+Dave pointed me back to the history; the validated root (cont.330/331/342, HLE-era) REPRODUCES in the
+clean model, decisively. cont.385's "R=02+ IRQs delivered but not serviced" was WRONG framing: the
+stake handler $298c IS entered every sector; it forks to $89f2 (skip) because $7950 old-bit=0. The
+parity is not a free toggle - it is an explicit ARM.
+
+FIRMWARE (read directly $103e-$1134, authoritative):
+  $103e move.b ($12,A6),D0 ; D0 = active-node class byte (node+$12)
+  $1042 andi.b #3,D0 / $1046 cmpi #3,D0 / $104a bne $110a   ; ONLY class&3==3 takes the arm path
+  &3==3 -> [$796e] set NEGATIVE (-1/-16/+1 sub-cases on bit5/&$18) + ENDEC-CAPTURE gate config
+          ($7420/$7422 = $d7ff/$da00 | $97ff/$9a00 | $f7ff/$fa00; E802 bit13 / E800 bit8 programmed)
+  &3∈{0,1,2} -> $110a->$1134 [$796e]=0 (NO ARM) + a DIFFERENT, non-capture gate config ($a7ff/$c7ff)
+The parity arm ($7ba8 $7bc0 sets $7950=1 IFF [$796e]<0) fires only when [$796e]<0, i.e. class&3==3.
+So node+$12&3 is the OPERATION-MODE selector for the whole read, not merely a done-flag: &3==3 =
+"per-sector ENDEC capture + stake"; the read's channel is programmed for something else.
+
+MEASURED LIVE (clean model, CPUAP_RTCFIX, runparity):
+  DOORBELL cmd=95 iopb=0fe780 node=71f0
+  ARMGATE: node[799a]=6e60 node+12=40 (&3=0) [796e]=0000     <- read's channel = ch2 ($6e60), class 0x40
+  STAKEFORK: $7950=0000 oldbit0=0 -> skip($89f2) [742c]=0001 node+12&3=0   (every sector, never stakes)
+Channel templates (boot, $5be/$5de/$5fe/$61e -> nodes $6c00/$6d30/$6e60/$6f90), class byte at +$12:
+  ch0=0x06(&3=2)  ch1=0x27(&3=3)  ch2=0x44(&3=0)  ch3=?   ; ch2 (the read's) is the ONLY &3=0.
+Runtime launch overwrites ch2 node+$12 0x44->0x40 (still &3=0).
+
+=> ROOT (clean-model-confirmed): the read runs on channel 2 whose class byte &3=0, so the firmware
+never arms the parity and never programs the ENDEC-capture config -> the $298c stake fork always
+skips -> no f0 stake -> [$7956] never 0 -> op42 completion-wait times out -> no SINIX boot. RETIRE
+the arm+mark deliver_mark() hack (it force-staked 1 sector against the firmware's own class decision).
+
+THE DECIDING FORK (cont.342, Dave's ground-truth call, now sharpened): node+$12=0x40 (&3=0) is either
+  (a) CORRECT for cmd 0x95 -> the read completes via the DESCGO/bulk path (cont.324/325), the stake/
+      parity is genuinely not this read's mechanism; OR
+  (b) WRONG -> the read should run on a &3==3 (staking/ENDEC) channel/class, and the model mispresents
+      the command/mode/IOPB field the firmware uses to pick the channel+class.
+Dave's "resolved with the parity" selects (b): the read SHOULD stake. NEXT: trace WHERE node+$12=0x40
+comes from at runtime (write-tap $6e72) + whether it derives from a CPUAP IOPB/command field the model
+controls (cont.331 checked only IOPB+$12=0x0f; the class may come from the command byte or another
+UIB field). That names the exact model intake to fix so cmd 0x95 lands on a &3==3 channel.
+
+## cont.387 — the class 0x40 is LAUNCH-stamped (t=6.4) and INHERITED by the read; not re-derived per-read
+
+Ungated write-tap on ch2 node+$12 ($6e72) + active-node selector [$799a] (cmd=95 gated):
+  t=0.413 PC=$086a  6e72 <- 4432   boot TEMPLATE copy (ch2 class byte = 0x44, &3=0)
+  t=6.407 PC=$3d4x  6e72 <- 4018   channel LAUNCH restamps class = 0x40 (&3=0), node+$13=0x18
+  (ZERO further writes to $6e72 in the cmd=95 read window @8s)
+  ACTIVENODE [$799a]<-... : ZERO writes during cmd=95 -> [$799a]=$6e60 (ch2) was selected BEFORE the
+  cmd=95 doorbell; the read INHERITS ch2 and never re-selects a channel.
+So class &3=0 is stable channel state stamped at the t=6.4 launch, inherited by the read.  The read
+runs on ch2 whose class is &3=0 in BOTH the boot template AND the launch restamp -> firmware never
+enters the stake/ENDEC mode for it.  The model CANNOT faithfully force &3=3 (it is 68000 firmware RAM;
+poking it = the HLE the mandate forbids).  The faithful lever is upstream: whatever the launch/select
+reads to stamp 0x40 (&3=0) must instead read a &3=3 value for a staking floppy read - i.e. the CPUAP
+IOPB / command / unit the model presents, OR the read must be dispatched to the &3=3 channel (ch1).
+
+UNRESOLVED TENSION (must adjudicate before refactor): cont.324 measured the NATIVE read delivering
+"8 sectors/1024 bytes 66x, DESCGO 67x" WITHOUT touching the stake ledger/parity (=> option a: the
+read completes via DESCGO bulk, parity/stake is a DIFFERENT [$791a]!=0 mode, dormant here). cont.326
+RETRACTED that on the ENDEC-engage diagnostic (=> option b: fw wants per-sector capture, parity is
+the mechanism). The history never cleanly closed a vs b. Dave's "resolved with the parity" leans b.
+The clean-model evidence now: fw DOES engage ENDEC (serdes, captures fire) AND class &3=0 blocks the
+stake - both true simultaneously, which is the exact a/b tension. DECISION NEEDED (Dave's ground
+truth): is the &3=0 read meant to complete via DESCGO (then the block is the DESCGO/announce path,
+NOT the parity, and cont.386's arm+mark was doubly wrong), or must the read run &3=3 staking (then
+the lever is the launch/select that stamps the class)?
+
+## cont.388 — (b) maps CLEANLY onto the current IRQ4/5/6; the ONE missing input is the CPUAP UIB class &3
+
+Dave: "(b) [staking], how does it map to IRQ4/5/6 as programmed currently (IRQ5/6 re-targetable)?"
+Answer, grounded in the current clean model:
+
+IRQ4 (channel/DMA done): FAITHFUL already. Raised ONLY on the fw's E800 bit12 rising kick
+  (ch_w line 605-608 -> run_channel_dma).  The clean rebuild already removed cont.336's synthetic
+  IRQ4 storm (no re-entrant $3bfe disruptor).  KEY: this SAME DMA path is what transcribes the class
+  byte - the 0x87 INIT fetch host 0xFE948 -> node $6E60 lands node+$12.  So IRQ4's DMA is the port
+  through which the &3 value ENTERS the firmware.
+
+IRQ5 ([$7300]=$29c0, re-targetable soft-vector, delivered by deliver_mark on flux DATA marks):
+  data-AM  -> $29c0 -> $7ba8 = the PARITY ARM ($7bc0 sets $7950=1 IFF [$796e]<0)
+  data-END -> $29c0 -> $8018 = slot/DESCGO.  Re-arm = E802 bit11 (fw ori #$800 in these handlers).
+  Fires correctly now, but $7ba8's arm is a NO-OP because [$796e]=0.
+
+IRQ6 ([$7304]=$298c, re-targetable soft-vector, delivered by deliver_mark on flux ID marks):
+  ID -> $298c stake fork: bchg $7950; old-bit1 -> $92b4->$92f6 STAKE, old-bit0 -> $89f2 skip.
+  Fires 483x, ALWAYS old-bit0 -> skip, because $7950 was never armed.
+
+THE GATE (measured + static, decisive): [$796e]<0 ⟺ class&3==3, and [$796e] is written by EXACTLY
+6 instrs, ALL inside the $1030 class routine ($1066/$109a/$10b0/$10d6/$10f6/$1134) - NO interrupt
+path writes it.  So the parity arm - hence the whole staking read - is gated SOLELY by the class
+byte &3.  UIBFETCH proved: class = CPUAP UIB[0xFE948+$12] = 0x40 (&3=0), model-transcribed faithfully
+(landed==source; node+$13=0x18).
+
+=> The IRQ4/5/6 programming is ALREADY correct for staking: vectors aimed right ($29c0/$298c), IRQ4
+faithful, re-arm cadence (E802 bit11) working.  The ONLY missing element is the parity arm, and it is
+gated exclusively by the CPUAP-supplied UIB class byte reading &3==3 instead of the current 0x40
+(&3=0).  This RELOCATES the frontier from the storager interrupt cadence (correct) to the CPUAP UIB
+build: why does the CPUAP write 0x40 (&3=0) at UIB+$12 (0xFE95A) for the FM-label floppy unit rather
+than a &3==3 value?  Candidates: (1) the CPUAP encodes density/type there from something the storager
+model returns to an earlier geometry/type query (model-controllable handshake), or (2) the label read
+should target a DIFFERENT unit whose UIB carries &3==3 (ch1 template=0x27, &3=3, is the staking class).
+NEXT: read the CPUAP UIB build (fe4484 label-read setup / the 0x87 INIT UIB assembler) - what sets
+UIB+$12, and whether it depends on a storager response the model controls.  RETIRE arm+mark
+deliver_mark() once the class path is proven (it force-staked against the fw's own &3 decision).
+
+## cont.389 — CPUAP pull: the RECAL/INIT sets CORRECT FM geometry but class byte &3=0; the tension with (b)
+
+Dave: pull on the CPUAP; after self-test it does an initial RECAL that may set the wrong path; boot
+runs from floppy AND ESDI; QIC02 tape path unexplored.
+
+CPUAP UIB builder FE3906 (decoded): fills the INIT block (EXT(0x5), the UIB DMA'd to storager node
+$6E60) from a GEOMETRY-TABLE entry R3 = EXT(0xC)[type*0x14], where type = (desc[0x4D]>>4)&7 and
+desc[0x4D] is parsed (CXP 0x28, fe4282/fe4287) from the boot-spec string (fe2c30 table, e.g. "(32,0)").
+Key field map: UIB+$12 (the storager's CLASS byte) <- geom+$6 ; UIB+4/5 <- geom+$E/$10 (GAP: FM 07/07,
+MFM 0d/0d) ; UIB+0 <- geom+2 (type id) ; UIB+1 <- geom+4 (SPT) ; UIB+2/3 <- geom+8 (secsize).
+
+MEASURED (storager UIBFETCH, full geometry, clean model):
+  cmd=87 @t=1.35  type=02  SPT=16  secsz=128  GAP=07/07 (FM)  firstID=01  CLASS(+$12)=0x40 (&3=0) +13=18
+So the initial INIT/RECAL sets the CORRECT FM label geometry (128B/16SPT/FM gaps) - NOT an FM-vs-MFM
+mismatch.  The label read (cmd=95 @t~8) INHERITS this node (no second cmd=87 before it).  The class
+byte geom+$6 = 0x40 (&3=0) is CPUAP ROM geometry, transcribed faithfully (endianness-invariant: the
+adjacent +13=0x18 is also &3=0).  No &3=3 value anywhere in this entry.
+
+THE TENSION (needs Dave's ground truth): the storager fw arms staking ONLY when class&3==3 ([$796e]
+written by 6 instrs, all in $1030, gated on &3==3).  The FM geometry entry gives &3=0.  So on FAITHFUL
+hardware the storager would NOT arm staking for this read - yet real HW boots.  Resolutions:
+  (i)  &3=0 is correct: the FM label read completes via DESCGO/bulk (option a), NOT per-sector stake;
+       the earlier "(b) resolved" was an HLE force (SLOTMAP/ONEIRQ5-era), now retired.
+  (ii) the read should run on a &3=3 CHANNEL, not the UIB node: storager has 4 channel nodes
+       ($6c00/$6d30/$6e60/$6f90) with TEMPLATE class 0x06(&3=2)/0x27(&3=3)/0x44->0x40(&3=0)/? .  ch1
+       ($6d30) template &3=3 = the STAKING class; the UIB fetch overwrote ch2 ($6E60) to &3=0.  The read
+       runs on ch2 ([$799a]=$6e60).  If the staking label read SHOULD run on ch1 (template &3=3) and the
+       dispatch/RECAL mis-routes it to ch2, that is the faithful bug (model-controllable via what the
+       channel-match dispatch $2196 reads).
+  (iii) the RECAL picked the wrong TYPE (desc[0x4D]) - but the geometry is correct FM, so the type's
+       geometry is right; only its +6 class lacks &3=3.  Would need a different type with SAME FM
+       geometry but geom+6&3=3 (unlikely - one FM zone = one entry).
+COMPARATIVE LEAD (Dave's "boots from floppy AND ESDI"): measure the ESDI/rigid read's class byte - if
+ESDI stakes (&3=3) and floppy doesn't (&3=0), that argues the floppy is meant to be DESCGO (i); if both
+are &3=0, staking is universally HLE-forced.  QIC02 tape unexplored (may set boot-device/type).
+NEXT (Dave's call): (i) vs (ii).  If (ii), trace the $2196 channel-match: why cmd=95 selects $6e60 not
+$6d30, and what model-presented field would route it to the &3=3 channel.
+
+## cont.390 — (1) FULLY EXPLORED: the &3=0 read completes via $6f44->DESCGO; missing = capture-into-slot ledger mark
+
+Dave: fully explore (1) [FM label read = DESCGO/bulk, &3=0 correct, staking irrelevant].  RESULT: (1)
+is VIABLE and the complete completion chain is now decoded - the missing model element is precise.
+
+MODE SELECTOR = [$7968]: op4A ($6edc) and the E01E arm ($7106->$7110 bra $6f44) both branch on it.
+  [$7968]==0 -> TRANSFER-BUILDER path $6f44 (the &3=0/DESCGO bulk path)   <- our case (measured 0)
+  [$7968]!=0 -> STAKING path (arm [$742c] via parity $7950)
+So &3=0 is CORRECTLY on the transfer-builder path, NOT staking.  (Confirms Dave's (1): staking is a
+DIFFERENT mode; this read is bulk.)
+
+FLOPPY COMPLETION IS NOT [$79a8]: the stamper's count dec ($932c) is HD-gated ($9322 tst $79b6; $9326
+beq skips it for floppy).  The floppy counter is [$7956], SET by $6f44 ($6f5c <- [$7abc]) and
+decremented in the DESCGO/channel-completion region ($44d0/$45b8/$48b2) - NOT the stamper.  So the
+floppy bulk read completes WITHOUT staking.  [$79a8]=8 staying put is EXPECTED, not a bug.
+
+THE TRANSFER BUILDER $6f44 (decoded $6f44-$702e): sets [$7956]/[$7958] from [$7abc]/[$7abe], then loops
+the ledger $7654[..]: $6f86 `bge` -> POSITIVE entries (slot# 0x01-0x7f) are consumed into the DESCGO
+slot-descriptor list ($74c4 table, 8-byte entries) and reset to ff/c0; NEGATIVE entries (c0=0xc0, f0)
+are reset to ff and SKIPPED.  So $6f44 builds a transfer ONLY from POSITIVE ledger slots.
+
+MEASURED GAP (clean model): ledger[7654..]=c0 c0 c0.. (STALE from 87/89), [$7958]=0, [$7a64]=0.  The
+cmd=95 flux capture stages sectors to SRAM but NEVER writes a POSITIVE slot# to the ledger.  So $6f44
+sees only negatives, builds nothing, [$7958] stays 0, DESCGO ($4102, gated [$7a64]!=0) never launches,
+[$7956] never decrements, node+18 never set, op42 times out.  cmd=95 posts ACCEPT (81) but never DONE.
+
+THE FAITHFUL (1) FIX (= cont.299 "capture-into-slot", the old SLOTMAP dropped in the cont.353 rebuild;
+cont.299 called it doctrine-clean): the GATE ARRAY, at each sector's DATA-record-end (flux_data_capture),
+DMAs the recovered sector into a local SLOT and writes ledger[pos] = POSITIVE slot# (pos = aim [$7428],
+NOT geometric - cont.299 caveat).  Then $6f44 (re-run, gated [$7b10] armed at $6ed6 - cont.301 the
+re-run is WALK-driven) consumes the positive slots -> descriptor -> DESCGO -> [$7956] dec -> completion.
+This is stimulus/response (the GA marks which slot it filled; the fw reads it), NOT HLE.
+Re-run TIMING gotcha (cont.300): $6f44 first runs BEFORE the captures populate the ledger; it must
+re-run AFTER.  cont.301: [$7b10] one-shot gates the re-run.
+
+NEXT: implement the capture-into-slot ledger mark in flux_data_capture (ledger[aim]=positive slot#) +
+verify $6f44 re-runs post-capture, builds the descriptor, DESCGO transfers, [$7956]->0, op42 releases,
+cmd=95 posts 0x80.  Then the arm+mark/parity machinery (cont.382-386) can retire (it was the [$7968]!=0
+staking mode, not this read).  Probes to keep during bring-up: op4A/XFER-BUILD/DESCGO/COMPLETE/UIBFETCH.
+
+## cont.391 — capture-into-slot IMPLEMENTED (Dave "try it"): ledger engages, but descriptor empty -> no completion
+
+Added to flux_data_capture: at data-record-end, GA writes ledger[aim=$7428] = positive slot# (= sector
+number, Dave).  RESULT (measured):
+- SLOTMARK works: ledger fills c0 01 ff.. -> c0 c0 02.. per sector; the FIRMWARE CONSUMES each positive
+  (01->c0 by the next sector) - so $6f44/the convert path IS processing the marked slots.  Good.
+- aim = [$7428] advances 1,2,..8 with R (scan base [$7954]=1, so wanted window = ledger[1..8]; fixed the
+  off-by-one guard 1<=aim<=8).
+- BUT descriptor stays EMPTY: [$7958]=0 always, because its source [$7abe]=0 (and [$7abc]=0 -> [$7956]=0).
+  $6f62 does [$7958]<-[$7abe]; [$7abe] is 0.  So DESCGO ($410c tst.l $7958; beq) never launches.
+- No completion: node+18 stays 0, op42 spins, cmd=95 posts ACCEPT(81) never DONE(80), and the read LOOPS
+  (aim runs past 8 to 17, R cycles 1-16 repeatedly) - nothing stops it.
+
+ROOT of the remaining block: the HOST TRANSFER DESCRIPTOR [$7abe]/[$7abc] (-> [$7958]/[$7956]) is never
+set up.  Writers: [$7abe] set at $a432/$a446 + $734e-$738c; [$7abc] at $7352/$7382; the $734e-$73cc
+region is the descriptor-setup (sets [$7abc]/[$7abe] then [$7956]/[$7958] at $73b6/$73bc).  These
+descriptor-setup routines are NOT running for the read.  LEAD: the ladder log shows op24->op28->op42,
+i.e. the SETUP ops 56/58/18/54 (which should build the host transfer descriptor from the IOPB) appear
+to be SKIPPED - even though op4A ($6ed2) ran once.  So the capture marks slots but there is no host
+buffer descriptor to transfer them into.
+NEXT: verify whether ladder ops 56/58/18/54 run (instrument each op handler) and which one sets
+[$7abe]/[$7abc] from the IOPB's host buffer; that is the missing descriptor the DESCGO transfer needs.
+
+## cont.392 — (2) CPUAP host buffer + IRQ answer: transfer=IRQ4; descriptor gated by node+$20 bit14 (capture phase)
+
+Dave: start with (2) [CPUAP host buffer/count for cmd=95] + does IRQ4 or IRQ6 complete the data xfer.
+
+IRQ ANSWER (firmware-decoded): IRQ4 completes the data transfer.  DESCGO ($4102) kicks the SRAM->host
+DMA (E800 bit12); DMA-done -> IRQ4 vector $3bfe -> $1310/$1348 -> posts node+2 = 0x80 (DONE) to the host
+IOPB (the byte the CPUAP polls at IOPB+2).  $1a4c writes node+18 = an ERROR code (0x4b/0x201e); $1a54
+stamps DONE only when node+18==0.  IRQ6 is the per-sector ID capture, NOT the transfer completion.
+
+(2) CPUAP host buffer (storager side, op4A dump): IOPB node=[$71bc]=$71f0 (the fetched cmd=95 IOPB).
+The storager reads the transfer descriptor [$7abe] from [$71bc]+$a ($a396 A4=[$71bc]; $a3a0 A1=A4+$a;
+$a42c 16-bit for floppy).  MEASURED: IOPB+$a = 0x0008, count=8 (set from chnode+$7 at $a486->[$79a8]).
+So the IOPB carries a +$a field (0x0008) and the count; the label read passes a real buffer (fe4484 ->
+CXP 0x2B reads into 0x69(R6), R6=EXT(0x18)).  BUT the value 0x0008 looks too small for a host address,
+and the descriptor [$7abe] ends up 0 (=> [$7958]=0, DESCGO never launches) even though the setup
+routine $a400 ran (it set the count).  Two candidate faults: (i) $a432 reads the wrong bytes / [$71bc]
+differs at $a400-time / the $738c clear-branch fires; (ii) IOPB+$a=0x0008 is not the real buffer.
+
+PHASE GATE (new, decisive): chnode[$799a]=$6e60 node+$20 = 0x8c27, bit14 = 0.  node+$20 bit14 is the
+CAPTURE(0)/TRANSFER(1) phase bit: $9484 btst #$e -> bit14=0 runs op4A CAPTURE, bit14=1 skips to op42;
+$73ac btst #$e -> bit14=1 sets [$7956]/[$7958] (descriptor), bit14=0 SKIPS it.  So the descriptor-copy
+$73bc is gated OFF in capture mode.  ($6f44 also sets [$7956]/[$7958] from [$7abc]/[$7abe] unconditionally,
+but [$7abe]=0 so it builds empty.)  The read is stuck in capture mode; nothing advances bit14 0->1 or
+supplies a non-zero [$7abe].
+
+NEXT: write-tap [$7abe] ($a432/$a446/$738c) to see why it lands 0 given IOPB+$a=0x0008; and determine
+whether the capture-read transfers via $6f44 (needs [$7abe] = real host buffer) or must flip node+$20
+bit14 to the transfer phase after capture.  IRQ4 is confirmed the completion interrupt to raise once the
+SRAM->host DMA is issued.
+
+## cont.393 — PASS 1 (probe): walk gate [$79ae] IS armed now (clean model) but is a ONE-SHOT consumed by sector 1
+
+Dave: two passes - (1) probe [$79ae]/[$7426]/walk routing, (2) wire the terminator.
+
+PASS-1 MEASURED (clean model, cmd=95 read window):
+- op4A: [$79ae]=0001 (WALK GATE ARMED), [$7426]=0000, [$7a64]=0000, [$7b10]=0000, node+20 bit14=0.
+  => CONFIRMED my hypothesis: unlike the HLE-era history (cont.289 "[$79ae] never armed"), the clean
+     model's $734e runs ($738c cleared [$7abe]; the same straight-line block reaches $739a move.w #1,$79ae),
+     so [$79ae]=1.  The completion route's ENTRY GATE is now open.
+- WALK $7c34: FIRST pass [$79ae]=1 -> COMPARE (7dac=fe 7daf=01); ALL subsequent passes [$79ae]=0 -> bail
+  ($7ce6).  So the walk does the compare EXACTLY ONCE (sector 1) then bails forever.
+- ROOT: $7c34 tst [$79ae]; beq $7ce6 (bail); $7c3c CLR [$79ae] (the walk consumes its own gate on the
+  first compare).  [$79ae]'s ONLY setter is $739a (setup one-shot); nothing re-arms it per sector.
+- TERMCMP $7c70 = 0, TERMACCEPT $7cac = 0, GATE $808a: [$7426]=0 -> $810e (dead) always.  No terminator
+  ([$7daf]=$fe) is ever staged, and even if it were, it arrives (at window-close) with [$79ae]=0.
+
+PASS-2 IMPLICATION (the wrinkle to solve): staging the $fe terminator at the index/window-close will
+find [$79ae]=0 (consumed by sector 1's walk at $7c3c) -> bail -> no completion.  So the terminator route
+needs [$79ae]=1 AT THE BOUNDARY.  Since the fw re-arms it only at $734e setup, either (a) the gate array
+re-arms the walk gate per capture / at window-close (faithful stimulus - the model presents it), or (b)
+a [$79ae] re-arm at the terminator (the cont.288 poke Dave previously rejected).  The first walk compare
+also took the MATCH path (byte==[$7436]=0), not the mismatch->terminator path, so sector 1 never reaches
+$7c70 either.  NEXT (pass 2): stage the real IAM/terminator ([$7daf]=$fe) at the index crossing during
+the armed read AND ensure [$79ae]=1 at that instant; measure whether the walk then hits $7c70->$7cac->
+[$7426]=1->$808a RERUN->$6f44 drain->[$7a64]=1->DESCGO->IRQ4.
+
+## cont.394 — PASS 2 (terminator): the (2a) re-arm WORKS (walk hits $7cac) but [$7426] is NOT the completion gate
+
+Dave: (2a) - the gate array arms the walk as part of the capture-complete stimulus.  Implemented: at the
+index crossing after the wanted window (m_window_seen), pump presents the window-close TERMINATOR
+([$7dac]=$fe,[$7daf]=$fe) + writes [$79ae]=1 (re-arm the walk gate) + raises IRQ6.  Per-command reset at
+the doorbell.
+
+RESULT - the mechanism fires exactly as designed:
+- TERMINATOR staged at index; the walk $7c34 (now [$79ae]=1 re-armed) reaches the compare, the mismatch
+  routes $7c50->$7c70, [$7daf]==$fe -> $7c84 -> TERMACCEPT $7cac: [$7426] <- 1.  The (2a) re-arm is correct.
+BUT completion does NOT follow, and the reason corrects cont.288's mapping:
+- [$7426] does NOT stick: $7f1a (scan path) CLEARS it repeatedly (T7426 tap: PC=$7f1a <-0000 dominant),
+  and the fw's own $7d62 sets it to 1 in between - [$7426] OSCILLATES 0/1 independent of the terminator.
+  cont.288's claim "$7cac bypasses $7f1a / gates $808a RERUN" does NOT hold in the clean model.
+- [$7426]'s ONLY reader is $7150 (tst $7426; bne $716a) = skip arming [$742c] in the E01E arm.  So
+  [$7426]=1 only briefly suppresses one capture re-arm; it is NOT a DESCGO/transfer/completion trigger.
+- $808a actually branches on a scanned ledger byte D0 ($8092 tst.w D0; beq $810e), NOT [$7426] - my
+  earlier "GATE $808a [7426]" label was wrong.
+- Net: no DESCGO, no IRQ4, cmd=95 posts ACCEPT(81) never DONE(80).  Read still loops.
+
+REDIRECT (the real completion lever, per cont.287/301/the drain math): completion is $6f44 draining the
+POSITIVE ledger slots -> $702e/$70a0 sub.w D3,[$7956] -> [$7956]==0 -> $70a6 [$7a64]=1 -> DESCGO ($4102)
+-> IRQ4 -> node status 0x80.  My SLOTMARK now populates the positive slots, but $6f44 runs ONCE too early
+(op4A one-shot [$7b10], and $7106->$6f44 fired only 1x) so D3=0, [$7956] stays 8, [$7a64] never set.  The
+terminator was the wrong lever; the lever is making $6f44 RE-RUN after the SLOTMARK so its drain lands
+[$7956]==0.  KEEP the terminator+[$79ae] re-arm (walk now completes, harmless) pending Dave's call:
+(a) chase why $7f1a clears [$7426] / whether the terminal accept should stick and stop the re-arm loop
+-> transition to transfer; or (b) drive the $6f44 re-run + drain directly ([$7a64] path).
+
+## cont.395 — (b) drive the drain: [$7a64] CAN arm (WIN64 fires!) but runs ONCE, EARLY - not per-capture
+
+Dave: try (b) - drive the $6f44 re-run + drain so [$7956]->0 -> [$7a64]=1 -> DESCGO -> IRQ4.
+
+RESULT - the (b) lever is PROVEN reachable but mis-timed:
+- WIN64 $70a6 FIRED: "[7956]==0 -> [7a64]<-1".  So the drain path $6f44->$702e->$70a0(sub D3,[$7956])->
+  $70a6([$7a64]=1) DOES work - [$7a64] can be armed.  This is the real completion lever (not [$7426]).
+- BUT timing is wrong: DRAIN/WIN64 fired ONCE, EARLY (before the SLOTMARKs) - line 1026 WIN64 precedes
+  line 1055 SLOTMARK R=01.  op4A right after shows [7a64]=0000 (cleared by $709a before the next would-be
+  drain).  DESCGO ($4102) NEVER reached; cmd=95 posts ACCEPT(81) never DONE(80).
+- Counts (whole read): $7106=1, DRAIN $70a0=1, WIN64=1.  So $6f44/the drain runs exactly ONCE, not
+  per-capture.  The SLOTMARK slots are never drained by a re-run.
+- Tried: re-arm [$79ae]=1 per ID capture (Dave (2a) per-capture) -> NO effect ($7106/DRAIN/WIN64 still 1).
+  REVERTED.  Root: the WALK $7c34 itself runs once, not per capture - it has NO direct caller (reached by
+  a computed jump from the $2970/$298c IRQ-thunk continuations), so arming its gate [$79ae] doesn't make
+  it re-run.  $6f44's per-capture re-run (via walk $7d94->$7106) never happens because the walk doesn't
+  re-run.
+
+STATE (all KEPT, builds green): SLOTMARK (capture-into-slot, ledger populates + fw consumes to c0) +
+window-close TERMINATOR ([$7daf]=$fe -> walk $7cac -> [$7426]=1) + drain probes.  What WORKS: the ledger
+fills; the terminal accept fires; the drain can arm [$7a64].  What DOESN'T close: the drain runs once
+early (wrong time), so [$7a64] arms before the data is captured and is cleared before DESCGO.
+
+OPEN (Dave): the walk/$6f44/drain machinery runs ONCE, not per-capture.  For (b) the drain must run
+AFTER the SLOTMARKs (so it drains the 8 marked slots -> [$7956] 8->0 -> [$7a64]=1) AND then reach DESCGO
+($4102) while [$7a64]=1.  What drives the walk (hence $6f44/$70a0) to re-run per capture / at capture-
+complete?  The walk's trigger is a computed jump (no direct caller) - needs the IRQ-thunk continuation
+($2970/$298c) route read, or a different re-run driver.  Very long multi-turn investigation; real progress
+(ledger + terminal accept + [$7a64] arm all proven) but completion not yet closing - recommend Dave
+reassess direction before further solo deep-dives.
+
+## cont.396 — COMPLETE GA ACCESS TRACE per micro-program step (Dave): the read captures 16 sectors, NEVER transfers
+
+Instrumented ga_trace() inside every GA handler (ch_r/ch_w/c000_w/c800_r/c800_w/d000_w/d800_w + 8253 tap,
+both mirrors) - the firmware reaches the GA via the 0xFF-mirror so physical-range taps missed it (4 lines);
+handler-based catches all (9000, capped).  Dedup on consecutive-identical.  The narrow ~400ms flow, by op:
+
+op24 (config/seek) @6.410: e806=0 ; e800=2a5d (drive/motor) ; PIT program 8006=7a/8002/8004 (settle timer) ;
+  c1e0=187f ; e800 SEEK seq ea3d->fa3d(**bit12 DMA-GO, IOPB/UIB fetch**)->2a3d->3a5d ; d000=38f8 ; f000=a0
+  (ready) ; e804=ff68/bf68.  So op24 does the seek + the ONE bit12 kick that fetches the IOPB/UIB.
+op28 (settle) @6.42->7.96 (~1.5s): e800 bit9 busy-wait 285d<->2a5d + 8000=ffff (PIT) until 8006=9a9a @7.96.
+op18 (READ SETUP) @7.963: e800=2abd(sel)->2a5d ; c800=0017/1c/1d/3f + c802=0001/1f + c87e=3f (capture cell/
+  field-boundary pointers) ; **E002-E01C COMMAND TABLE**: 0829 0033 0a6d 0a09 x5 0809 0829 083b 023f 023f
+  023f  = the gate array's ID-hunt/window micro-command list (0a6d=window, 023f=ID-hunt, 0a09=operating).
+op42 (completion-wait) @7.968->9.79: c83e=0 ; d800=3ed6 ; c800=0 ; f000=08a0(bit11 timer)->00a0 ; e800 bit9
+  toggle ; then the CAPTURE POINTER c800 ADVANCES 2000,2040,2080,...,23c0 - **16 steps of 0x40 (=128B/sector)
+  at ~12ms each (7.978->8.163, 185ms)** = 16 sectors staged to SRAM (chunk<<1 = 0x4000+).  Then STALL ->
+  8006=9a9a @9.79 (PIT timeout ~1.6s later).
+
+DECISIVE (the goal divergence, read straight from the GA trace):
+1. The read CAPTURES 16 SECTORS (the whole track, c800 2000->23c0), NOT stopping at the 8 wanted.
+2. There is NO c000 host-address load and NO E800 bit12 DMA-GO during op42 - so the STAGED DATA IS NEVER
+   TRANSFERRED TO HOST.  The only bit12 kick in the whole read is op24's IOPB/UIB fetch (e800=fa3d @6.41).
+3. op42 just loops the capture (firmware keeps the GA armed via the E002-E01C 023f ID-hunt) and TIMES OUT.
+
+So the micro-program reaches op42 with the capture running but never transitions capture->transfer.  The
+GOAL (8 sectors -> 1024B -> host -> completion) needs, after the 8th wanted sector: STOP capturing, LOAD
+c000 = host buffer, issue E800 bit12 DMA-GO (=DESCGO $4102, gated [$7a64]) -> run_channel_dma -> IRQ4 ->
+$1310 node+2=0x80.  That transition is exactly the [$7a64]/drain path (cont.395) - now VISIBLE in the GA
+trace as "the missing c000 load + bit12 kick during op42".  Full skeleton: scratchpad/ga-control-skeleton.txt.
+
+## cont.398 — BREAKTHROUGH (Dave's frame): sectors-remaining [$7956] DOES decrement 8->0; op42 fails to terminate at the count==0 fork
+
+Dave: two DMAs (serializer->local staging; local->host at complete).  Why does the sectors-remaining
+decrement fail to terminate op42's read of 8 sectors?  Some state isn't recognizing sectors 1-8 in the
+local buffer.
+
+MEASURED (counter write-taps, cmd=95): [$7956] (the FLOPPY sectors-remaining) DECREMENTS 8->7->..->0,
+one per sector at PC=$7ebe (the walk), t=7.97->8.056 (~12ms/sector = one sector-time).  So with the
+SLOTMARK feeding the ledger, the per-sector RECOGNITION + decrement WORKS - the count reaches 0 at
+t=8.056.  ([$79a8] stays 8 - reset each pass at $81ca = the REQUESTED count, not the working count.)
+
+THE STALL, exactly located - the count==0 TERMINATE FORK ($7ebe-$7ed8):
+  $7ebe subq #1,$7956 ; $7ec2 bne $7ee0 (count!=0 -> keep walking)
+  count==0: $7ec4 tst [$796a]; beq $7ed8      (STOP if [$796a]==0)
+            $7eca tst.l [$7958]; bne $7ed8    (STOP if [$7958]!=0 = descriptor built)
+            $7ed0 cmpi.b #$aa,(A0,D0); bne $7ee0   (STOP if the buffer byte == 0xAA; else KEEP WALKING)
+            $7ed8 = done exit -> $7f1a
+So at count==0 the walk terminates ONLY if [$796a]==0 OR [$7958]!=0 OR buffer[pos]==0xAA.  In the bulk
+read ([$796a]!=0) with no descriptor ([$7958]==0), termination requires the **0xAA boundary marker** in
+the local buffer.  It is NOT present -> $7ec2/$7ed0 fall to $7ee0 -> the walk KEEPS GOING past 8 sectors
+(c800 ran to 23c0 = 16).  THIS is "the decrement failing to terminate op42": the count reaches 0 but the
+count==0 stop-condition (the 0xAA end-of-window marker in the buffer, or the built descriptor) is unmet.
+
+=> The missing recognition state = the **0xAA boundary/end-of-window marker** the walk expects at the
+buffer position when the wanted window (sectors 1-8) is complete (or [$7958] the transfer descriptor).
+NEXT: probe [$796a]/[$7958]/ledger at the count==0 fork ($7ec2) to confirm which of the three is unmet,
+then supply the missing state faithfully (the gate array marking window-close = the 0xAA, tying back to
+the terminator work but for the WALK's count==0 exit, not the $7cac path).
+
+## cont.398b — CONFIRMED: the missing state is the 0xAA end-of-window marker; the ledger has c0x8 ff fe fe fe
+
+count==0 landing dump (definitive): [796a]=0001 (bulk), [7958]=0 (no descriptor), ledger =
+`c0 c0 c0 c0 c0 c0 c0 c0 ff fe fe fe`.  All three $7ebe-count==0 stop-conditions FAIL:
+[$796a]!=0, [$7958]==0, and NO 0xAA in the ledger (position 8 = 0xFF "wanted", 9-11 = 0xFE "beyond").
+The firmware's walk ($7e6e/$7e9a/$7ed0) scans the ledger for 0xAA = END-OF-WINDOW boundary; the correct
+terminal is `c0 ... c0 AA`, but the model produces `c0x8 FF ...` -> the walk never finds the boundary
+-> keeps walking past 8 -> op42 never terminates.
+
+WHO WRITES 0xAA: $706c `move.b #$aa,(A0)` (and $72f8), reached in the $6f44 tail ($702e-$706c) when
+D1 = node+1 (+1 if class bit1 clear) - [$7954] - [$7956] == 0 ($7048 beq $706c) - i.e. $6f44 lays the
+0xAA boundary at position [$7954]+[$7956] after filling the window.  In the model the 0xAA is absent at
+count==0 because $6f44 RUNS ONCE EARLY (~7.963, before the captures), lays the boundary against the
+pre-capture ledger, and the ledger is then re-initialized (ff/fe) + overwritten by the captures (c0) -
+the 0xAA is lost.  SAME $6f44-timing root as cont.395/301: $6f44 must run (lay the 0xAA boundary) AFTER
+the window is captured, so the walk's count==0 exit finds `c0..c0 AA` and terminates op42 -> op36 xfer.
+
+So Dave's "state not recognizing sectors 1-8 in the local buffer" = the **0xAA end-of-window ledger
+marker**, laid by $6f44/$706c, absent because $6f44's single early run predates the captures.  The fix
+is faithful $6f44 re-run timing (lay 0xAA after capture), NOT a poke - and it is the SAME re-run gate
+that also lands the [$7a64] drain (cont.395).  One fix (re-run $6f44 post-capture) closes both:
+0xAA boundary -> op42 terminates; drain zero-landing -> [$7a64] -> DESCGO -> IRQ4 -> op36 -> op00 -> 0x80.
+
+## cont.398c — VALIDATED: two 0xAA writers; the SECOND ($72f8) is Dave's "other writer" and is DORMANT
+
+Comprehensive search (all addressing modes, #$aa and #-$56, register-sourced): EXACTLY TWO firmware
+0xAA byte writers - $706c (in $6f44's tail, boundary from [$7956]) and $72f8 (in the $72ae routine,
+boundary from [$7abc]).  No third, no register-sourced.  MEASURED: $706c fires ONCE early (t=7.96, in
+$6f44, ledger pre = c0 ff.. then the captures overwrite the 0xAA); $72f8 NEVER fires.
+
+$72f8 (Dave's suspected "other writer") is gated on [$7968]!=0 (chunk-pending): $7106 `tst $7968; bne
+$7114`(->..->$72f8)`; beq ->$6f44`(->$706c).  Model has [$7968]==0 always -> only $706c (early) runs.
+[$7968]=1 is set at $79d6, reached ONLY when the chunk-pending scan finds a chunk:
+  $79a6 tst [$796c]; beq $7a4c (skip)      <- prerequisite flag
+  $79be bsr $32ac  (ledger scan)
+  $79c2 tst (-$6,A3); bne $79d0->$79d6 ([$7968]=1)  else $79ca ([$7968]=0)
+So the SECOND 0xAA writer needs: [$796c]!=0 AND the $32ac ledger scan to FIND a pending chunk.  In the
+model neither the chunk-pending state nor $72f8 runs -> the 0xAA end-of-window boundary is never laid at
+capture time (only $706c's early, overwritten one) -> the walk's count==0 exit ($7ed0 ledger==0xAA)
+never fires -> op42 never terminates.  This IS "the state not recognizing sectors 1-8 in the buffer":
+the [$7968]/[$796c] CHUNK-PENDING recognition + the $32ac scan finding the captured sectors.
+NEXT: trace [$796c] + $32ac - why the model's captured (SLOTMARK->c0) sectors don't register as pending
+chunks, so $72f8 lays the 0xAA and the transfer path ([$7a64] just past $72f8 at $7300) engages.
+
+## cont.398d — ROOT of the op42 stall: the per-sector STAGING-COMPLETE ($4400/$4480) never runs
+
+Full op42-termination chain (firmware), traced end to end:
+  capture a record -> enqueue chunk to [$7ac8] (the $75xx record-processing: $752a/$7568/$7596)
+  -> the $43d6/$4400 STAGING-COMPLETE routine (gated [$743c]): $43e0 bsr $32ac (scan [$74ac] ready-slot
+     list); if a chunk found ($43ec bne $441c) -> $4440 builds the slot descriptor (address <- $77f8[])
+     + $4484 marks the slot READY (status 0x40) + $44d0 decrements [$7956]
+  -> ready slots (0x40) get linked into [$74ac] -> $32ac now finds them -> [$7968]=1 (chunk-pending)
+  -> $72f8 lays the 0xAA end-of-window boundary in the ledger
+  -> the walk's count==0 exit ($7ed0 ledger==0xAA) fires -> op42 TERMINATES -> op36 pump transfers.
+
+THE MODEL'S BREAK (the missing state): [$7956] decrements via the WALK ($7ebe), NOT the staging-complete
+path ($44d0).  So $4400/$4440/$4484 NEVER runs: no slot is marked READY (0x40), [$74ac] stays empty,
+$32ac finds nothing, [$7968]=0, $72f8 is dormant, no 0xAA boundary -> op42 hangs and the read walks all
+16 sectors.  The walk RECOGNIZES the sectors (decrements the count) but the STAGING-COMPLETE PROCESSING
+(mark-slot-ready + build the ready-slot list [$74ac]) - the "second DMA setup" completion, per sector -
+is the state that never gets set.
+
+So Dave's "missing state in op42 or a previous op" = the per-sector STAGING-COMPLETE ($4400 chain):
+the model's flux_data_capture stages to SRAM + marks the ledger (SLOTMARK->c0) but never enqueues the
+chunk ([$7ac8]) / triggers $4400, so the slot is never marked READY (0x40) and [$74ac] is never built.
+Everything above it ([$7968] chunk-pending, $72f8 0xAA, [$7a64] transfer-launch, op42 terminate) hangs
+off that.  NEXT: what per-sector event should trigger $4400 (the first-DMA serializer->local completion)
+- an interrupt or the [$7ac8] enqueue - and whether op18/op42 arms it; then drive the staging-complete
+per captured sector so slots go READY (0x40) -> [$74ac] -> $32ac -> [$7968] -> $72f8 0xAA -> op42 done.
+
+## cont.399 — THE PER-SECTOR SIGNAL: IRQ4 (staging-DMA-done) -> $45d4 -> mark slot READY; the model never raises it
+
+Traced the $75xx->[$7ac8]->$4400 chain to its trigger.  RUNTIME PROBE (staging-chain): $32ac SCAN runs
+per sector (16x, [$74ac] advances 74c4->74cc->74d4.. through the slot table) but finds NO ready slot;
+STAGE-DONE ($4440/$4484 = mark slot 0x40) NEVER runs; REC-PROC ($74ce enqueue) NEVER runs.
+
+THE FIRMWARE'S INTENDED PER-SECTOR FLOW (static):
+  DESCGO ($417a) launches the per-sector staging DMA -> [$7454]=1 (channel busy)
+   -> DMA-done -> IRQ4 -> $3bfe -> $3c98 `jsr (A1)` where A1=[$7456]=$45d4 (installed $61c8 move.l
+      #$45d4,$7456)  = the CHANNEL-DONE handler
+   -> $45d4 clears [$7454] -> $45f4/$4600 (if [$7956]!=0) -> $4632 bsr $4362 (staging-complete)
+      -> $4440/$4484 mark the sector's slot READY (status 0x40) + $44d0 decrement [$7956]
+   -> ready slots (0x40) linked into [$74ac] -> $32ac finds them -> [$7968]=1 (chunk-pending)
+   -> $72f8 lays the 0xAA end-of-window boundary -> walk count==0 ($7ed0 ledger==0xAA) -> op42 done -> op36.
+
+THE MODEL'S BREAK (definitive, whole-chain): the model stages each sector via a DIRECT SRAM WRITE
+(flux_data_capture) + raises IRQ5/IRQ6 (the record MARKS), and the WALK ($7ebe) decrements [$7956].  It
+NEVER runs the per-sector DESCGO/IRQ4/$45d4 STAGING-COMPLETE chain, so slots are never marked READY
+(0x40), [$74ac] never carries a ready slot, [$7968] stays 0, $72f8 is dormant, no 0xAA -> op42 hangs.
+
+=> THE MISSING PER-SECTOR SIGNAL = IRQ4 (channel/DMA-done) raised as EACH captured sector finishes
+staging to local RAM - which invokes $45d4 ([$7456]) -> mark the slot READY (0x40) + decrement [$7956]
+through the FIRMWARE'S path ($44d0), not the walk's ($7ebe).  (Connects to Dave's earlier "IRQ4 vs IRQ6
+completes the transfer": IRQ6=the record mark/capture; IRQ4=the per-sector staging-DMA-done that runs
+$45d4.)  The model currently raises IRQ4 only for the E800-bit12 host-DMA kick (run_channel_dma), never
+per staged sector.  CAVEAT/next: the firmware arms the per-sector DMA via DESCGO ($417a sets [$7454]);
+raising a bare IRQ4 without that arm may mis-run $45d4 - so the faithful path is likely to make the
+per-sector capture drive the channel the firmware expects (the serializer->local DMA + its IRQ4), so
+$45d4 marks slots READY and [$7956] drains through $44d0 (retiring the walk's $7ebe theft, cont.287).
+
+## cont.400 — TEST (a): per-sector IRQ4 engages $45d4 + sets [$7968]=1, but not the full staging-complete
+
+Injected IRQ4 at each flux_data_capture (sector fully staged).  RESULT: STAGE-IRQ4 x20; [$7968]
+(chunk-pending) now = 0001 (was 0 every prior run) from t=8.068 - so the IRQ4 DOES reach the channel-done
+handler $45d4 ([$7456]) and lights part of the chain (via $82b2/$79d6).  BUT STAGE-DONE ($4440/$4484 =
+slot READY 0x40) still 0; $72f8 (0xAA) still 0; [$7956] still drains via the walk $7ebe (not $44d0);
+cmd=95 still ACCEPT(81) never DONE(80).  => IRQ4 is confirmed the right per-sector signal, but the full
+staging-complete ($45d4 -> $45f4 tst [$7b42] -> $4600 tst [$7956] -> $4626 tst [$7b48] -> $4632 $4362 ->
+$4440 slot 0x40) is gated on channel state the model doesn't arm.  Proceed to (b): the DESCGO/[$7454]
+per-sector channel arm.
+
+## cont.400b — (b) correction: IRQ4 does NOT reach $45d4; $45d4 is the per-sector STAGING-CHANNEL completion callback
+
+CHANDONE $45d4 = 0 with the injected per-sector IRQ4 (STAGE-IRQ4 x20).  So IRQ4 ($3bfe) sets [$7968]=1
+via $82b2/$79d6 but does NOT invoke $45d4.  Correcting cont.399: $45d4 is NOT the IRQ4 vector handler -
+it is a CHANNEL-COMPLETION CALLBACK stored in [$7456] (LONG; set to $45d4 at $61c8, or $3f68 at $604c),
+paired with [$7454] (channel-busy, set by DESCGO $417a).  The per-sector staging is a CHANNEL (DESCGO-
+launched: [$7454]=1 busy + [$7456]=callback); on completion the channel machinery invokes [$7456]=$45d4
+-> $4600 -> $4362 -> mark slot READY (0x40) + $44d0 decrement.  The MODEL bypasses this entirely: it
+stages each sector by a DIRECT SRAM WRITE (flux_data_capture), so no channel is launched ([$7454] never
+armed, [$7456] callback never invoked), $45d4 never runs, slots never go READY.  Test (a) confirmed IRQ4
+is PART of the completion ([$7968]=1) but the slot-ready path needs the real per-sector STAGING CHANNEL,
+not an injected interrupt.  FAITHFUL DIRECTION (b): drive the per-sector serializer->local staging as the
+channel the firmware launches (arm [$7454]/[$7456] via the fw's DESCGO, do the DMA, invoke the completion
+callback), so $45d4 marks slots READY and [$7956] drains via $44d0 - replacing the direct-SRAM shortcut.
+This is a larger architectural change (model the staging channel) vs the current direct write.
+
+## cont.401 — COMPLETE MECHANISM MAPPED: the bulk staging channel ($7442/$3f68) is never LAUNCHED (DESCGO gated by the walk/drain race)
+
+The whole op42->op36 chain, fully decoded (Dave's op18/op42 focus + the staging channel):
+- Bulk read setup ($604c, builder $5FC0): installs [$7456]=$3f68 = the per-sector STAGING-COMPLETE
+  callback ($3f68 marks the slot READY (0x40) at $3f9c, processing the $74b4 slot list).
+- The STAGING CHANNEL node = $7442: node+$14 = $7442+$14 = $7456 = the $3f68 callback; node+$12 = $7454
+  (channel-busy).  The IRQ4 handler ($3bfe) uses A0=[$743a], invokes node+$14 (($14,A0)) if !=0.
+- To fire the per-sector staging: DESCGO ($4102) LAUNCHES the channel - sets [$743a]=$7442 ($414c),
+  [$7454]=1 busy ($417a), programs the DMA (D000/C000/PIT/E800 bit12).  Then per sector the DMA-done ->
+  IRQ4 -> A0=[$743a]=$7442 -> node+$14=$3f68 -> mark slot READY (0x40) -> [$74ac] -> $32ac -> [$7968]=1
+  -> $72f8 lays 0xAA -> the walk's count==0 exit -> op42 TERMINATES -> op36 pump -> op00 -> 0x80.
+- DESCGO is gated [$7a64]!=0; [$7a64]=1 is set by the DRAIN ($70a0, in $6f44) landing [$7956]==0.
+
+THE ROOT (cont.287, now fully confirmed with the entire downstream chain): the WALK ($7ebe) decrements
+[$7956] 8->0 per sector during op42, STEALING the zero-landing from the DRAIN ($70a0).  So [$7a64] is
+never set -> DESCGO never launches -> [$743a] stays $748a (wrong node, +$14=0) -> the $3f68 callback is
+never invoked -> slots never go READY -> op42 hangs.  MEASURED CONFIRMATION: at each per-sector IRQ4,
+[$743a]=$748a, node+14=0, [$7454]=0, [$7456]=$3f68 (callback pending, channel unlaunched).
+
+So the model bypasses the staging channel with a direct SRAM write, and even the firmware can't launch it
+because the walk/drain race denies [$7a64].  FAITHFUL DIRECTION (Dave's (1), no shortcut): the gate array
+must drive the per-sector staging as the CHANNEL the firmware set up - which requires the firmware to
+reach DESCGO ([$7a64]).  The open question is whether a gate-array stimulus makes the DRAIN (not the walk)
+land [$7956]==0 (so [$7a64]->DESCGO->[$743a]=$7442->$3f68), or whether DESCGO is armed by a different
+per-sector event ($7208/$825c also set [$7a64]) that the model should present.  Probes: STAGE-IRQ4 channel
+state, CHANDONE, [$7956]/[$7a64] taps.
+
+## cont.402 — [$7a64] IS set LEGITIMATELY ($825c scan-ISR), not blocked by the drain race; block is DOWNSTREAM
+
+Traced the other [$7a64] setters ($7208, $825c).  DECISIVE: $825c sets [$7a64]=1 when the floppy
+sectors-remaining hits 0 - the FIRMWARE's own scan ISR ($82e2->$8214->$821a [$79b6]==0 floppy ->$822c
+[$79ba]==0 ->$8230 ->$823c [$7956]==0 ->$825c).  MEASURED: A64GATE $823c runs per sector (16x); once
+[$7956]==0 (t=8.064) it takes the $825c branch 8x; A64SET $825c fires [$7a64]<-1.  So the cont.287/401
+"walk steals the drain's zero-landing -> [$7a64] never set" narrative is WRONG for [$7a64]: the scan
+ISR sets it via a DIFFERENT path (the walk driving [$7956]->0 is what TRIGGERS $825c).  [$7a64] IS armed.
+
+BUT the completion still does NOT fire with [$7a64]=1 (and [$7968]=1 from the removed test-(a) IRQ4):
+DESCGO ($4102) = 0, $72f8 (0xAA) = 0, no 0xAA in the ledger (still c0x8 ff fe fe fe), op36 never reached,
+cmd=95 ACCEPT never DONE.  So setting [$7a64]/[$7968] is NOT sufficient - the block is DOWNSTREAM:
+  (1) DESCGO ($4102) is gated [$7a64] but CALLED from a site not reached (op36/a callback) - launching
+      the staging channel ([$743a]=$7442, node+$14=$3f68) never happens.
+  (2) $72f8 (the 0xAA that op42's walk needs) fires only if its $72ae routine is REACHED - it isn't; the
+      earlier "$72f8 gated on [$7968]" was wrong.
+REMOVED the test-(a) IRQ4 injection (a shortcut, Dave's constraint; test done).  HONEST STATE: the whole
+op42->op36 mechanism is mapped (cont.397-402) and [$7a64] arms legitimately, but the completion is a
+multi-gate firmware flow whose downstream sites (DESCGO caller, $72ae/$72f8) are not reached - each gate
+resolved reveals another.  Recommend reassessing with the phase/scheduler dispatch ($2290 phase table)
+in view, or Dave's hardware read, rather than more single-gate solo chasing.
+
+## cont.403 — $2290 phase dispatcher analyzed; NO undecoded-GA accesses; phase-0x0A pump never runs (node stuck at phase 8)
+
+Dave: analyze $2290 (not well traced); look for GA-adjacent / UNDECODED-address writes ("anything out of RAM").
+- $2290 decoded: A0=[$71bc] (or [$71b6] if 0); D0=node+$26 (PHASE); phase 8 -> walker setup ($22a6);
+  phase 4 -> $1f82; phase 0xC -> done ($23e6); ELSE -> $2304 dispatch $222[phase] ($2312 jsr) then run
+  the op-ladder op ($2342 jsr).  Phase table: $222[0x0A]=$15fe = the phase-0x0A WATCH PUMP.
+- $15fe/$1646 = the WATCH PUMP: scans [$727c] for a node at phase 0x0A; for that node reads *(node+$2)
+  and, when != node+$4 (last value), invokes the callback at node+$6 ($1676 jsr).  A "watch a location
+  for change -> fire callback" engine.
+- UNDECODED-GA TAPS (0x8008-0xBFFF, 0xCA00-0xCFFF, 0xD002-0xDFFF, both 0x00 and 0xFF mirrors): ZERO
+  accesses during cmd=95.  So the firmware makes NO access to those undecoded I/O gaps - Dave's
+  undecoded-address hypothesis is FALSIFIED for those ranges.
+- PHASE-DISP probe ($2304): fires only EARLY (t=6.41, phase 00); during op42 (t=8) NEVER (the command
+  node $71f0 sits at phase 8 = walker/op42).  PUMP-0A ($1646) = 0, PUMP-CB ($1676) = 0.  Data node
+  [$71b6] = 0 the whole read.  So the phase-0x0A transfer pump NEVER runs - the node never leaves phase
+  8/op42, and everything downstream (op36 pump, the watch, the transfer, completion) hangs off op42
+  terminating, which hangs off the 0xAA/staging-complete/channel-launch chain (cont.398-402).
+
+HONEST STATE (cont.386-403): the ENTIRE bulk-read completion mechanism is now mapped and cross-confirmed
+from many angles (GA trace, op-ladder, phase dispatcher, the $3f68 staging channel, [$7a64] arming
+legit via $825c, the $72f8/0xAA terminator, the $45d4/$4362 staging-complete, the $4400 channel-done).
+The read is STUCK at op42/phase-8; op42->op36 needs the walk's 0xAA, which needs the staging channel
+launched (DESCGO/[$743a]=$7442), which the fw never issues - a tightly-coupled multi-gate loop that has
+NOT closed via incremental single-gate analysis.  Extensive TEMP instrumentation added (ga_trace,
+undec_ga, ~20 pctrace cases) - STRIP pre-PR.  RECOMMEND: reassess at the modeling level (does the direct-
+SRAM capture bypass state the phase/channel machinery needs?) or Dave's hardware read on how the bulk
+read is meant to enter its data phase (phase 0x0A) - rather than more single-gate chasing.
+
+cont.404-405 (DTACK BREAKTHROUGH - the staging channel launches; 2/8 -> 8/8 transfers): the cont.403
+"staging channel never launched" root is CLOSED, and it was a MODELING bug, exactly as recommended.
+Chain of corrections this session, all from Dave's steering:
+- WHAT WRITES THE LEDGER (Dave's question): a write-tap on $7654 proved the FIRMWARE writes it (all PCs
+  in ROM), not the gate array.  The read-time staker is $9312 (`move.b #$f0`, pending) via $7ba8; the
+  data-done staker is $8018.  The data-phase handlers are ALTERNATOR-selected ($7950 bit0): IRQ5 stub
+  $29C0 -> $8018 (DONE, old bit0=1) or $7ba8 (SETUP, old bit0=0); IRQ6 stub $298C -> $89f2/$92b4.
+- THE 2ND IRQ5 (the missing gate-array signal): the model delivered ONE IRQ5/sector, which dead-ended
+  every sector at $7ba8 setup so $8018 (which stamps $74c4+2=0x40 READY + stakes the ledger) NEVER ran.
+  Restoring the 2nd data-phase IRQ5 (a real GA field-boundary interrupt) -> clean 8xIRQ6 + 16xIRQ5, and
+  the read moved ERROR 0x82 -> WAIT 0x81 with [$7a64]=1 (DONE-enabled), [$743a]=7442 (staging channel
+  ACTIVE - the cont.403 blocker), [$74b4]=74cc (descriptor queued).  This also cured the "alternating-
+  slot staking" parity: [$7424] now advances 0..7, [$7428] 1..8, all 8 linear.
+- DTACK (Dave's hypothesis, THE key): the transfer kickoff ($3cd4/$3d42) RTS's immediately after the
+  E800 bit12 write - no inline poll - but the gate array bus-masters the DMA and HOLDS THE 68000 off
+  the bus for its duration.  The model's INSTANT DMA let the CPU race ahead and the descriptor drain
+  launched only 2 of 8 sectors ([$741c]/[$7968] re-set before completion).  Modeling the hold
+  (`m_cpu->spin_until_time(from_usec(40))` for the data transfer) -> ALL 8 SECTORS TRANSFER, D000
+  advances $4000/$4080/..$4300 (the firmware builds a LINEAR 1024-byte buffer; the "fixed $4000"
+  reading was an artifact of only 2 firing), [$74b4] DRAINS TO 0.  Recorded as a board-wide principle
+  (storager-gate-array-principle memory): every bus-master DMA (read/write/format/HD) must hold the CPU.
+- BOARD CORRECTION: no separate SERDES MSI part - the board has 74LS1801/1802 ENDEC (data separation
+  only); the VGC7219 does the deserialise/CRC/DMA (AM2147 = its bit buffer).  SERDES refs stripped from
+  storager.cpp (m_serdes_active -> m_read_window).
+
+REMAINING (one gate): still WAIT 0x81 - op42 ($6BC2) never returns 0.  The completion (node+$26=0x0C at
+$843e, clr [$72d6]) is gated on [$7968]=0, which the $8200 handler RE-SETS at $82b2 ([$727e]=0); [$727e]
+=ffff needs [$7b40]!=0 needs the node's TRANSFER PHASE (node+$20 bit14, set by $974c when [$7a70]=ffff
+at $9dd4) - which runs 0 times.  So the DMAs physically complete but the fw never enters the transfer-
+phase STATE.  op42's own DONE hinges on a status word (A1)-bit7 + settle flag [$7a36] ($661a), neither
+asserting after the 8 transfers.  NEXT (fresh): what (A1) is in op42 + what stimulus enters node+$20
+bit14 (likely the $7442 transfer node becoming [$799a]-current, or a status $9dd4 reads - it checks
+[$71bc] first byte==0x8b); use a debugger bp on $6c8e, not opcode taps (they segfaulted here).
+storager.cpp debug (logerror/m_irqn/PROG) STRIPPED; DTACK hold + linear staging + 2-IRQ5 + SERDES-strip
+are keepers, builds clean, cmd=95 -> st=0081 (no regression).  board.yaml/board-notes.md rewritten to
+this state.
