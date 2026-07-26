@@ -9817,3 +9817,1106 @@ bit14 (likely the $7442 transfer node becoming [$799a]-current, or a status $9dd
 storager.cpp debug (logerror/m_irqn/PROG) STRIPPED; DTACK hold + linear staging + 2-IRQ5 + SERDES-strip
 are keepers, builds clean, cmd=95 -> st=0081 (no regression).  board.yaml/board-notes.md rewritten to
 this state.
+
+## cont.406 — DTACK as a level; data payload must NOT byte-swap; staging takes the COMMANDED chunk; op18 decoded (param block in RAM, per-descriptor selector bit, C800 = port not file)
+
+Dave's steering, four items: (a) hold DTACK as a level rather than a fixed interval, (b) deliver data
+bytes in literal byte order, (c) fix the DMA staging (a dropped last block is wrong), (d) the gate array
+should be COMMANDED, never snoop the workspace.  (a)-(c) done; (d) is next.
+
+DTACK AS A LEVEL (replaces the cont.405 fixed 40us spin).  `spin_until_time` was a timeout that other
+code could pre-empt (the pcmx2 runs five CPU stacks).  Now: `m_cpu->suspend(SUSPEND_REASON_HALT, true)`
+at the E800 bit12 kickoff, `resume()` in the transfer-end callback alongside the IRQ4, duration from a
+new `dma_time(len)` = one Multibus word per ~600ns (a 128B FM sector ~38us; the 1024B ESDI sector now
+scales by itself).  Applies to control-block transfers too (doctrine 4).  Result: identical 8/8
+transfers, D000 walking $4000..$4300, no magic number, hold bounded by the transfer alone.
+
+DATA PAYLOAD MUST NOT BYTE-SWAP.  run_channel_dma applied `k ^ 1` to EVERY local->host transfer.
+Proven wrong on the payload: src[VOL1SINIX0] -> host[OV1LISIN0X].  The swap IS load-bearing for the
+control block (it is how node+3 = 0x81 reaches the host's IOPB+2 - same trace), but wrong for data:
+a controller presents the recovered byte stream to the bus, and the label buffer base is ODD
+(0x0FC0DD), which no word-boundary swap could serve.  Keyed on is_data; host now reads VOL1SINIX0
+correctly.  The real board almost certainly selects this per transfer from a swap-control bit in the
+IOCB/UIB - NOT yet decoded, so the is_data key is provisional.
+
+STAGING NOW USES THE COMMANDED CHUNK.  advance_read no longer computes `0x4000 + index*len`; it stages
+the field into `C800[0] << 1`, the chunk the gate array was armed with.  Before: the model wrote a
+record AHEAD of the firmware's pointer, so the per-sector DMA sourced the previous chunk ($4000 sent
+twice), and $4380 was NEVER transferred - HDR1 never reached the host.  After: VOL1SINIX0 in host slot
+7, HDR1 NSC Boo in slot 8, last sector delivered.  Status unchanged at 0x81 (no regression).
+
+HANDLER CADENCE MEASURED (opcode taps on $89f2/$92b4/$7ba8/$8018, AS_OPCODES - fetches do NOT go through
+AS_PROGRAM).  Per sector the firmware enters FOUR handlers: verify(alt=1), verify(alt=0), setup(alt=1),
+done(alt=0) - the docs' even 4-event cycle is CORRECT and parity does balance (an earlier "only 3 events
+are delivered so parity must net-flip" objection is WITHDRAWN).  But the handler ROLES in board.yaml
+were BACKWARDS:
+  $7BA8 ("setup") ADVANCES [$741e]        (2000 -> 2040 -> 2080 ...)
+  $8018 ("done")  WRITES C800[0]=[$741e]  (arms the chunk for the NEXT field)
+So C800[0] during field k is the arm written at field k-1's done.  A third writer, $899A, re-arms
+C800[0]=[$741e] between the two verifies.
+
+REMAINING HOLE - R=01 HAS NO DESTINATION.  At the first data field there has been no prior done, and
+[$741e] is still 0 (the first SETUP is what initialises it to $2000), so both arms write 0 and sector
+R=01 is dropped; host slots are [R02,R02,R03..R08].  The duplicate at the head is the FIRMWARE's own
+descriptor sourcing an unarmed chunk, not a model artifact.  Either the model delivers the first data
+record one cycle early, or something primes [$741e]/C800[0] at read start that we are not stimulating.
+
+op18 ($308C) DECODED (Dave: "is there additional data hidden in the op18 init?" - yes, two things).
+- THE PARAM BLOCK IS IN RAM, NOT ROM.  [$7938] = $6E84 - immediately after the UIB at $6E60.  op18's
+  program is BUILT PER-UNIT FROM THE UIB, not loaded from a class-selected ROM template (board.yaml
+  was wrong).  The field program is therefore a function of the geometry the CPUAP supplied.
+- Layout: count word n=$0F, then 16 triples (C800 byte-offset, value, selector), then the E000 words
+  at +$32.  Captured from the loop registers (A2/D0/D1/D5 at the $30E0 write).
+  COUNT RECONCILIATION (corrected in cont.407 - the first reading here was backwards): there are NINE
+  op18 program loads during the boot, all byte-identical, so 9 x 16 = 144 pushes, which is exactly the
+  144 $6000 reads - one read per push.  The $6000 tap's attribution was RIGHT; it was c800_w's
+  pcbase() that under-reported (16 of 144).  Lesson stands but points the other way: pcbase() inside a
+  WRITE handler is unreliable for counting; prefer a hardware-visible discriminator (see the E800
+  bit7 load-enable below), which needs no PC at all.
+- The 16 triples:
+      off val sel      -> C800 word cell
+       00  17   1      cell 0
+       00  1c   1
+       00  1d   0
+       00  1d   1
+       00  3f   0
+       00  3f   1
+       02  01   1      cell 1
+       02  1f   1
+       7e  3f   1 (x8) cell $3F
+- THE THIRD BYTE IS A ONE-BIT SELECTOR, NOT A $6000 TABLE INDEX.  D5 is only ever 0 or 1.  The
+  "read $6000[idx]" is a byte read at $6000 or $6001; $6000 is zeroed RAM (the $073A boot clear,
+  `lea $4000.w,A0; move.w D0,(A0)+`, $1F10 words) and is never filled, so the DATA is meaningless.
+  What carries the bit is WHICH BYTE STROBE IS ASSERTED - UDS vs LDS on a dummy read.  Confirmed on
+  the bus: 15 accesses mask=00ff (odd byte, sel=1) vs 3 mask=ff00 (even, sel=0), matching the
+  thirteen/three split in the triples.  The model ignores it completely ($6000 is plain RAM there).
+  Same house idiom as the C000 counter (bits 23-16 on A1-A8, data on the data bus): address-as-payload.
+- C800 IS A PORT, NOT A FILE.  Cell 0 takes SIX different values in a row inside op18, each bracketed
+  by E800 write-enable ($2ABD) -> C800 write -> $6000 strobe -> E800 idle ($2A5D); then the runtime
+  handlers push the buffer pointer through the SAME cell.  A 256-entry array where the last write wins
+  cannot represent a six-value sequence - the model is structurally blind to what op18 pushed first,
+  and its reading of C800[0] as "the live chunk pointer" is partly a last-write-wins artifact.
+  1d/1d and 3f/3f appear as sel=0 then sel=1 PAIRS - the selector looks like it picks between two
+  banks/halves for the same value.
+- E000 EXTENT: EXACTLY 16 WORDS, E000..E01E, nothing above (n=$0F, so the copy loop runs 16 times; the
+  asm comment's "N=$10 observed" is off by one).  Block:
+      0a6d 0829 0033 0a6d | 0a09 x5 | 0809 0829 083b | 023f x4
+  word[0] (0a6d) is ALSO stored to [$7a48].  Three variants exist, selected by node+$20 bit9 and
+  [$71bc][0]==$99 (the $3118 ori-#$200 path and the $3146 path); the read takes the plain copy.
+- RUNTIME RE-ENGAGEMENT is a THREE-write cycle per record: 022f ($891A) -> 023f ($8928) -> 0a6d
+  ($8936).  0a6d is exactly op18's word[0] - the write that re-issues the field program's first
+  command.  The model's ch_w decodes 0x22f/0x23f but NOT 0x0a6d, so that third write does nothing.
+
+SPECULATION (flagged as such) - op18 LOADS A MICRO-SEQUENCE THE GATE ARRAY RUNS BEFORE op42 WAITS.
+The shape argues for a serial program load, not a register-file fill: writing the SAME cell six times
+in a row is a no-op as storage but is six pushes into a queue; the eight identical (7e,3f,1) pushes are
+eight entries, not one.  Under that reading the three C800 offsets ($00/$02/$7E) are three WRITE PORTS
+of a sequencer (a step queue, a 2-deep port, an 8-deep queue), the $6000 dummy read is the PUSH/ADVANCE
+STROBE with its byte-strobe carrying a one-bit qualifier per pushed word, and the E800 write-enable/idle
+pair is the load-enable window.  op18 then = LOAD the micro-program, op42 = WAIT for it to run, op46 =
+field-execute - i.e. yes, there IS a gate-array micro-sequence running for the read prior to op42, and
+the model currently implements none of it.
+  Supporting shape on the E000 side: the words look like {flags, count} steps (low 6-7 bits a byte
+  count: 3f=63, 29=41, 09=9, 3b=59, 33=51), and the variant paths modify bit9 (ori #$200) and bit5
+  (andi #$ffdf) of each word - bit-level flags in the same word.  That maps onto a track format:
+  gap, sync, AM, ID(4), CRC(2), gap, sync, DAM, data(128), CRC, with 023f as the idle/terminate step.
+  FALSIFIABLE PREDICTION: the EIGHT identical pushes to cell $3F equal the EIGHT commanded sectors.
+  If changing the IOCB count changes the number of cell-$3F pushes, then cell $3F is the per-sector
+  step queue - and the model could take the commanded sector count FROM THE GATE-ARRAY PROGRAMMING
+  instead of snooping [$7abc], which is exactly the desnoop Dave wants next.
+  It would also explain the R=01 hole: if the loaded sequence has an initial step before the first
+  data field, hardware's first capture happens one step later than the model's - precisely the
+  one-record skew measured above.
+
+STATE: builds clean, cmd=95 -> st=0081 (no regression).  Keepers = DTACK-as-level, data no-swap,
+commanded-chunk staging.  TEMP probes still in the tree (TEMPDMA/TEMPSTAGE/TEMPH/TEMPC800/TEMP6000/
+TEMPE000) - STRIP pre-PR.  Nothing committed.
+
+## cont.407 — "load, then run": the field program is loaded before anything executes; the descriptor stack is modelled; E800 bit7 = load-enable
+
+Dave: build the deferred read-window opening - "don't run anything until everything is loaded" - and
+create the stack in the gate-array emulation.  Done, and it works as designed, but it does NOT close
+the R=01 hole; the two turn out to be independent.
+
+FACTUAL CORRECTION to the premise: interrupts are NOT masked for the entire load.  The $2700 mask
+covers only the C800 push phase ($30B2 .. $30F0); it is restored BEFORE the E000 block copy at $310E.
+So the load has two phases, and the "loaded" boundary is the end of the E000 BLOCK, not the end of the
+masked region.  That also resolves a chicken-and-egg: the per-record engagement writes ($891A/$8928/
+$8936) are issued from the record ISR, so they cannot be what starts the run - the program must start
+when the load completes, or no first record ever arrives to issue one.
+
+WHAT WAS WRONG BEFORE.  The model opened its read window on E000 bit11 rising.  op18's word[0] is
+$0A6D, which HAS bit11 - so the window opened on the first word of the block LOAD, and records were
+delivered while the program was still being copied in.  Measured, before the fix:
+    e000 <= 0a6d (pc=310e) / VERIFY / VERIFY / e002 <= 0829 (pc=310e) / ... / e01e <= 023f / STAGE
+Two field records landed against a half-built program.
+
+THE MODEL NOW.  m_prog[16] holds the E000 step block; the write that completes it (E01E) is the
+load-complete edge on which start_field_program() runs (opens the window, captures the track, arms the
+counted delivery).  A bit11 write to E000 is only treated as the per-record RE-engagement once
+m_prog_loaded is set.  Verified after the fix - the whole block loads contiguously, first record after:
+    e000..e01e (16 writes, pc=310e, uninterrupted) / VERIFY / 022f,023f,0a6d (pc=891a/8928/8936) / VERIFY / STAGE
+
+THE DESCRIPTOR STACK, and E800 bit7 = LOAD-ENABLE (new, and it validated on real stimulus).  C800 is a
+port, so a push must be distinguished from an ordinary register write.  The discriminator is on the bus:
+op18 frames every push with `ori #$80` into the E800 shadow (D2) and restores the raw shadow (D3)
+after - and $79F6's resting value $0C1F has bit7 CLEAR.  So: a C800 write with E800 bit7 asserted is a
+PUSH onto the field-program stack; without it, it is the per-record chunk arm the ISR issues through
+cell 0.  Implemented as m_desc_port[]/m_desc_val[]/m_desc_n, and it captures exactly the expected
+stream, confirming the discriminator:
+    16 descriptors: (00,17)(00,1c)(00,1d)(00,1d)(00,3f)(00,3f) (01,01)(01,1f) (3f,3f) x8
+(ports here are WORD indices; the firmware's byte offsets $00/$02/$7E.)
+
+R=01 IS UNCHANGED - the two problems are independent.  After the fix the first data field still stages
+to chunk=0000, because at the first verify [$741e] is STILL 0: the firmware initialises it at its first
+SETUP, which runs AFTER the first data field, and C800[0] for field k is written at field k-1's done.
+For k=0 there is no k-1.  So the ordering fix was necessary and correct but the first field's
+destination must come from somewhere else - op18 itself, most likely.  Status unchanged at 0x81, all 8
+transfers, VOL1SINIX0 + HDR1 still land correctly.
+
+DAVE'S PUSH-COUNT PREDICTION: UNTESTED, not falsified.  There are NINE op18 program loads in the boot
+and all nine are byte-identical (8 pushes to port $3F every time).  Since the read never completes, the
+nine are consistent with the same 8-sector label read being retried - so nothing yet varies the IOCB
+count.  To test it, drive a read with a different sector count and watch the port-$3F push count.
+
+KEEPERS this session: DTACK-as-a-level, data no-swap, commanded-chunk staging, load-then-run, the
+descriptor stack + E800 bit7 load-enable.  Builds clean, cmd=95 -> st=0081, no regression.
+
+## cont.408 — IOCB count experiment (op18 is count-invariant); op$3E = the transfer-launch micro-op; the physical-timing attempt FAILED and was reverted
+
+Dave: (a) force the IOCB from 8 to 4 sectors as an experiment, (b) then study the op18 -> op42
+transition for state that would let the first DMA complete, watching every gate-array READ and the
+IRQ5/IRQ6 timing for an implied DTACK-style synchronisation delay.
+
+(a) THE COUNT EXPERIMENT - op18's PROGRAM IS COUNT-INVARIANT.  IOCB layout for cmd=95 (fetched, at the
+node): +$00 cmd=95, +$0A/+$0B = the sector count as a BE word, +$0D..$0F = the host buffer (0x0FC0DD).
+Forcing the count 8 -> 4 at the doorbell (node copy AND the host block, before the firmware runs):
+    [$7abc]        8 -> 4
+    op18 descriptors        16 -> 16   (BYTE-IDENTICAL stream)
+    port-$3F pushes          8 -> 8
+    field records staged     8 -> 4
+    data DMAs                8 -> 4
+    status                  81 -> 81
+So Dave's cont.406/407 push-count prediction is FALSIFIED: the eight port-$3F pushes are NOT eight
+sectors.  op18's field program describes the TRACK FORMAT (it is built from the UIB geometry) and does
+not vary with transfer length; the count drives only the firmware's own loop/ledger, downstream.  Two
+independent axes - so the sector count CANNOT be recovered from the gate-array programming, and that
+route to retiring the [$7abc] snoop is closed.  Reducing the count also does NOT affect completion
+(still 0x81), which rules out the "the count never reaches zero" class of explanation.
+Dave's reading: 8 FM sectors looks like a hard 1KB envelope (8x128B); on MFM he expects op18 to program
+4 x 256B - the same 1024 bytes, which matches the linear $4000-$43FF buffer exactly.  Worth testing when
+the MFM area of the disk is exercised.
+Count chain confirmed by write-tap: exactly ONE write to [$7abc] during the read, at $7352, fed from
+[$7abe]; $738C rewrites [$7abe].  That is a CLAMP ($7346-$738C bounds the request against the track), so
+the count can be recomputed rather than taken verbatim - which is why one early run showed [$7abc]=8
+even with the node patched to 4.
+
+(b) THE op18 -> op42 TRANSITION.
+- $8922 IS NOT A POLL.  `move.w #$10,D2 / $8922: move.w (A0),D0 / dbra D2,$8922` = a fixed 17-iteration
+  delay loop whose BODY IS A GATE-ARRAY READ, value discarded, with E802 bit15 held asserted across it
+  (ori #$8200 before, andi #$7fff after).  The engagement is: arm bit15 -> E000=022f -> SETTLE ->
+  E000=023f -> drop bit15 -> E000=0a6d.  Same idiom as op18's $6000 dummy read: the firmware
+  manufactures settling time out of bus cycles.  Direct support for Dave's implied-DTACK instinct -
+  if the gate array wait-states these reads the real delay is far longer than the model's instant ones.
+- THE FIRST RECORD WAS BEING DELIVERED INSIDE op18.  Measured:
+      7963328.1us  wr e01e=023f  pc=00310e   <- last word of the block load
+      7963328.1us  IRQ6          pc=00310e   <- first record, same instant, same PC
+  i.e. before $3114 clr.l D0 / $3116 rts.  The firmware serviced sector 1 before op18 returned and
+  before op42 was ever entered - there was no op18->op42 transition at all.
+- op $3E ($8F74) IS THE TRANSFER-LAUNCH MICRO-OP (new, from the $192 table).  It forks on node+$20
+  bit11: SET -> $8FAE/$8FB6 builds the $7442 staging-channel descriptor and calls the $3ABC scheduler;
+  CLEAR -> $8F94, a local memory fill.  node+$20 measured = $8C27, which is exactly the READ command's
+  PARAM word from the $92 dispatch table (0x95 -> $5FC0 param 8C27).  Decoding it: bit11 SET (the DMA
+  branch is selected), bit9 CLEAR (op18 takes the plain copy path - matches the observed block),
+  bit14 CLEAR (the long-standing completion transfer-phase gate).
+  BUT op$3E is dispatched ZERO times, and it is NOT in cmd=95's ladder (24 28 56 58 18 54 4A 42 36 00).
+  So for the READ the transfer is not launched by a micro-op - it must come from the interrupt path.
+- [$799a] DURING THE READ IS $6E60 - THE UIB, not the command node $71F0.  So "node+$20" for the
+  current node is $6E80 (the cell an earlier session tapped as "phase20").  Node-relative reasoning in
+  earlier entries was reading the UIB's flags word.
+- The descriptor IS queued ([$74b4] <= 74c4, right after sector 1's done) but nothing dispatches it:
+  [$743a] stays 748a and never becomes $7442, DESCGO ($4102) never runs, no kickoff.
+
+(c) THE PHYSICAL-TIMING ATTEMPT - FAILED, RETRACTED, REVERTED.  Records were made physically timed
+(m_next_rec + sector_period() = 200ms/rev / sectors = 12.5ms for FM 16x128B, vs the model's 200us pump -
+60x too fast) and the first record was no longer delivered at load-complete.  The handler cadence stayed
+perfect (16 verify / 8 setup / 8 done) but the DATA TRANSFERS VANISHED (8 -> 0).
+  I then reported that "the deferral is the cause" on the strength of a single bisect run.  THAT WAS
+  WRONG and is retracted.  Follow-up A/B: restoring the immediate first record at physical rate -> still
+  0 DMAs; disabling the time gate entirely ("the original behaviour") -> still 0 DMAs.  Checking the
+  AGGREGATE counters instead of just the metric of interest showed why: those configurations were in a
+  RUNAWAY RETRY LOOP - 21938 stages, 65799 program loads, 150400 handler entries, vs 8/9/40137 for a
+  healthy run.  They were not comparable states, so every A/B conclusion drawn from them is void,
+  including the "$3abc caller" diff (CALL-3dac fired in all of them).
+  Reverted the whole timing experiment; 8/8 transfers restored DETERMINISTICALLY (two runs, identical
+  counters; VOL1SINIX0 + HDR1 land correctly; status 0x81).
+  METHOD LESSON (the expensive one): this driver has genuine run-to-run variance AND failure modes that
+  look like the metric you are watching.  Never conclude from a single run, and always check aggregate
+  health counters (stages / program loads / handler entries) to detect a runaway before comparing the
+  metric of interest.  Physical record timing is still the right long-term model, but it must be
+  re-introduced as its own carefully validated step, not alongside other changes.
+
+STATE: reverted to the cont.407 keepers (DTACK-as-a-level, data no-swap, commanded-chunk staging,
+load-then-run, descriptor stack + E800 bit7 load-enable).  8/8 transfers, st=0081.  TEMP probes still in
+the tree.  Nothing committed.
+
+## cont.409 — the DMA engine's park/kick handshake DECODED, and why the kick is dead: a word write clobbers a byte-tested flag
+
+Dave: true rotational timing breaks the read, which smells like the firmware running ahead of the
+hardware - so find the actual synchronisation method, then find why the kick doesn't happen.
+
+THE SYNCHRONISATION METHOD (decoded, static + traced).  It is NOT a bus-level handshake and nothing
+polls the gate array for transfer completion.  It is a self-clocking DMA chain with an idle-flag kick:
+  park:  $3DE2  bset #$0, $7a30.w        ; queue-service found the queue EMPTY -> mark engine IDLE
+  kick:  $833C  bclr #$0, $7a30.w        ; test-and-clear the idle flag (tail of the done handler)
+         $8342  beq  $8348               ;   was already clear (engine busy) -> skip
+         $8344  bsr  $3dbc               ;   was set (engine idle)  -> RESTART the queue service
+`bclr` sets Z from the ORIGINAL bit, so $833C-$8344 is the classic lock-free "if it parked, restart it".
+The running chain is IRQ4-clocked:
+  launch -> DMA -> IRQ4 -> channel-done callback $3F68 -> $3FD0 -> $3FF2 -> $3E3A -> queue walk $3EA2
+         -> node+$20 bit11 set -> $3F1E -> $3F36 (bsr $3ABC) -> launch next
+The completion signal is IRQ4; the "wait" is the busy lock [$7a1a].  The only busy-wait spin in the
+whole path is $8FF4 (`tst.w $7454 / tst.w (A1) / beq $8ff4`), on the op$3E path, spinning on a word the
+channel-done path writes.
+CORRECTION to a reading made earlier this session: $70A0 is NOT the per-sector launcher.  Measured, it
+fires exactly ONCE per read (at the start); the eight per-sector launches all come through $3F36.
+
+WHY THE KICK IS DEAD - [$7a30] IS WRITTEN BY TWO DIFFERENT-SIZED ACCESSES THAT DO NOT ADDRESS THE SAME
+BIT.  On the 68000 a bit op with a memory destination is ALWAYS byte-sized, so:
+  - $3DE2 / $6042 / $400C / $94E4  `bset #0,$7a30`  and  $833C `bclr #0,$7a30`
+        act on the BYTE at $7a30 = the HIGH byte of the word.
+  - $70D4 `move.w #$1,$7a30`  is a WORD write: it sets bit0 of the LOW byte and ZEROES THE HIGH BYTE.
+Traced, physical-timing run:
+    6411302.6us  [7a30] <= 0101  pc=006042   ; bset #0     -> high byte 01 = engine IDLE
+    7963574.6us  [7a30] <= 0001  pc=0070d4   ; move.w #$1  -> high byte WIPED to 00
+    7997494.6us  [7a30] <= 0000  pc=00833c   ; bclr #0 finds it ALREADY CLEAR -> Z=1 -> no kick
+    (and identically at every following sector)
+$70D4 runs ONCE, early (right after op18rts; SECDEC fires exactly once), and from that moment the byte
+$833C tests is permanently zero.  Counts confirm end to end:  KICK-test 16, but 3DBC-guard 0,
+PARK-7a30 0, CALL-3f36 0, data DMAs 0.  So $3DBC is never entered for the whole read.
+This also resolves the apparent circularity (bit0 only ever set inside $3DBC, which the kick would
+call): the flag IS set earlier, at $6042 - it is then CLOBBERED by a word write the byte-wise test
+cannot see.
+
+WHY IT ONLY BITES AT TRUE SPEED.  Nothing above is timing-dependent.  With the arm-driven model records
+arrive faster than the chain drains, so the queue is never empty at a channel-done and the engine
+self-clocks via $3E3A/$3F36 WITHOUT ever consulting [$7a30].  At 12.5ms/sector the chain drains and
+parks after every sector, so every subsequent transfer depends on the $833C kick - which $70D4 has
+already disabled.  The fast cadence was masking a dead restart path.
+
+METHOD - PREFETCH SHADOW (new rule, nearly cost a wrong conclusion).  A read tap on AS_OPCODES fires on
+the 68000's PREFETCH, not on execution.  $8344 sits two bytes past the `beq` at $8342, so KICK-TAKEN
+fired 8 times while the bsr never executed; $833C itself was "fetched" 16 times for 8 executions.  ONLY
+taps well inside a routine (e.g. $3DC6, four bytes into $3DBC) are trustworthy for control flow.  Pair
+this with the existing rule that fetches only appear on AS_OPCODES, never AS_PROGRAM.
+
+OPEN: is $70D4's word write a genuine firmware quirk that real hardware tolerates (because the disk
+keeps the chain fed so it never parks), or is the model driving the firmware down a path it would not
+normally take?  $70D4 is on the "count did NOT reach zero" branch of the sector decrement yet runs once,
+very early, before any sector completes - which is itself suspicious.  Next: compare $70D4/[$7a30] in
+the working (arm-driven) run.
+
+STATE: storager.cpp carries a PHYSICAL_TIMING A/B constant (TEMP) so the two record-timing models are
+one edit apart.  false = arm-driven, 8/8 transfers, st=0081.  true = physically timed, healthy
+(stages=8, progloads=9) but 0 transfers.  Nothing committed.
+
+### cont.409a — the OPEN question above is answered: $70D4 is reached only because true speed gives the firmware idle time
+
+Compared the working (arm-driven) run against the physical-timing run with identical taps:
+                          working (8/8 DMAs)      physical (0 DMAs)
+    SECDEC ($70A0)              1                       1
+    $70D4 writes [$7a30]        NEVER                   once, at 7963574us
+    3DBC-guard                  2                       0
+    PARK-7a30                   1                       0
+    CALL-3f36                   8                       0
+$70A0 runs ONCE IN BOTH - but takes a DIFFERENT BRANCH:
+    0070a0: sub.w  D3, $7956.w
+    0070a4: bne    $70d4          ; count != 0 -> the WORD write that clobbers the byte-tested flag
+    0070a6: move.w #$1, $7a64.w   ; count == 0 -> DONE-enable, flag untouched
+  working : $70A0 runs at the END, after all 8 launches, [$7956] already drained to 0 -> $70A6 branch,
+            no clobber; the engine parks once ($3DE2) and is cleanly restarted ($3DBC entered twice).
+  physical: $70A0 runs ~245us after op18rts - BEFORE ANY SECTOR COMPLETES - count still 8 -> $70D4 ->
+            clobber -> every subsequent $833C kick dead -> chain parks forever.
+
+ROOT CAUSE, stated cleanly: at 12.5ms/sector there is a ~12.6ms IDLE GAP between the field program
+starting and the first record arriving, which the firmware spends in op42's wait.  The arm-driven model
+has no such gap (the first record lands immediately), so it never reaches the early $70A0 path.  The
+firmware is NOT running ahead of the hardware - at true speed it is GIVEN IDLE TIME IT NEVER HAD, and in
+that idle time it runs a path that disables its own DMA restart.  The $7a30 word/byte aliasing is the
+MECHANISM; the early $70A0 visit is the TRIGGER.
+So $70D4 is not (necessarily) a firmware bug: on real hardware the question becomes what the firmware is
+legitimately doing in that gap, and why the sector-decrement path is entered there at all with a full
+count.  NEXT: find what calls $70A0 during the op42 wait (it is not the ladder - op42 returns $FE and the
+walker re-enters it; something else reaches the $70xx routine), and whether a real drive's index/rotation
+stimulus - which the model does not yet present during the gap - is what the firmware is actually
+waiting on there.
+
+## cont.410 — E804 modelled as real gate-array state; the track snoop is gone; F000 decoded from op24
+
+Dave: capture E804 properly and keep drive/track select as gate-array state, remove the track snoop,
+decode the F000 read and identify unit-ready (aimed at eventually dropping the install floppy and
+booting from the hard disk), and refresh microprogram-decode.md.
+
+WHAT THE PRE-op18 OPS DO TO THE GATE ARRAY (Dave's question).  Ladder 24 28 56 58 | 18 | 54 4A 42 36 00.
+Traced live + confirmed statically, the entire GA traffic before op18 is ONE meaningful write:
+  op24 $651C  unit/drive select + status: F000 x4, E802 (from the $79F8 shadow), E804 x2
+  op28 $6788  seek engine: E804 (held in A2) + E802 - on the cyl-0 label read it short-circuits, and
+              the only trace evidence is the single E804=$BF78 write at $6B20
+  op56 $A392  NO register access - it builds a CHANNEL DESCRIPTOR at $7444 (#$1, [$79d8] long,
+              #$d000, [$79ce]).  The literal #$d000 is the descriptor's "which local-address latch"
+              field - the same shape $8FB6 builds at $7442.  So the transfer channel IS set up before
+              op18, exactly as Dave suspected.
+  op58 $7346  ZERO GA access - the pure count clamp ([$7abc] from [$7abe], bounded against the track).
+Everything else in that window (e800=285d/2a5d at $2BC2/$2BCE, every ~26ms) is the IRQ1 tick petting
+the bit9 PIT gate, not the read.
+DAVE'S "GA WRITES [$7956] BY DMA" HYPOTHESIS: NOT SUPPORTED.  With C000/D000/D800 now in the GA trace,
+nothing programs any of them before op18 during the read (the only latch traffic is the PREVIOUS
+command's IOPB write-back at 6.41s).  A DMA into $7956 would need D000 = $7956>>1 = $3CAB, which never
+appears; [$7956] is written only by firmware ($6F5C/$73B6 load it from [$7abc], $70A0 decrements it).
+The descriptor-before-op18 half of the hypothesis IS right - it is op56's $7444 build.
+
+E804 NOW MODELLED (was: ignored entirely).  Decoded from op24 $6576-$65A0: D5 = UIB+$D4; if negative
+clr; lsl #8; NOT; low byte := UIB+$DC; -> E804.  So the head rides bits 8-11 ONE'S-COMPLEMENTED and the
+drive/control byte is the low byte.  head = ~(E804 >> 8) & $0F.  Checks out: the observed $BF78 gives
+head 0, correct for the cyl0 label.  The model now latches m_sel_head / m_sel_drive in ch_w and holds
+them as gate-array state.
+TRACK SNOOP REMOVED: capture_track() no longer reads the firmware's [$7436]; it takes the side from the
+latched E804 head.  The gate array has no visibility into firmware RAM - it knows only what it was
+commanded.  Regression-tested: 8/8 transfers, VOL1SINIX0 + HDR1 correct, st=0081, unchanged.
+
+F000 DECODED (from op24, the only reader before a transfer starts):
+  bit0  FAULT       $663C btst #0 -> if SET the op aborts with error $10
+  bit3  FAULT       $65AE btst #3 -> if SET the op aborts with error $1B
+  bit4  INDEX       $6746 btst #4
+  bit5  UNIT READY  $66D6 masks F000 and compares == $20 (ready with no other status bits set)
+  $6772 composes the per-unit status byte: [$794e] = ~F000 & table[$22E + unit] - a CLEAR F000 bit
+  becomes a SET fault bit.  Table @$22E = 00 06 00 27 00 3f 00 2d ef ff cf ef 2f ff 0f ef, i.e. a
+  different mask per device class (floppy / ESDI / tape).
+So "unit present and usable" = both fault bits clear AND bit5 set, under that unit's class mask.  The
+model now explicitly reports bits 0/3 clear (it previously left them at whatever m_ch[] held, which
+happened to be 0).  FOR THE HD-BOOT GOAL: the per-class mask at $22E is the table that decides what a
+given unit must report; selecting WHICH unit is still open - it rides E804's low byte and that encoding
+is not yet decoded (m_sel_drive is captured but not yet acted on).
+
+DOCS: microprogram-decode.md rewritten as a current synthesis (it was cont.348-350 vintage and its
+narrative had been retired by the cont.353 rebuild).  Now carries the walker's D0 contract (0 = advance,
+$FE/$FD/$FF = re-enter/WAIT, else error at node+$18 + phase $C), the $192 table, a per-op table for the
+read ladder with the GA traffic each op generates, op18 in full (descriptors + E000 block + load-then-
+run), op$3E and op1A, the park/kick transfer engine, and a Superseded section.  NOTE: op1A's presence in
+the read ladder is recorded from cont.348 and has NOT been re-verified since the rebuild - flagged as
+such in the doc.
+
+STATE: 8/8 transfers, st=0081, no regression.  PHYSICAL_TIMING=false.  TEMP probes still in.  Nothing
+committed.
+
+## cont.411 — the kick's ORIGIN is the ladder builder; and the gate array does NOT choose the sector
+
+Dave: analyse op18/op42 and the interrupt routines for the most likely origin of the kick, and settle
+how the gate array knows which sector to work on without snooping 68000 memory - or is it simply an
+interrupt per address mark with the firmware deciding whether to arm the data phase?
+
+THE KICK'S ORIGIN: THE COMMAND BUILDER SEEDS IT.  $6042 is not a stray bset - it is the tail of the
+read's ladder builder ($5FC0):
+    006036: move.w #$42, (A6)+          ; emit op 42
+    00603a: move.w #$36, (A6)+          ; emit op 36
+    00603e: move.w #$0,  (A6)+          ; emit op 00
+    006042: bset   #$0, $7a30.w         ; ARM the engine-idle flag
+    006048: clr.w  $7a60.w
+    00604c: move.l #$3f68, $7456.w      ; install the channel-done CALLBACK
+    006054: move.w #$2,   $7450.w
+So in one breath the builder emits the final ops, ARMS [$7a30] bit0, and installs $3F68 - the very
+callback traced driving the working run's launch chain.  The design is: the builder seeds the engine as
+IDLE so the first $833C test-and-clear starts it; thereafter it self-clocks on IRQ4.  A second arm site
+is $94E4, gated on [$791a]==0 - the SAME [$791a] gate as $70E4, so that flag suppresses both the arm and
+the launch.  This is exactly why $70D4's word write is destructive: it clobbers the builder's seed
+before any done handler can consume it.
+LOOSE END: in the traced read $6042 fired at 6.41s and NOT again before the 7.96s read, so that read may
+have been running on a stale seed.  Worth pinning down separately.
+
+THE GATE ARRAY DOES NOT CHOOSE THE SECTOR - Dave's second reading is correct.  $89F2 (the IRQ6 handler):
+    0089fa: move.b ($12,A0), D0   ; UIB density/class byte
+    0089fe: btst   #$1, D0
+    008a02: beq    $8a38          ; bit1 CLEAR -> skip the header check entirely
+    008a14: lea    $7dac.w, A0    ; THE CAPTURE CELLS
+    008a1a: or.b   (A0)+, D0      ; OR the first three bytes together
+    008a1c: or.b   (A0)+, D0
+    008a1e: or.b   (A0)+, D0
+    008a20: cmpi.b #$a1, D0       ; == $A1 $A1 $A1 ?
+    008a26: cmpi.b #$fe, (A0)+    ; == $FE (IDAM) ?
+    008a2c: cmpi.b #$ff, (A0)     ; == $FF ?
+The firmware reads RAW RECOVERED FIELD BYTES out of $7DAC and checks an MFM PREAMBLE IN SOFTWARE, gated
+on the UIB density bit - skipped for FM, which is right because FM HAS NO $A1 SYNC BYTES.  That internal
+consistency is what makes the reading solid.  There is no hardware sector comparator on this path; the
+sector-select compare is software (op44 / $9884, as the disasm header already suspected).
+[$79a4] - reloaded from [$79a2] at $1030, decremented at $8A3C - is a per-address-mark countdown; at
+zero the handler reads E01E (the record ACK) and drops E802 bits 15/12/11.
+ALTERNATOR CORRECTION: $8A38 CLEARS $7950 outright rather than relying on the bchg toggle, so parity is
+RESET PER RECORD, not free-running.
+
+MODEL CONSEQUENCE - the same class of error as the $7436 snoop.  advance_read() was CHOOSING the sector:
+m_sec_index walked m_track[] in physical order for exactly [$7abc] sectors, and wrote NORMALISED
+C/H/R/N ($fe,c,h,r,nn) into $7DAC.  Two wrongnesses:
+  (1) the model picks which sector to deliver.  Hardware cannot - it delivers every address mark that
+      passes the head and lets the firmware accept or reject.
+  (2) the capture cells hold the wrong FORM.  The firmware expects the raw recovered bytes (preamble +
+      AM + header).  We get away with it only because the FM path skips the preamble check - ON THE MFM
+      PATH (the rest of the disk, and the HD) $8A14's compare would fail against normalised bytes.
+      THIS BLOCKS THE HD-BOOT GOAL and must be fixed before MFM is exercised.
+CHANGE MADE (this step, isolated): PER_ADDRESS_MARK - advance_read no longer stops after the commanded
+count; it wraps around the track and delivers a record per address mark, and the arm/hold handshake (the
+firmware simply stops re-arming) is what ends the run.  The capture-cell FORMAT change is deliberately
+NOT bundled here: the exact raw layout ($A1 $A1 $A1 $FE then... $FF at offset 4, which does not look
+like C/H/R) cannot be pinned down without tracing a real MFM read, and guessing it is how the timing
+rework went wrong.  Left as the next isolated step.
+
+RESULT of the PER_ADDRESS_MARK change (two runs, byte-identical counters - deterministic):
+                        before        after
+    data DMAs             8             8      (payload still correct: VOL1SINIX0 + HDR1)
+    status               0081          0081
+    records staged        8           101
+    op18 program loads    9           272
+    handler entries    ~40137        45019
+So the OUTCOME is preserved and the model is now architecturally right (the firmware, not the gate
+array, decides), but the CHURN is ~30x: the firmware is now genuinely accepting/rejecting records and
+is rejecting most of them, re-running op18 over and over.
+That is the expected coupling, and it is evidence FOR the deferred half: with the model no longer
+pre-selecting the "right" sectors, the firmware's accept/reject decision depends entirely on the
+CONTENT of the capture cells - which we know is NOT in the raw form it expects ($89F2 wants preamble +
+AM + header; we still write a normalised $fe,c,h,r,nn).  Previously the pre-selection masked the wrong
+format.  The two changes are coupled: per-address-mark delivery only pays off once the capture cells
+carry the raw recovered field.  NEXT (isolated): pin the raw capture-cell layout from a real MFM read
+and change the staged form - do NOT guess it.
+
+## cont.412 — the capture record FULLY MAPPED: D800 is the commanded address, and the layout is density-dependent
+
+THE DESTINATION IS COMMANDED, NOT $7DAC.  $9F06 (the capture-arm routine) programs it:
+    009f14: movea.w $793a.w, A2      ; the op18 param block (saved copy)
+    009f18: adda.w  #$32, A2         ; -> the E000 word block
+    009f1c: move.w  ($4,A2), D7  / ori #$8 / -> $e004
+    009f28: move.w  ($6,A2), D7  / ori #$8 / -> $e006
+    009f34: move.w  D6, $d800.w      ; <-- the CAPTURE-CELL ADDRESS LATCH
+    009f38: move.w  #$0, $c800.w
+Live trace: D800 <= $3ED6 = $7DAC>>1, re-written PER RECORD at $8990 and $801C (28 writes in a read).
+So the gate array deposits the record where it was TOLD; $7DAC is merely where the firmware happens to
+point it.  (Note $9F34 computes (addr-$4000)>>1 = $1ED6, the SRAM-relative convention also used for the
+channel descriptor's +$10 field at $8FB6, while the live D800 writes use the absolute addr>>1 = $3ED6.
+Two conventions exist; the live read uses the absolute one.)
+
+THE RECORD LAYOUT - it is the RAW RECOVERED BYTE STREAM, so it is DENSITY-DEPENDENT:
+    MFM:  +0 +1 +2 = $A1 sync preamble | +3 = $FE (IDAM) | +4[,+5] = cylinder | then H, R, N, CRC
+    FM :  +0 = $FE (IDAM) | +1 = C | +2 = H | +3 = R | +4 = N | then CRC
+FM has NO $A1 sync bytes, which is why the two readers disagree about where $FE lives - and that
+disagreement is the proof the deposit is raw:
+  $9884 (the REAL sector-select compare, op44): A3 = [$7a66] (the firmware's own pointer to the same
+        buffer); combines bytes 0-2 via ori #$80 / eor to $A1 (GATED ON UIB+$12 BIT2), requires $FE at
+        byte 3, takes the cylinder from byte 4 (or 4+5 as a 16-bit value when UIB+$12 BIT1 is set), and
+        compares it against [$7438] = the TARGET CYLINDER.  Mismatch -> error $2012 (which board.yaml
+        already listed as "cyl mismatch" - now sourced).
+  $89F2 (IRQ6): the OR-of-bytes-0..2 == $A1 / $FE at 3 / $FF at 4 test, counting matches into [$7a0c].
+        This is NOT a header compare - byte4 == $FF is a sentinel cylinder value, so it is a marker
+        detector, gated on UIB+$12 bit1.
+  $7C7A (FM path): cmpi.b #$fe, $7dac.w - $FE at BYTE 0, no preamble.
+UIB+$12 decoded so far: bit1 = 16-bit cylinder (and gates $89F2's check), bit2 = preamble present (MFM).
+
+MODEL CHANGE (verified behaviour-neutral, two runs byte-identical: dataDMA=8, stages=101,
+progloads=272, VOL1SINIX0 + HDR1 correct, st=0081): advance_read now deposits the ID field at
+`m_d800 << 1` - the commanded address - instead of a hardcoded $7DAC, and emits the three $A1 preamble
+bytes when the density is MFM.  On the FM path this is a no-op by construction (m_d800<<1 IS $7dac and
+FM emits no preamble), which is exactly why it is safe; its value is that the MFM path is now correct,
+and MFM is what the rest of the disk and the HD use.
+Our FM staging was already right by luck - $FE at offset 0 followed by C/H/R/N is precisely the raw FM
+recovered stream.
+
+STATE: PHYSICAL_TIMING=false, PER_ADDRESS_MARK=true.  8/8 transfers, st=0081, deterministic.  The
+remaining churn (101 records / 272 program loads) is the firmware genuinely rejecting records; with the
+layout now correct the next question is WHY it rejects - the obvious candidate is the target-cylinder
+compare at $98E0 against [$7438], i.e. whether our staged C matches what the firmware is seeking.
+
+## cont.413 — the settle flag WORKS (1.55s spin-up verified); the real op42 gate is [$798e], the SEEK-completion flag
+
+Dave reasoned physically: spin-up (~1.5s), seek to track zero, settle-after-seek of a few ms, and then
+once on-track address-mark interrupts need no settle at all - "this suggests that the earlier seek did
+not set the completion".  Traced end to end; he is right.
+
+THE SPIN-UP SETTLE [$7a36] - IMPLEMENTED, ARMED AND FIRING CORRECTLY.  $661A lives inside op24 (which
+spans $651C-$6786), NOT op28 - so it is armed at UNIT-SELECT time, before any seek, from a PER-UNIT
+field.  Measured:
+    UIB+$14 = 0x06, low nibble 6  ->  6 * 10 = 60 ticks
+    6409522.2us  [$7a38] <= 733c   (timer queued; queue head [$736c]=733c, walked on 133 ticks)
+    7962080.1us  [$7a36] <= 0001   pc=002b84  (the tick handler's queue-walk target write)
+    7962100.2us  [$7a38] <= 0000   (pending cell cleared)
+  armed -> fired = 1.5526s, against 60 ticks x 26.1ms = 1.566s.  Within 1%.  Dave's remembered ~1.5s
+  drive spin-up falls out of the firmware's own constant, and the read starts at 7.963s - JUST AFTER it
+  fires.  So [$7a36] is set before op42 needs it and is NOT the blocker.
+PIT PROGRAMMING VERIFIED (Dave asked): via the 0xFF mirror - pit1 ctrl $26 = ctr0 mode 3 MSB-only with
+count $FF00 (the ~26ms tick), pit0 ctrl $7A = ctr1 mode 5 (the seek-settle one-shot), plus ctr0 m4 /
+ctr2 m4,m2,m0.  Both documented timers are programmed as board.yaml says.
+
+THE ACTUAL GATE: [$798e] == 0.  Measured at op42 entry:
+    OP42 [798e]=0000 node=6e60 n+12=40 (bit1=0 bit7=0) [7a36]=0000
+[$798e] is op42's MASTER CONTROL:
+    $6BC2 tst [$798e]; blt $6CDA   -> NEGATIVE: return 0 = DONE immediately
+    $6C22 tst [$798e]; bne $6C32   -> POSITIVE: the bit7 / settle path
+          ==0 falls to $6C28: (A1) = node+$18 = the ERROR FIELD; it is 0, so beq $6CDE -> return $FE
+So with [$798e]=0 op42 never even reaches the bit7 or settle tests.  And node+$12 = $40 confirms it
+independently: bit7 is ALSO clear, so gate 3 would fail even if [$798e] were positive.
+
+[$798e] IS THE SEEK-COMPLETION FLAG - Dave's hypothesis, confirmed.  Every writer is in op24 or op28:
+    op24: $683E <= ffff, $6854 <= 1, $6866 <= ffff, $6876 <= 0
+    op28 (the SEEK engine): $688A <= 0, $68A4 <= 0, and the decision at $68EA:
+        0068fa: move.w #$1, $798e.w        ; IMMEDIATE - seek complete, no settle needed
+        006904: clr.w  $798e.w             ; else clear and SCHEDULE the deferred write:
+        00690c: move.w #$798e, (-$2,A3)    ;   target  = $798e
+        006912: move.w #$1,    (-$4,A3)    ;   value   = 1
+        00691a: move.b ($19,A6), D2        ;   UIB+$19 = per-unit STEP/SETTLE time
+        00691e: mulu.w D2, D0              ;   (steps * UIB+$19)
+        006920: divu.w #$a, D0             ;   / 10
+        006924: addq.w #1, D0              ;   + 1   -> tick delay
+        00692a: move.w #$7990, (-$8,A3)    ;   pending cell = $7990 (NOT $7a38)
+This is EXACTLY the structure Dave described: a settle-after-seek scaled by the number of steps, via the
+same $29F8 deferred-write scheduler as the spin-up.  So the two timers are siblings: [$7a36] = per-unit
+SPIN-UP (armed in op24 from UIB+$14), [$798e] = per-seek SETTLE/completion (armed in op28 from UIB+$19).
+For a cylinder-0 label read the step count should be 0, giving delay = 0*x/10 + 1 = ONE tick (~26ms) -
+so it should fire almost immediately.  It does not; [$798e] is still 0 when op42 runs.
+
+NEXT: does op28 even reach $68EA during the read?  The GA trace shows op28 making a single E804 write
+($BF78 at $6B20) and nothing else - consistent with the seek short-circuiting on an already-on-track
+drive.  If it short-circuits BEFORE $68EA then [$798e] is never written at all and simply retains its
+power-on zero (the $073A RAM clear), which would make this a missing seek-completion path rather than a
+timer that failed to fire.  Probe: tap $68EA/$68FA/$6904 and the [$7990] pending cell.
+
+INSTRUMENTATION ERRORS CORRECTED (both mine, both cost a wrong conclusion):
+  (1) I filtered logs on awk $2 when the "[:slot1:storager] " prefix puts the timestamp in $3, so
+      several "nothing happened after 6.4s" readings were EMPTY BY CONSTRUCTION - including the claim
+      that the settle deferred write "never lands".  It lands, on time.
+  (2) The first PIT tap was installed at 0x8000-0x8007 only; the firmware reaches the PITs through the
+      0xFF MIRROR (short-absolute), so it saw 4 writes out of dozens.  Same trap as the original
+      gate-array taps.  Fixed by tapping both bases.
+Standing rule, now three times over: before concluding "X never happens", verify the instrument can see
+X - wrong address range (mirror), wrong field index, or prefetch shadow have each produced a false
+negative this session.
+
+## cont.414 — the full op28->op42 chain runs correctly; the ONLY gap is PIT1 ctr2 (the rotational one-shot), whose OUT the model does not implement
+
+Dave reasoned the physical sequence (spin-up, seek to track zero, settle-after-seek, then no settle
+needed once on-track) and predicted the seek was failing to set the completion.  Traced end to end.
+EVERY stage he predicted is implemented in the firmware AND WORKING in our model:
+  1. op24 arms the SPIN-UP timer from UIB+$14 (=6) -> [$7a36] fires at 1.5526s (predicted 1.566s)  ✓
+  2. op28 returns $FE (WAIT) while [$7a36] is clear ($67A2/$67B2) - "wait for the drive"            ✓
+  3. op28 finds the head ALREADY ON TRACK ($67EE: UIB+$D0==[$7946]=0, UIB+$D2==[$7948]=0) and takes
+     $683E -> [$798e] = $FFFF, the "no seek, no settle, complete at once" value                     ✓
+  4. op28 then ARMS PIT1 ctr2 MODE 5 ($684C: move.b #$9a,$8007) and OVERWRITES [$798e] with 1
+     ($6854) = "now waiting for the rotational one-shot"                                            ✓
+  5. op42 waits for it.  node+$12=$40 so bit7 is clear; op42 loops.
+  6. ctr2's OUT IS UNMODELLED -> the wait can never end -> status stays 0x81.                       <-- THE GAP
+Measured, after the spin-up:
+    7962198.3us [798e] <= ffff pc=00683e     ; on-track, exactly as predicted
+    7962203.1us [798e] <= 0001 pc=006854     ; overwritten 5us later - wait for ctr2
+    7962224.6us OP28 ret D0=0000 [798e]=0001 ; op28 ADVANCES
+    7962227.9us OP42 node[71bc]=71f0 [798e]=0001 n+12=40
+
+THE MODEL GAP, precisely:  storager.cpp `timer2_out()` IS AN EMPTY STUB.  m_pit[1] ctr2's OUT is wired
+to it and goes nowhere.  Separately, m_timer_out - which drives F000 BIT11, documented as "i8253 timer
+OUT" - is fed from ctr0 (the SYSTEM TICK), not ctr2.  Since op28 arms ctr2 immediately before setting
+the wait flag, bit11 is far more likely to be ctr2's OUT and our wiring is on the wrong counter.
+
+PIT CENSUS (Dave: the two PITs sit on alternate bytes of the 16-bit bus, so a word write would hit
+both - worth checking for the "missing" count load).  Full census, correct field indices:
+    ff8000 mask=00ff  4581   pit1 ctr0 count  (the ~26ms tick reload)
+    ff8002 mask=ff00    34   pit0 ctr1 count  ($3CF8/$3CFC, the seek-settle program)
+    ff8004 mask=ff00    34   pit0 ctr2 count  ($3CF8/$3CFC)
+    ff8006 mask=ff00    20   pit0 control     (38 / 7a / b8)
+    ff8006 mask=00ff     7   pit1 control     (26 / 66 / b8 / b4 / b0 / 9a)
+    ff8004 mask=00ff     0   pit1 ctr2 count  <-- NEVER via this address
+    mask=ffff            0   NO WORD WRITES AT ALL - this firmware always accesses the two PITs as
+                             separate bytes, so the write-both-at-once case does not arise here.
+BUT the ctr2 count IS loaded, from another site - op42's own DONE path:
+    006cc2: move.b #$9a, $8007.l      ; pit1 ctr2 control, mode 5  (same word op28 writes at $684C)
+    006cca: cmpi.w #-$10, $796e.w
+    006cd0: bne    $6cda
+    006cd2: move.b ($13,A0), $8005.l  ; pit1 ctr2 COUNT = UIB+$13   ($8005 odd -> pit1, register 2)
+  gated on [$796e] == $FFF0, a cell earlier sessions showed is essentially never set.
+So: PIT1 ctr2 = the ROTATIONAL/SECTOR one-shot, control from op28/$684C and op42/$6CC2, count from
+UIB+$13 on the [$796e]==$FFF0 path.  Mode 5 is HARDWARE-TRIGGERED, so it also needs a GATE edge - and
+the model drives no gate on pit[1] ctr2 at all.
+
+OPEN, to implement it properly: (a) what drives pit1 ctr2's GATE (mode 5 needs a rising edge);
+(b) does its OUT land on F000 bit11, or raise an interrupt; (c) is the [$796e]==$FFF0 count-load path
+the normal one, or is UIB+$13 loaded elsewhere too.  Not guessing at these - the timing rework earlier
+this session is what happens when this model is guessed at.
+
+INSTRUMENTATION DISCIPLINE - FOUR false negatives this session, all mine, all from an instrument that
+could not see what I was asking:
+    1. taps at 0x8000-0x8007 while the firmware uses the 0xFF MIRROR      (PIT programming "absent")
+    2. awk filters on $2 when the "[:slot1:storager] " prefix puts time in $3  (settle "never fires")
+    3. read taps in the 68000 PREFETCH SHADOW                             (the "kick" appeared to fire)
+    4. head -12 / sample caps that ended BEFORE the event of interest     ([$798e] "never written")
+RULE, now written down: before concluding "X never happens", prove the instrument can observe X -
+address range/mirror, field index, prefetch shadow, and sampling window each falsified a conclusion
+this session.
+
+### cont.414a — CORRECTION: op42 does NOT wait on PIT ctr2.  It waits on a SOFTWARE guard timer ([$7a40]/[$7a3e])
+
+Working back from the count, as Dave asked, and then looking for the OUTPUT - which overturned the
+cont.414 framing.
+
+THE COUNT.  UIB+$13 = $18 = 24 (PIT1 ctr2's count, RW=01 so 8-bit).  Calibrating the counter clock
+against Dave's "<50ms for a track-to-track settle": pit0 ctr1 (the SEEK-SETTLE one-shot) takes a 16-bit
+count of $1103 = 4355, and at our modelled 1.25MHz that is 3.48ms - a textbook floppy track-to-track
+settle, comfortably inside his bound.  So the 1.25MHz counter clock is CORROBORATED by his figure.
+Applying it to ctr2: 24 x 800ns = 19.2us.  That is a STROBE, not a settle - so ctr2 is not a settle
+timer at all, which is the first sign the cont.414 reading was off.
+
+THE OUTPUT.  Exactly ONE site in the whole firmware tests F000 bit11:
+    00a0ae: (pit1 ctr0 control $26)      ; from the live PIT trace
+    00a0b6: (pit1 ctr0 count $FF00)
+    00a0d2: move.w $f000.w, D0
+    00a0d6: btst   #$b, D0
+    00a0da: beq    $a0f8                 ; poll until bit11 CLEARS
+    00a0de: bne    $a0d2
+It programs ctr0, loads its count, then polls bit11 - so F000 BIT11 IS PIT1 CTR0's OUT (the system
+tick), EXACTLY AS THE MODEL ALREADY WIRES IT.  The cont.414 suggestion that bit11 might be ctr2's and
+that our wiring was on the wrong counter is WRONG and is retracted.  ctr2's OUT does not surface on
+F000 at all, and where it does go remains unknown.
+
+AND op42 NEVER CONSULTS ctr2.  Re-reading its actual path with [$798e]=1 and node+$12=$40 (bit7 CLEAR):
+    006c32: btst  #$7, D0     ; bit7 CLEAR -> $6C88 NOT taken
+    006c38: tst.w $7a40.w     ; the guard-timer PENDING cell
+    006c3c: bne   $6cde       ;   non-zero -> return $FE (WAIT)
+    006c40: tst.w $7a3e.w     ;   else: has the guard timer EXPIRED?
+    006c52: D0 = node+$18     ;   the guard COUNT
+    006c5c: move.w #$ffff, $7a3e.w   ; count==0 -> EXPIRE NOW -> $6C88
+    006c64: else arm timer (target [$7a3e], count node+$18, pending [$7a40]) via $29F8
+[$7a3e] has NO interrupt writer - only op42 itself ($6C5C) and its own deferred timer.  So op42's wait
+is a SOFTWARE GUARD TIMER on the same $29F8 queue as the spin-up, not a hardware one-shot.
+So the whole PIT-ctr2 line of enquiry, while it produced a genuine finding (timer2_out() is an empty
+stub and ctr2's OUT is unmodelled), is NOT the read's blocker.  That finding stands on its own but is
+demoted from "the last gate" to "an unmodelled signal of unknown destination".
+
+THE ACTUAL REMAINING GATE: [$7a40] != 0.  node+$18 (the guard count) is ZERO - the error-field tap
+showed no writes during the read - so if op42 ever reached $6C40/$6C52 it would take the IMMEDIATE-
+EXPIRY path at $6C5C, fall to $6C88, find [$7a36] set (it is, from 7.9621s), and return 0 = DONE.
+It never gets there because $6C38 finds a guard timer already queued.  Since the timeout queue IS
+serviced (the spin-up timer fired through it), a queued guard timer should fire and clear [$7a40] -
+so either it was queued with a huge count, or its queue entry was lost, or [$7a40] is stale from an
+earlier command and was never cancelled ($2ABA is the cancel).
+PROBE THAT CLOSES IT: write-tap [$7a40] and [$7a3e] for the whole run with PC, and log node+$18 at
+op42 entry.  One run.
+
+### cont.414b — op42 is NOT permanently blocked: the guard timer fires and op42 COMPLETES at 9.79s
+
+Measured with whole-run write taps on the guard cells (no wall-clock window - the OP42 tap now gates on
+[$7a36] being set instead, since window-guessing produced four false negatives this session):
+    7962227.9us  op42 entry: [7a40]=0000 [7a3e]=0000 n+18=0000
+    7970414.6us  [7a40] <= 7360  pc=002aa8   ; guard timer ARMED (the $29F8 queue insert)
+       ... op42 sees [7a40]!=0 -> returns $FE (WAIT) ...
+    9790168.9us  [7a3e] <= 0001  pc=002b84   ; the TICK HANDLER's queue walk fires it
+    9790189.0us  [7a40] <= 0000            ; pending cell cleared
+    9790268.6us  PIT ff8006 <= 9a9a pc=006cc2  ; <-- $6CC2 is INSIDE op42's DONE path
+So the guard timer expires 1.82s after arming, op42 takes its DONE path and returns 0, and the ladder
+advances.  RETRACTION: "op42 never returns 0" - carried since cont.405 and repeated all through this
+session - is WRONG.  It returns 0 at ~9.79s.  Every earlier op42 sample was capped or windowed before
+7.971s, so the completion was never in view; the belief survived only because the instrument stopped
+looking 1.8 SECONDS too early.
+
+THE FRONTIER MOVES.  After op42's DONE there are NO further bus-master transfers at all - the last
+node->host control write-back still carries st=81, and nothing follows it:
+    TEMPDMA ctl local=71f0 host=0fe780 len=24 st=81   <- last one, and no 0x80 ever
+17 DMAs total in the run, none after 9.79s.  So the chain now stops BETWEEN op42's DONE and the host
+completion stamp: the walker should advance op42 -> op36 (phase $0A park + watch pump) -> op00 (phase
+$0C) -> $1A54 stamps 0x80 -> a node->host DMA carries it to the IOPB.  None of that is happening.
+NEXT: tap the walker's phase writes (node+$26) and $1A54, from 9.78s on, to see how far past op42 it
+gets.  Note also that a guard timer EXPIRING is normally a TIMEOUT, so op42 may be completing via its
+timeout path rather than a genuine success - worth checking whether the ladder then errors.
+
+### cont.414c — CONFIRMED: op42's "DONE" is the WATCHDOG TIMEOUT, not a completion (Dave called it)
+
+    006c40: tst.w  $7a3e.w
+    006c44: bne    $6c88          ; timer EXPIRED -> proceed
+    006c54: move.b ($18,A0), D0   ; A0 = [$799a] = THE UIB -> UIB+$18 = the GUARD COUNT
+    006c5a: bne    $6c64          ;   non-zero -> arm
+    006c5c: move.w #$ffff, $7a3e.w;   zero -> expire immediately
+    006c64: ... arm (target [$7a3e], value 1, count D0, pending [$7a40]) via $29F8 ...
+UIB+$18 = $46 = 70 (from the UIB dump: 10 97 40 18 06 02 00 02 46 03 50 00 ...).
+    70 ticks x 26.1ms         = 1.827s
+    measured 9790168.9 - 7970414.6 = 1.8198s
+To within one tick's phase.  So op42 exits by its WATCHDOG EXPIRING, and then returns 0 with NO error
+recorded - a timeout treated as "proceed".  Dave's read was right.
+
+CORRECTION: the guard count is UIB+$18, NOT node+$18.  The disassembly's own annotation says
+"count=node+$18" and I repeated it; A0 is [$799a] = the UIB ($6E60), so the cell is $6E78.  My probe
+read $7208 (the command node) and got 0000, which is exactly why the immediate-expiry path at $6C5C
+looked like it should have been taken.  Wrong operand.
+
+AND [$7a3e] HAS NO INTERRUPT WRITER - only op42 itself ($6C5C) and its own deferred timer ($2B84).  So
+op42's ONLY exit is that timer.  In a healthy read the command must therefore complete and tear the
+node down BEFORE the guard matters; op42 reaching its timeout is positive proof the real completion
+never happened.  This also explains why nothing follows: after the timeout the ladder advances but the
+operation was never actually finished, so no 0x80 is ever stamped and no further DMA occurs.
+
+SO THE REAL QUESTION IS UNCHANGED AND NOW SHARP: what should complete the read within 1.83s of op42
+arming?  All 8 data transfers are done by ~7.97s - well inside the guard - so the transfer is not the
+missing piece; the missing piece is whatever turns "8 sectors transferred" into "command complete".
+From the earlier decode that is the $8200/$843e chain: node+$26 = $0C at $843e, gated on [$7968]==0.
+NEXT: tap $843e, node+$26 (the phase), and [$7968] across the whole run - no windows, no caps.
+
+### cont.414d — the completion route runs THROUGH the capture record ($7C7A); both gates on $843E are shut
+
+Whole-run write taps on the completion flags (no windows, no caps):
+    7963463.6us  [727e] <= 0000  pc=00a374    ; zeroed ONCE early - never set again
+    7963734.8us  [741c] <= 0001  pc=007f14    ; set per record, ~490us apart
+       ... 17 more, NEVER cleared ...
+    7967479.0us  [7968] <= 0001  pc=0082b2    ; because [727e]==0
+    9790292.7us  [7216] <= 000a  pc=0015a0    ; phase -> $0A after op42's timeout, then STOPS
+$843E is never reached (0 hits all run), so node+$26 never becomes $0C and no 0x80 is ever stamped -
+which is why there are no bus-master transfers after 9.79s.
+
+$843E is gated on [$7968]==0, and BOTH exits from [$7968] are shut:
+  - $82B2 RE-SETS it, because [$727e]==0.  [$727e]=ffff is set only at $75AC, gated on [$7b40], which
+    is computed by op48 = $73FA - AND op48 IS NOT IN THE READ'S LADDER (24 28 56 58 [1A] 18 54 4A 42
+    36 00).  Same absent-op pattern as op3E (transfer launch), op44 (bit14) and op4E ([$7a70]): FOUR
+    completion-related ops, none of which a read ever emits.
+  - $82C6 would CLEAR it, but needs [$741c]==0, and [$741c] is permanently 1.
+[$741c]: set at $79F6/$7B06/$7D5C/$7F14, cleared at $7C08/$7CA4/$7ED8.  Only setters ran.
+
+AND THE CLEARERS SIT ON THE CAPTURE-RECORD PATH:
+    007c7a: cmpi.b #$fe, $7dac.w   ; THE CAPTURE CELL, byte 0 == $FE (the FM IDAM)
+    007c80: bne    $7d4a           ;   no match -> away
+    007c84: tst.w  $7968.w
+    007c88: bne    $7c92
+    007c92: move.w #$0, $7968.w    ; clears chunk-pending DIRECTLY
+    007c9e: move.w #$ffff, $7b2e.w
+    007ca4: clr.w  $741c.w         ; clears the other gate
+So the read's completion route is NOT the [$7b40]/bit14 chain (which reads structurally cannot use) -
+it is the $7C7A path, which keys on the RAW ID FIELD the gate array deposited.  That ties the completion
+directly to the cont.412 capture-record work: the firmware re-reads the capture cells and, finding a
+valid FM address mark, retires the chunk and clears both completion gates.
+$7C7A is not being reached.  NEXT: tap $7C7A/$7C80/$7CA4 and log the live capture-cell bytes at that
+moment - the model writes $FE at offset 0 for FM (verified cont.412), so either the path is entered from
+somewhere we do not satisfy, or the cell has been overwritten by a later record before $7C7A reads it.
+Note the model now delivers a record per address mark (cont.411), so the cells are rewritten every
+~490us - a staleness hazard that did not exist when the model pre-selected 8 sectors.
+
+## cont.415 — the buffer is SLOT-ALLOCATED from a table, not pointer-incremented; the first field is lost because no slot is allocated yet
+
+Dave: the commanded run IS sectors 1-8 (authoritative), so the observed buffer contents are wrong.
+Also his process point, which the record bears out: several conclusions this session were built on bad
+measurements - 68k PREFETCH (MAME's m68000 is die/microcode accurate, so a read tap fires on the FETCH
+and reports instructions that never execute), plus mirror-blind taps, wrong awk field, and sampling
+windows that closed before the event.  Method changed: state the expected result BEFORE running a probe;
+prefer WRITE taps and model-side reads (no prefetch semantics) over read taps; treat any single-run
+conclusion as provisional until a differently-shaped measurement agrees.
+
+ACCEPTED-SECTOR CORRELATION (write tap on [$7428] + model-side reads - prefetch-immune):
+    sec=0 R=01 -> chunk=0000 | accepted[7428]=0001 ptr[741e]=2000
+    sec=1 R=02 -> chunk=4000 | accepted[7428]=0002 ptr[741e]=2040
+    sec=7 R=08 -> chunk=4300 | accepted[7428]=0008 ptr[741e]=21c0
+[$7428] (written ONLY at $992E, inside the ID-match routine) equals R exactly, every record, and the
+chunk tracks it rigidly: chunk = $4000 + (R-2)*$80.  RETRACTION: "the chunk pointer advances
+independently of the accept decision" is WRONG - they are locked together.  The mapping is off by
+exactly one slot, and since the commanded run is R=01..R=08 the buffer ends up holding R=02..R=09 with
+sector 1's data discarded.
+
+THE ID MATCH IS CONVENTIONAL AND IS RUNNING (retracting "there is no header verification"):
+    $98E0 cmp cylinder vs [$7438]  -> error $2012 on mismatch
+    $98F6 cmp head     vs [$7436]  -> error $202A on mismatch
+    $9916 read sector R; $991A the wanted sector from node+$1; $992A range-check; $992E ACCEPT ->
+          [$7428] = the matched sector number
+Soft-sectored ID matching, one error code per field - exactly as Dave said it must be.  My "$9884 never
+runs" measurement was misleading: the routine has an ALTERNATE ENTRY at $9934, so an entry tap misses
+the way it is actually reached, and [$7428] is demonstrably written (only $992E does that).
+Dave also rejected the index-relative-capture hypothesis outright: index-relative addressing is
+hard-sectored thinking and flies in the face of 50 years of disk practice.  Correct - withdrawn.
+
+THE BUFFER IS TABLE-DRIVEN AND SLOT-ALLOCATED (the real structure):
+    $7EFE  move.w D1, $7424.w        ; the SLOT index
+    $7F02  mulu.w #$6, D1            ; 6-byte entries
+    $7F06  lea    $7696.w, A0        ; the CHUNK TABLE
+    $7F0A  move.w (A0,D1.w), D0      ; entry+0 = the chunk's byte address
+    $7F10  move.w D0, $741e.w        ; [$741e] = table[slot]
+    $7F14  move.w #$1, $741c.w       ; and the flag that blocks $843E
+Live table dump:
+    slot 0: addr=4000 +2=ff00    slot 4: addr=4200
+    slot 1: addr=4080            slot 5: addr=4280
+    slot 2: addr=4100            slot 6: addr=4300
+    slot 3: addr=4180            slot 7: addr=4380   <- slots 0..7 = $4000-$43FF, the 1024B envelope
+    slot 8: addr=4400 ...        (the table continues, which is why the over-run goes unremarked)
+So [$741e] is NOT a pointer the firmware increments - it is table[slot], and $7F10 is the ONLY writer
+that runs during the read (write tap, whole run).  The four other writers ($79EE/$7AFE/$84A6/$864E)
+use the identical table idiom and never fire.
+
+WHERE THE SLOT COMES FROM - $32AC, THE ALLOCATOR (static, no measurement):
+    $7EE0  link A3,#-$a
+    $7EE4  move.w #$0, (-$2,A3)      ; input arg
+    $7EEA  bsr $32ac                 ; <-- allocates a slot
+    $7EEE  tst.w (-$6,A3)            ; found-flag (OUTPUT)
+    $7EF2  bne $7EF8                 ;   found -> use it
+    $7EF6  bra $7ED8                 ;   NOT found -> $7ED8 clears [$741c] and exits
+    $7EF8  move.w (-$8,A3), D1       ; the allocated SLOT INDEX (OUTPUT)
+and $32AC itself:
+    $32CA  tst.w $74ac.w             ; the SLOT LIST - empty?
+    $32CE  beq $3320                 ;   EMPTY -> not found
+    $32D8  movea.w (A1), A2          ; pop the head
+    $32DA  move.w #$80, ($2,A2)      ; stamp it claimed
+    $32E6  move.w ($4,A2), D1        ; entry+4 = the slot index, returned
+So slots are ENQUEUED, not computed.  Two writers of the list head: $0A90 (low intake/init region) and
+$8196 (the record-handler region, the per-record re-enqueue).  $0A90's path is therefore the
+command-setup enqueue that must populate [$74ac] BEFORE the first data field.
+Note $7ED0 also routes to $7ED8 on the 0xAA end-of-window ledger marker (cont.404's sentinel), so
+[$741c] is cleared either when the slot pool is exhausted or when that marker appears - which is the
+natural "buffer complete" condition and ties the completion chain to the $706C/$72F8 marker writers.
+
+THE DEFECT, precisely: sector R=01 arrives while NO SLOT HAS BEEN ALLOCATED, so [$741e] is 0 and its
+data goes nowhere; $7F10 then allocates slot 0 -> $4000 and assigns it to R=02, shifting every sector
+one slot late.  The fix is NOT to write [$741e] directly (that would be an HLE shim of exactly the kind
+the cont.353 rebuild removed) - it is to find why the command-setup enqueue onto [$74ac] is not
+happening, or is happening after the first record.
+ALSO PROVEN (and worth keeping): withholding the first data record until a chunk is armed DEADLOCKS -
+9293 attempts, never armed - because the firmware arms C800[0] only in RESPONSE to the data-done record.
+So the first field genuinely cannot be held; the allocation must happen before it, not during it.
+NEXT: trace $0A90's enqueue path and what gates it.
+
+## cont.416 — the read's completion is a THREE-WAY test at count-exhaustion; all three fail, measured
+
+Continuing the careful step-by-step Dave asked for.  Every value below is a model-side read or a write
+tap (no prefetch semantics), taken at the exact instant of interest.
+
+$8A88 WAS A DECOY.  It clears [$741c] but only after [$79a4] counts down to zero, and [$79a2] (its
+reload, written ONLY at $1030 as `asl.w #4,D1` = D1*16) measures 0x0100 = 256 = 16 sectors x 16 = SIXTEEN
+REVOLUTIONS.  That is background housekeeping, not an operation-scoped count - which is why it fired
+once in 120s, long after op42's 1.83s watchdog.  The value is deliberately computed, so nothing is
+missing there; hypothesis "the [$79a2] load is failing" is FALSIFIED.
+
+THE REAL COMPLETION PATH is at $7EBE, and it is the conventional one:
+    007ebe: subq.w #1, $7956.w      ; DECREMENT sectors-remaining
+    007ec2: bne    $7ee0            ;   not zero -> allocate the next slot, keep reading
+    007ec4: tst.w  $796a.w
+    007ec8: beq    $7ed8            ;   [$796a]==0      -> CLEAR [$741c]  (complete)
+    007eca: tst.l  $7958.w
+    007ece: bne    $7ed8            ;   [$7958]!=0      -> CLEAR [$741c]
+    007ed0: cmpi.b #$aa, (A0,D0.w)
+    007ed6: bne    $7ee0            ;   ledger==$AA     -> CLEAR [$741c]; else KEEP READING
+    007ed8: move.w #$0, $741c.w
+($7C08 is the abort path - $7C02 forces [$7956]=0 first.)
+
+[$7956] REACHES ZERO CLEANLY - cont.317 IS SUPERSEDED.  Measured per record:
+    R=01 remain=0007, R=02 0006, ... R=07 0001, R=08 0000  <- lands on zero exactly at the 8th sector
+    R=09 0000, R=0A 0000 ...                                <- pinned at 0 while the capture over-runs
+cont.317's "D3 never==[$7956] so [$7956] never lands 0" was an HLE-era finding and no longer holds; the
+$7EBE decrementer is a plain subq #1, distinct from the D3-subtract at $70A0.
+(NOTE: the write tap on $7956 logged NOTHING while the value demonstrably changed - subq.w is a
+read-modify-write and MAME's write tap did not fire as expected on that path.  The model-side reads are
+the trustworthy record.  Another instrument caveat for the list.)
+
+ALL THREE CONFIRMATIONS FAIL, measured at the 8th record:
+    remain[7956]=0000 | 796a=0001  7958=00000000  ledger[7654+01]=c0
+    tst.w $796a  -> needs 0        got 0001        FAILS
+    tst.l $7958  -> needs non-zero got 00000000    FAILS
+    cmpi.b #$aa  -> needs $AA      got $C0         FAILS
+So it falls through to $7EE0 and keeps reading - exactly the observed over-run past R=08.
+The ledger byte is $C0, which board.yaml records as the ledger's IDLE/RESTING value (cont.405 corrected
+an earlier "staked" reading).  So the drain slot was never advanced to the $AA end-of-window marker,
+consistent with cont.403's measurement that the $706C/$72F8 writers (the only two $AA sources) never run.
+
+STATE: PHYSICAL_TIMING on (12.5ms sectors, ~23ms observed per sector due to arm latency accumulating -
+the schedule is incremental from actual delivery rather than absolute-from-rotation, a known model flaw
+Dave deemed acceptable for now), PER_ADDRESS_MARK on.  8/8 sectors captured, payload correct
+(VOL1SINIX0 + HDR1), sector<->chunk mapping deterministic, count exhausting properly.  Completion
+blocked on the three-way test.  Nothing committed.
+NEXT: re-read the historical entries on [$796a] (cont.316/317) and the $AA writers (cont.403/404)
+against these measurements, and determine which of the three the firmware INTENDS for this path -
+rather than picking whichever is easiest to satisfy.
+
+## cont.417 — the program/data split CONFIRMED; and both read defects collapse into ONE missing trigger ([$796c])
+
+PROGRAM/DATA SPLIT - now conf V, on positive evidence.  Dave challenged the ROM/RAM overlap (correctly:
+I had asserted it as board fact when it was an unexamined model construction).  Resolved:
+  - RAM is $4000-$7FFF, 16KB = the 2x MB8464A, CONFIRMED by the reset SSP $7D96 (stack grows down) and
+    by every observed variable reading back what was written.
+  - DECISIVE: we have measured PCs EXECUTING ABOVE $8000 - $833C, $8A88, $992E, $9D34/$9D46, $A374 -
+    each holding, in the ROM image, exactly the instruction that produced the observed effect.  In DATA
+    space $8000-$8007 is the PIT pair and $C000+ is the gate array, so execution there is impossible
+    unless FETCHES see ROM where DATA cycles see I/O.  No boot overlay, bank latch or code-in-RAM
+    explanation survives that.  (My earlier "no copy loop" argument was only negative evidence; the
+    real proof was already in our own traces.)
+  - Corroboration: every ROM constant actually used sits below $4000 ($192 op table, $63E op-family,
+    $22E per-unit masks); every structure at/above $4000 is RAM-built at runtime ($7696 chunk table,
+    $6E84 op18 param block, ledger, nodes).  Code high, constants low - the discipline a split-I&D
+    machine forces.
+  - Mechanism (Dave): FC1 alone discriminates program from data; one line into the decode PAL selects
+    "ROM only" vs "RAM + I/O".  Motive: the board decodes only A1-A15 (a 24-bit CPU wired as a 64KB
+    machine), and one FC line buys the address space back.  Lineage: PDP-11 split I&D; analogues are
+    the 8051 /PSEN vs /RD and the Z80 /M1.  Rare on a 68000 but explicitly supported by Motorola.
+  - STANDING CAUTION (Dave): with only A1-A15 decoded, ANY address above 64K must be examined very
+    carefully - the Storager may use those bits for unrelated purposes.  Two confirmed instances
+    already: the C000 counter carries host bits 23-16 on A1-A8, and op18's $6000 strobe carries its
+    selector on the UDS/LDS choice.  The model's Multibus window at $010000-$FEFFFF needs re-examining
+    against this - if only A1-A15 are decoded, the CPU cannot reach host memory by direct addressing and
+    every host access must go through the gate array's bus-master path.
+  - This also explains $72AE being BOTH ROM code and a RAM structure ([$72e2] points at it): not an
+    anomaly, the architecture working as designed.  The disassembly is trustworthy as CODE at every
+    address; ambiguity exists only on the data side.
+
+$72AE IS NOT A ROUTINE (correcting cont.398c and my own repetition of it).  There is no bsr/jsr to it
+and no pointer table containing it - the bytes "72 AE" occur 5 times in the ROM, all accounted for
+($1696 is a cmpi comparison; the four `lea $72ae` sites WRITE a RAM structure).  $72AE is reached by
+FALL-THROUGH from the loop that ends `$72AA dbra D1,$724C`.  Its enclosing routine starts at $7106.
+
+THE ARM/DISARM PAIR, measured and then explained:
+    2897065.0us  [7b10] <= ffff  pc=006ed6  [7968]=0000   ; op4A ARMS
+    2897068.1us  [7b10] <= 0000  pc=006f3a  [7968]=0000   ; disarmed 3us later
+op4A itself makes the decision:
+    006ed6: move.w #$ffff, $7b10.w    ; arm
+    006edc: tst.w  $7968.w            ; chunk-pending?
+    006ee0: beq    $6f3a              ;   CLEAR -> disarm and fall into $6F44 (the other ledger path)
+So the arm is retained ONLY if [$7968] is ALREADY SET when op4A runs.  In our run [$7968] becomes 1 at
+7.967s - five seconds later, and via $82B2, which is the FAILURE branch (taken because [$727e]==0).
+Nothing re-arms: of the seven [$7b10] writers, $6ED6 is the only setter and the other six all clear it.
+This supersedes cont.398c's "$72F8 is dormant, gated on [$7968]" - it is not gated-dormant, it is
+UNREACHABLE because the arm that would call it was consumed before its precondition existed.
+
+BOTH DEFECTS COLLAPSE INTO ONE MISSING TRIGGER.  [$7968] has exactly two setters to 1: $82B2 (the
+failure branch) and $79D6.  $79D6 sits in a single coherent block at $79A6-$79FC:
+    0079a6: tst.w  $796c.w          ; THE GATE
+    0079aa: beq    $7a4c            ;   zero -> skip the entire block
+    0079ae: move.w #$0, $796c.w     ;   else consume it
+    0079be: bsr    $32ac            ; ALLOCATE a slot
+    0079c2: tst.w  (-$6,A3) / bne $79d0
+    0079ca: clr.w  $7968.w          ;   no slot -> clear chunk-pending
+    0079d6: move.w #$1, $7968.w     ; SET CHUNK-PENDING      <- op4A's precondition
+    0079dc: move.w D0, $7424.w      ; the slot index
+    0079e4: lea    $7696.w, A0      ; the chunk table
+    0079ee: move.w D0, $741e.w      ; SET THE BUFFER POINTER <- the missing initialisation
+    0079f6: move.w #$1, $741c.w
+ONE routine allocates the slot, sets chunk-pending AND loads [$741e] from the chunk table.  If it ran
+before op4A it would fix BOTH known defects at once:
+  (a) the first data field would have a destination -> no R=01 loss, no off-by-one (the buffer would
+      hold R=01..R=08 in slots 0..7 instead of R=02..R=09), and
+  (b) [$7968] would already be set when op4A executes -> the arm survives -> $8330 calls $7106 -> the
+      [$7968]-set branch runs -> $72F8 lays the 0xAA end-of-window marker -> $7ED0 matches -> [$741c]
+      clears -> $82C6 clears [$7968] -> $843E sets phase $0C -> host status 0x80.
+That is the entire completion chain, and it hangs on one cell: [$796c].
+NEXT: trace [$796c] - what sets it, and why it is not set before op4A on the read path.
+
+## cont.418 — session close: op4A IS the ledger builder and DOES lay the 0xAA; two candidate roots, one cheap test
+
+$6ED2 (op4A) is ONE routine running all the way to $70A0 - not the small "arm [$7b10]" op the earlier
+decode described.  Full shape:
+    006ed2  move #$2700,SR
+    006ed6  [7b10] = ffff                     ; arm
+    006edc  tst [7968] / beq $6f3a            ;   chunk-pending CLEAR -> disarm, fall into $6F44
+    006f3a  [7b10] = 0                        ;   (the 3us disarm we measured at 2.897s)
+    006f44  ... THE LEDGER BUILDER ...
+    006f5c  [7956] = [7abc]                   ; re-seed sectors-remaining from the commanded count
+    006f62  [7958] = [7abe]
+    006f80-$702A  chain slot entries onto [$74ac], marking $FF / $C0 per entry
+    007030-$7048  D1 = node+$1 (+1 if class bit1 clear) - [$7954] - [$7956]
+    00706c  move.b #$aa, (A0)                 ; LAYS THE 0xAA BOUNDARY
+    007078-$7092  scan for the first $AA/$FF/$FE from [$7954]
+    007094  [796c] = 0                        ; clears the gate
+    00709a  [7a64] = 0
+    0070a0  sub.w D3, $7956                   ; decrement by entries processed
+    0070a4  bne $70d4
+    0070c6  [796c] = 1                        ; ONLY on the count-exhausted + no-0xAA branch
+Callers: the ladder (op4A = $6ED2 in the $192 table) and $948E (`bsr $6ed2`).
+So three things previously treated as separate - the ledger build, the slot chaining, and the 0xAA
+boundary - are one routine.  And op4A DOES lay the marker, at 2.897s, on the disarm path.  This matches
+cont.398c's "$706C fires once early, then gets overwritten by the captures".
+
+SO THE MARKER IS NOT MISSING - IT IS LAID AND THEN DESTROYED.  And [$796c], which would re-trigger the
+$79A6 allocation block (slot + chunk-pending + [$741e]), is CLEARED at $7094 on this same path and only
+re-set at $70C6 - the count-exhausted branch, which never re-runs because $70A0 executes once, early,
+with the count still full (measured: SECDEC=1 at 7.9636s, count 8 -> takes bne $70d4).
+
+TWO CANDIDATE ROOTS, distinguishable by one cheap measurement:
+  (1) THE BOUNDARY IS LAID IN THE WRONG PLACE.  Its position comes from node+$1 - [$7954] - [$7956] at
+      $7030-$7048.  We have measured [$7956] (8 -> 0 correctly) and [$7abc] (8), but we have NEVER
+      measured [$7954] (the window base) or node+$1 (the start sector).  If either is wrong the marker
+      lands where the per-record staking will overwrite it.
+  (2) THE OVERWRITE IS LEGITIMATE and $70A0 is meant to run again at exhaustion - i.e. something should
+      re-enter $6ED2 (via the ladder or $948E) once the count drains.
+NEXT SESSION, FIRST MOVE: read [$7954] and node+$1 at the moment $706C executes, and compute where the
+0xAA lands versus where the staking writes.  Two model-side reads, prefetch-immune.  If the position is
+correct, (1) is dead and the answer is (2).
+
+SESSION STATE (uncommitted): PHYSICAL_TIMING=true (12.5ms sector period; ~23ms observed because the
+schedule is incremental from actual delivery rather than absolute-from-rotation - a known model flaw,
+Dave deemed it acceptable for now), PER_ADDRESS_MARK=true.  8 sectors captured with correct payload
+(VOL1SINIX0 + HDR1), [$7956] drains 8->0 correctly, sector<->chunk mapping deterministic (chunk =
+$4000 + (R-2)*$80, i.e. one slot late), 0 data DMAs in this configuration, host status 0x81.
+storager.cpp carries extensive TEMP (STRIP) instrumentation - ga_log, the CTX/CNT/POOL/BUFPTR/SEEKF/
+GUARD/AAPATH/REMAIN/VECTOR taps, TEMPSTAGE/TEMPDMA/TEMPPROG - all to be removed before any PR.
+
+## cont.419 — the 0xAA IS correctly placed; [$79e6] is vestigial; [$7abe] is legitimately cleared. All three $7EBE exits closed by CORRECT state.
+
+Continuing the careful step-by-step.  Everything below is a write tap or a model-side read.
+
+THE 0xAA IS EXACTLY WHERE THE FIRMWARE INTENDS IT - retracting cont.398c AND my own restatements.
+Measured at the write:
+    7963562.8us [766e] pos=26 <= aa  pc=00706c | [7954]=0001 node=6e60 n+1=10 [7956]=0008 [7abc]=0008
+    UIB+00..0f: 02 10 80 00 07 07 01 08 02 01 00 01 00 00 00 00
+    ledger[0..31]: c0 | ff x8 | fe x17 | AA | c0 c0 c0 c0
+  - UIB+$0 = 02 = heads, UIB+$1 = $10 = 16 = SECTORS PER TRACK.  So $7030's `move.b ($1,A6),D1` is
+    reading a track dimension, NOT a start sector.  (I briefly suspected it was a mis-read start
+    sector - wrong, retracted.)
+  - The ledger layout is deliberate: $FF marks the 8 REQUESTED sectors (pos 1-8), $FE marks the rest
+    of the track (9-25), $AA closes the window at 26.  Arithmetic: UIB+$1 +1 -[$7954] -[$7956] =
+    16+1-1-8 = 8 entries beyond the wanted run.
+  - Only ONE 0xAA write occurs in the whole read and it is never overwritten.  cont.398c's "the
+    captures overwrite it" is WRONG.
+  - [$7954] is a STATIC window base: exactly two writers ($102A, $9462), no increment/decrement
+    anywhere.  It is the build base, not a moving drain pointer.  ($102A is in the same routine as
+    $1030, which sets the [$79a2] countdown - i.e. the per-operation setup routine.)
+
+THE SCAN, decoded and measured.  A0 = $7654 (ledger base, set at $7D0A); D0 is a WALKING index:
+    007e6c: addq.w #1, D0
+    007e6e: cmpi.b #$aa,(A0,D0.w) / beq $7e8a   ; $AA -> exit WITHOUT writing [$7430]
+    007e76: cmpi.b #$ff,(A0,D0.w) / beq $7e86   ; $FF -> exit, record position
+    007e7e: cmpi.b #$fe,(A0,D0.w) / bne $7e6c   ; $FE -> falls through and exits; else keep scanning
+It halts on $AA, $FF or $FE and walks past $C0.  Measured (write tap on [$7430]): halt pos = 10 -
+[$7956], stepping 2,3,4,5,6,7,8 as the count drains 8->2.  Each capture converts one $FF to $C0.
+INSTRUMENT CAVEAT: the $AA path skips the [$7430] write, so a [$7430] tap is BLIND to exactly the
+case of interest - only 7 scans are visible for 8 captures.  I briefly concluded from that truncation
+that the scan never reaches the $AA; wrong.
+
+EXPERIMENT: forcing [$79e6]=1 (so $704E fills $C0 instead of $FE) DOES unblock the scan:
+    EXPERIMENT: 8152410.0us [741c] <= 0000 pc=007ed8   <-- reaches the count-exhausted exit, gate CLEARS
+    BASELINE:   8152358.8us [741c] <= 0001 pc=007f14   <-- never clears, just re-sets
+So removing the $FE barrier lets the scan reach pos 26, $7ED0 matches the $AA, and [$741c] clears.
+BUT the command still does not complete: DONE-843e = 0, st = 0x81, and $7D5C immediately re-sets
+[$741c]=1.  Necessary, not sufficient.
+
+[$79e6] IS VESTIGIAL - PROVEN, so the experiment above is a SHIM, not a discovery of intent:
+  - No direct writer anywhere; the only two references are the tests at $704E and $72CE.
+  - ROM byte-search: "$79E6" as a value occurs exactly TWICE - both are the extension words of those
+    two tst.w instructions.  "$3CF3" (= $79E6>>1, the word-address form the gate array would need on
+    D000/D800) occurs ZERO times.
+  - So no ROM-resident pointer holds it and the gate array is never given the address in any form.
+    (Dave's standing question - "how can the gate array know or derive the address?" - is the right
+    check and should PRECEDE any "the GA must write X" hypothesis.  Applied here it kills it outright.)
+  => [$79e6] is permanently 0, so a bulk read ALWAYS gets the $FE fill, so the scan ALWAYS halts on
+     $FE, so $7ED0's $AA test can never fire for a bulk read.  That exit is closed BY DESIGN.
+
+[$7abe] IS LEGITIMATELY CLEARED - so the descriptor exit is closed by CORRECT state too:
+    7962985.8us [7abe] <= 0008  pc=00a432   ; the IOCB count parse loads 8
+    7963075.1us [7abe] <= 0000  pc=00738c   ; op58's CLAMP clears it, 90us later
+    7963456.4us [7958] <= 0000  pc=006f62   ; op4A snapshots the now-zero value
+  $7372-$738C is the clamp's two-way exit: $7386 `sub.l D3,$7abe` keeps the REMAINDER when the request
+  spills past the track; $738C `clr.l $7abe` discards it when the request fits entirely within the
+  track.  We take $738C because 8 sectors fit on a 16-sector track.  So [$7958] is not a count - it is
+  a "MORE WORK FOLLOWS" descriptor, and zero correctly means "this is the only chunk".
+
+WHERE THIS LEAVES THE COUNT-EXHAUSTED FORK ($7EC4-$7ED6).  All three exits are closed, and each by
+state that is now demonstrably CORRECT:
+    tst.w $796a  -> needs 0        it is 1      (confirmed authentic, cont.398b - bulk/read-ahead class)
+    tst.l $7958  -> needs non-zero it is 0      (correct: no residual work beyond this track)
+    cmpi.b #$aa  -> needs $AA      it is $FE    (correct: the $FE fill is unconditional for a bulk read)
+That combination cannot be what a healthy single-track bulk read does - so a PREMISE is still wrong,
+exactly as the $8A88 "decoy" turned out to be.  The most likely candidate is that $7EBE is not the
+read's completion fork at all (it is reached from the $7BA6 routine, the IRQ5-setup chain), and the
+real terminal lies elsewhere.  DO NOT paper over this with a shim: forcing any of the three produces
+a false completion, as the [$79e6] experiment demonstrated.
+
+STATE unchanged: PHYSICAL_TIMING=true, PER_ADDRESS_MARK=true, 8 sectors captured with correct payload,
+[$7956] drains 8->0, st=0x81, DONE-843e=0.  The [$79e6] experiment has been REMOVED from the source.
+storager.cpp still carries the TEMP (STRIP) probe set.  Nothing committed.

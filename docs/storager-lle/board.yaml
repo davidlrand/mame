@@ -8,7 +8,7 @@
 #           "?" = provisional / open frontier.
 
 meta:
-  as_of: "cont.405 (2026-07-24)"
+  as_of: "cont.414 (2026-07-25)"
   sources: ["DESIGN.md (append-only log)", "siemens/disasm/storager/storager_v260.asm (commented disasm)", "storager.cpp (the clean-rebuild model)", "storager_3030.webp (Plamen's board photo)"]
   synthesis_note: >
     The cont.353 clean rebuild re-authored storager.cpp from the gate-array spec with ALL HLE
@@ -36,19 +36,25 @@ board:
     (3) Detection is capture (cont.211) - an address-mark IRQ arrives with the just-passed field
     bytes already in the capture cells; the model stages the record before raising the IRQ.
     (4) DMA HOLDS THE CPU (DTACK, cont.405) - a bus-master transfer takes the local bus and stalls
-    the 68000 for its duration; the model MUST hold the CPU (spin_until_time) during every DMA or
-    the CPU races ahead and desyncs the firmware's per-transfer state machine. Applies to reads,
-    writes, format, and the HD path.
+    the 68000 for its duration; the model MUST hold the CPU during every DMA or it races ahead and
+    desyncs the firmware's per-transfer state machine. Model it as a LEVEL (cont.406): suspend() at
+    the kickoff, resume() at the transfer end - NOT a fixed interval, which other code on a five-CPU
+    machine can pre-empt; the duration then falls out of the byte count. Applies to reads, writes,
+    format, and the HD path.
+    (5) LOAD THEN RUN (cont.407) - op18 loads a field program (C800 descriptor pushes + the E000 step
+    block) and NOTHING executes until the load completes. Delivering a record mid-load captures it
+    against a half-built program.
 
 address_map:
   # 68000 view; on-board I/O is also reached sign-extended abs.w (mirrors across A16-A23).
   - {range: "0x000000-0x00FFFF", device: ROM, role: "two firmware ROMs (storager_v260), mirror 0xFF0000", conf: V}
-  - {range: "0x004000-0x007FFF", device: SRAM, role: "local buffer + node/ledger work area", conf: V}
+  - {range: "0x004000-0x007FFF", device: SRAM, role: "local buffer + node/ledger work area. 2x MB8464A-80 = 16KB, CONFIRMED by the reset SSP ($7D96, stack grows down) and by every observed variable (node $71F0, ledger $7654, chunks $4000-$43FF, capture cells $7DAC, dual-port $7E00-$7FFF)", conf: V}
   - {range: "0x008000-0x008007", device: "2x i8253 PIT", role: "timers (NOT the gate array); #0 high byte, #1 low byte", conf: V}
   - {range: "0x00C000-0x00C7FF", device: VGC7219, role: "Multibus host-address 24-bit up-counter (one's-complement preset)", conf: V}
-  - {range: "0x00C800-0x00C9FF", device: VGC7219, role: "field-boundary offset file (16 entries); cell 0 = live SRAM chunk word ptr", conf: V}
+  - {range: "0x00C800-0x00C9FF", device: VGC7219, role: "field-program WRITE PORTS (not a file - see registers.C800); op18 uses only offsets $00/$02/$7E. Cell 0 doubles as the live SRAM chunk word ptr at runtime", conf: V}
+  - {addr: "0x006000-0x006001", device: "(bus cycle only)", role: "op18's per-descriptor PUSH STROBE: a dummy byte read whose UDS/LDS choice carries a one-bit selector. The memory is zeroed SRAM and the data is discarded - only the access matters", conf: V}
   - {addr: "0x00D000", device: VGC7219, role: "local SRAM word-address latch (the DMA source/dest local address)", conf: V}
-  - {addr: "0x00D800", device: VGC7219, role: "parameter/status template word-address latch ($7DAC>>1) - local, NOT host-high", conf: V}
+  - {addr: "0x00D800", device: VGC7219, role: "CAPTURE-CELL ADDRESS LATCH - where the gate array deposits the recovered ID field. Programmed at $9F06 and re-written per record ($8990/$801C); live value $3ED6 = $7DAC>>1. Local, NOT host-high (see registers.capture_record)", conf: V}
   - {range: "0x00E000-0x00E01F", device: VGC7219, role: "channel/ENDEC command window (16-word command block + status)", conf: V}
   - {range: "0x00E800-0x00E807", device: VGC7219, role: "control registers (kickoff / arm / direction)", conf: V}
   - {addr: "0x00F000", device: VGC7219, role: "drive/aux status word (sampled lines + timer OUT)", conf: V}
@@ -63,18 +69,70 @@ host_address_note: >
 pit:
   ctr0: {ctrl: "0x26", mode: 3, count: "0xFF00", role: "system tick (IRQ1, ~26ms)", conf: V}
   ctr1: {ctrl: "0x7A", mode: 5, role: "SEEK-SETTLE one-shot; NOT a DMA transfer counter (cont.156-158). The read's transfer count is [$7956] (firmware), decremented at $70a0.", conf: V}
-  ctr2: {ctrl: "0x9A", mode: 5, role: "rotational/sector one-shot", conf: V}
+  ctr2:
+    ctrl: "0x9A"
+    mode: 5
+    role: >
+      PIT1 ctr2 = the ROTATIONAL/SECTOR one-shot, and (cont.414) the LAST GATE on the read. op28 arms it
+      at $684C immediately after finding the head on-track, then sets [$798e]=1 meaning "wait for this
+      one-shot"; op42 waits for it. Control is written at op28/$684C and op42/$6CC2; the COUNT comes
+      from UIB+$13 at $6CD2 ($8005 = odd byte = pit1 register 2), gated on [$796e]==$FFF0.
+    model_gap: "timer2_out() is an EMPTY STUB - ctr2's OUT goes nowhere, so the wait can never end. Also m_timer_out (F000 bit11, 'i8253 timer OUT') is fed from ctr0, the system tick, which is probably the wrong counter."
+    open: "mode 5 is hardware-triggered so it needs a GATE edge (the model drives no gate on pit1 ctr2); and whether OUT lands on F000 bit11 or raises an interrupt is undetermined"
+    conf: V
+  bus_note: "the two PITs sit on alternate bytes of the 16-bit bus (pit0 = even/high byte, pit1 = odd/low byte), so a word write would program BOTH. This firmware never does one - measured zero mask=ffff writes; it always accesses them as separate bytes."
 
 registers:
+  C800:
+    role: >
+      NOT a 16-entry file - a set of WRITE PORTS into the gate array's field sequencer.  op18 pushes 16
+      descriptors through only THREE offsets ($00 -> cell 0 x6, $02 -> cell 1 x2, $7E -> cell $3F x8),
+      writing the same cell repeatedly with different values.  As storage that is a no-op (last write
+      wins); as a queue it is a program.  Each push is framed: E800 write-enable ($2ABD) -> C800 write
+      -> $6000 strobe -> E800 idle ($2A5D).
+    op18_descriptors: >
+      (offset, value, selector): (00,17,1) (00,1c,1) (00,1d,0) (00,1d,1) (00,3f,0) (00,3f,1)
+      (02,01,1) (02,1f,1) then (7e,3f,1) x8.  Values look like field/gap lengths (17=23, 1c=28,
+      1d=29, 1f=31, 3f=63).  1d/1d and 3f/3f appear as sel=0 then sel=1 PAIRS.
+    runtime_use: "cell 0 is ALSO the live chunk pointer: $8018 writes C800[0]=[$741e] (arming the NEXT field) and $899A re-arms it between the two verifies"
+    model_gap: "the model backs C800 with a 256-entry array, so it cannot represent the push sequence and sees only the last value written to each cell"
+    conf: V
+  capture_record:
+    role: >
+      The record the gate array deposits at the D800-latched address on every address mark.  It is the
+      RAW RECOVERED BYTE STREAM, so its layout is DENSITY-DEPENDENT - which is the proof that the
+      deposit is raw rather than normalised, since the firmware's own readers disagree about where the
+      address mark lives.
+    layout:
+      MFM: "+0,+1,+2 = $A1 sync preamble | +3 = $FE (IDAM) | +4[,+5] = cylinder | then H, R, N, CRC"
+      FM:  "+0 = $FE (IDAM) | +1 = C | +2 = H | +3 = R | +4 = N | then CRC  (FM has NO $A1 sync bytes)"
+    readers:
+      "$9884 (op44)": "THE sector-select compare. A3 = [$7a66]; combines bytes 0-2 to $A1 (gated on UIB+$12 bit2), requires $FE at byte 3, reads the cylinder from byte 4 (16-bit from 4+5 when UIB+$12 bit1 set) and compares against [$7438] = target cylinder; mismatch -> error $2012."
+      "$89F2 (IRQ6)": "NOT a header compare - an OR-of-bytes-0..2==$A1 / $FE at 3 / $FF at 4 marker test, counted into [$7a0c]."
+      "$7C7A (FM)":  "cmpi.b #$fe,$7dac - $FE at byte 0, no preamble."
+    uib_12_bits: "bit1 = 16-bit cylinder (also gates $89F2's check); bit2 = preamble present (MFM)"
+    model: "advance_read deposits at `m_d800 << 1` (the COMMANDED address, not a hardcoded $7DAC) and emits the three $A1 bytes when the density is MFM. On FM this is a no-op by construction."
+    conf: V
   E000:
-    role: "channel/ENDEC command window - a 16-word command block (E000..E01E) op18 loads from a class-selected ROM template, paired 1:1 with the C800 boundary file"
+    role: "channel/ENDEC command window - a 16-word command block (E000..E01E, nothing above) that op18 builds from a per-unit param block in RAM at [$7938]=$6E84, i.e. FROM THE UIB ($6E60), not from a ROM template"
+    block: "0a6d 0829 0033 0a6d | 0a09 x5 | 0809 0829 083b | 023f x4; word[0] (0a6d) is also stored to [$7a48]. Words look like {flags, byte-count} steps; the variant paths ori #$200 (bit9) and andi #$ffdf (bit5) per word"
+    variants: "three, selected by node+$20 bit9 and [$71bc][0]==$99 ($3110 plain copy / $3118 / $3146); the read takes the plain copy"
     engagement: "the read window opens on E000 bit11 (rising) - the firmware's per-record ENGAGEMENT write ($a6d-class); this is the per-command arm, NOT E802 bit15"
+    load_then_run: >
+      CRITICAL (cont.407): op18's word[0] is $0A6D, which ALSO has bit11 - so a naive bit11 trigger
+      opens the window on the first word of the block LOAD and delivers records against a half-built
+      program.  The program starts on the write that COMPLETES the block (E01E); a bit11 write is the
+      per-record re-engagement only once the block is loaded.  It must be the load-complete edge and
+      not a later engagement write, because the engagement cycle is issued from the record ISR - it
+      cannot produce the first record.
+    runtime_cycle: "per record the firmware writes THREE words: 022f ($891A) -> 023f ($8928) -> 0a6d ($8936). 0a6d = op18's word[0], re-issuing the field program's first command. The model decodes 0x22f/0x23f but NOT 0x0a6d"
     E01E: "record-status latch; reading it is the firmware's per-record ACK (clears the latch so the GA delivers the next record). Model returns bit4 set + clears its rec latch; do NOT drop held marks here."
     conf: V
   E800:
     role: "control / DMA kickoff"
     bits:
       "5-7": {meaning: "op-family select (from the $63E PROM table)", conf: V}
+      "7": {meaning: "FIELD-PROGRAM LOAD-ENABLE (cont.407): op18 frames every C800 descriptor push with `ori #$80` (D2) and restores the raw shadow (D3) after; $79F6's resting $0C1F has bit7 clear. A C800 write with bit7 asserted is a PUSH onto the program stack; without it it is an ordinary register write (the per-record chunk arm through cell 0). Validated on live stimulus - it captures exactly the 16 expected descriptors.", conf: V}
       "6": {meaning: "DMA enable / active", conf: V}
       "9": {meaning: "PIT ctr0 gate", conf: V}
       "10-11": {meaning: "per-unit ENDEC config (FM/MFM, latched from UIB+0x11 bits6-7)", conf: V}
@@ -90,15 +148,33 @@ registers:
       "6": {meaning: "IRQ2 doorbell ack (toggled low on entry)", conf: V}
       "11": {meaning: "per-record capture re-arm (the ori #$800 each read ISR issues; rising edge primes the next record)", conf: V}
       "15": {meaning: "capture-arm held while a mark passes (mark-circular; NOT the per-command arm - gating on it deadlocks)", conf: V}
-  E804: {role: "sector/head + drive-select (bit4 motor/write-current; bit11 write-precomp)", conf: R}
+  E804:
+    role: "drive / head select, LATCHED in the gate array (cont.410)"
+    build: >
+      op24 ($6576-$65A0) builds it from the UIB: D5 = UIB+$D4, cleared if negative, lsl #8, NOT, then
+      the low byte replaced by UIB+$DC; written twice ($658E, then $65A0 merging the head nibble back
+      over the control byte). op28's seek engine drives stepping through it.
+    fields:
+      "8-11": "HEAD, ONE'S-COMPLEMENTED -> head = ~(E804>>8) & $0F. The observed $BF78 = head 0, correct for the cyl0 label."
+      "0-7":  "drive select + control (bit4 motor/write-current, bit11 write-precomp). The unit-select encoding is NOT yet decoded - needed for HD boot."
+    model: "m_sel_head / m_sel_drive are latched as gate-array state; the read takes its side from m_sel_head. This REPLACED the old snoop of the firmware's [$7436] - the gate array has no visibility into firmware RAM."
+    conf: V
   E806: {role: "target cylinder for seek/verify", conf: R}
   E807: {role: "channel-op command byte", conf: R}
   F000:
     role: "drive / aux status word (sampled lines + timer OUT)"
+    decoded_from: >
+      op24 ($651C) is the only F000 reader before a transfer starts, and it reads it four times.
+      $6772 composes the per-unit status byte: [$794e] = ~F000 & table[$22E+unit] - a CLEAR F000 bit
+      becomes a SET fault bit. Table @$22E = 00 06 00 27 00 3f 00 2d ef ff cf ef 2f ff 0f ef (a
+      different mask per device class: floppy / ESDI / tape). "Unit present and usable" = both fault
+      bits clear AND bit5 set, under that unit's class mask. (cont.410 - the basis for HD-boot probing.)
     bits:
+      "0": {meaning: "DRIVE FAULT - $663C btst #0; if SET op24 aborts with error $10", conf: V}
       "1": {meaning: "seek/settle active (also ESDI handshake strobe)", conf: V}
-      "4": {meaning: "index pulse (also ESDI serial response-data bit)", conf: V}
-      "5": {meaning: "drive ready", conf: V}
+      "3": {meaning: "DRIVE FAULT - $65AE btst #3; if SET op24 aborts with error $1B", conf: V}
+      "4": {meaning: "index pulse ($6746 btst #4; also ESDI serial response-data bit)", conf: V}
+      "5": {meaning: "UNIT READY - $66D6 masks F000 and compares == $20 (ready, no other status bits)", conf: V}
       "8-9": {meaning: "gate-array op-status (busy/fault); polled by op42 Branch B (seek/status cmds), NOT on the read path - the two long-unmodeled bits", conf: R}
       "11": {meaning: "i8253 timer OUT", conf: V}
       "13": {meaning: "track 0", conf: V}
@@ -121,7 +197,13 @@ interrupts:
       sector. An odd count per sector net-flips parity and desyncs the routing.
     forks:
       "$298C (IRQ6)": "bchg; old 0 -> $89F2 (verify); old 1 -> $92B4 (stake)"
-      "$29C0 (IRQ5)": "bchg; old 1 -> $8018 (DONE: stamp $74C4+2=0x40 READY + stake ledger); old 0 -> $7BA8 (SETUP: arm chunk, 0xf0 pending)"
+      "$29C0 (IRQ5)": "bchg; old 1 -> $8018 (DONE: stamp $74C4+2=0x40 READY + stake ledger); old 0 -> $7BA8 (SETUP)"
+    measured_cadence: "cont.406, opcode taps on AS_OPCODES: verify(alt=1), verify(alt=0), setup(alt=1), done(alt=0) - four handler entries per sector, parity returns to start. Confirmed for all 8 sectors."
+    pointer_ownership: >
+      MEASURED (cont.406), and the reverse of the earlier reading: $7BA8 (setup) ADVANCES [$741e]
+      (2000 -> 2040 -> ...); $8018 (done) WRITES C800[0]=[$741e], arming the chunk for the NEXT field.
+      So C800[0] during field k is the arm written at field k-1's done.  $899A re-arms it between the
+      two verifies.
     conf: V
 
 host_interface:
@@ -141,12 +223,21 @@ host_interface:
 read_model:   # cont.404-405 - the counted, op18-programmed read (replaces the HLE flow)
   shape: >
     The read is a COUNTED, finite gate-array operation: read EXACTLY the IOCB sectors ([$7abc], 8
-    for the label), then terminate. NOT free-running. op18 arms the GA (C800 field bit-positions +
-    E000 command block from a class ROM template); op42 waits; op46 field-executes.
+    for the label), then terminate. NOT free-running. op18 LOADS the field program (C800 descriptor
+    pushes + the E000 step block, built from the UIB); op42 waits; op46 field-executes.
   micro_op_ladder: "byte string at $62FC built as ..16,18,42,46,00; dispatched via table[$192+opcode] (word offsets): op18=$308C (arm), op42=$6BC2 (wait), op46=$8AC8, op16=$2BD6 (template build)"
+  op18_load: >
+    op18 does NOT fill a register file - it pushes a 16-descriptor stream through three C800 write
+    ports, each push framed by the E800 write-enable/idle pair and accompanied by a one-bit selector
+    expressed as the UDS/LDS choice of a dummy read at $6000/$6001, then block-writes the 16-word
+    E000 field program.  SPECULATIVE (cont.406) but strongly shaped: this is a MICRO-SEQUENCE LOAD
+    that the gate array RUNS for the read before op42 waits on it (op18=load, op42=wait, op46=execute).
+    Falsifiable: the EIGHT pushes to cell $3F should equal the EIGHT commanded sectors - if the count
+    tracks the IOCB, the model can take the sector count from the gate-array programming instead of
+    snooping [$7abc].
   per_sector_interrupts:
     cadence: "IRQ6 (ID address mark) then TWO IRQ5 (data-field-armed, data-field-done) = an EVEN 4-event alternator cycle"
-    routing: "IRQ6 -> $89F2 verify (C/H/R staged at $7DAC where the POSPTR verify reads it); IRQ5#1 -> $7BA8 setup (arms the chunk C800[0]=[$741e], writes 0xf0 pending to the ledger); IRQ5#2 -> $8018 done (stamps $74C4[slot]+2=0x40 READY, stakes the ledger, advances the linear buffer)"
+    routing: "IRQ6 -> $89F2 verify (C/H/R staged at $7DAC where the POSPTR verify reads it); IRQ5#1 -> $7BA8 setup (ADVANCES [$741e]); IRQ5#2 -> $8018 done (stamps $74C4[slot]+2=0x40 READY, stakes the ledger, and WRITES C800[0]=[$741e] to arm the next field)"
     model_note: "the model delivers IRQ6 + 2xIRQ5 per sector (was 1 IRQ5 - dropping the 2nd dead-ended every sector at $7BA8 setup so $8018 never ran). = 8xIRQ6 + 16xIRQ5 for an 8-sector read."
   ledger:
     base: "$7654; the drain window is $7654+[$7954] (=+1), slots 1..8"
@@ -154,7 +245,7 @@ read_model:   # cont.404-405 - the counted, op18-programmed read (replaces the H
     staked_slots: "[$7424] (READY slot) advances 0..7, [$7428] (ledger slot) advances 1..8 - LINEAR, all 8 (the old alternating-slot symptom is cured by the 2-IRQ5 cadence)"
   data_buffer:
     layout: "the firmware builds a LINEAR 1024-byte buffer $4000-$43FF; chunk ptr [$741e] advances +0x40 words (+128 bytes) per sector ($4000, $4080, ...)"
-    model_stages: "each sector's data to $4000 + index*sector_len (mirrors the linear buffer; the 'fixed $4000' reading was an artifact of only 2 transfers firing)"
+    model_stages: "into the COMMANDED chunk C800[0]<<1 (cont.406), never a self-computed address - computing 0x4000+index*len staged each sector a record ahead of the firmware's pointer, so its DMA sourced the previous chunk, $4000 was sent twice and $4380 (HDR1) was never transferred at all"
   count_in_native_sectors: "the IOCB count is in NATIVE SECTORS (128B FM / 256B MFM / 1024B ESDI-HD), NOT 512-byte blocks; the label read = 8 native sectors on cyl0 head0 (R7=VOL1SINIX0, R8=HDR1). No track boundary, no head switch. (cont.260, media-verified.)"
   conf: V
 
@@ -162,11 +253,20 @@ transfer:   # cont.405 - the firmware-commanded per-sector SRAM->host DMA
   command: "the firmware commands each sector's DMA via the channel node ($7442) descriptor: C000 = host dest (channel+6, advancing +0x80), D000 = local source (advancing $4000/$4080/...), E800 bit12 kickoff; setup at $3cd4/$3d08"
   kickoff: "the kickoff code ($3d42 set E800 bit12, $3d46 write E800) RTS's IMMEDIATELY ($3d4c) - no inline status poll, no DTACK-blocking access in the CODE"
   dtack: >
-    BUT the gate array bus-masters the DMA and holds the 68000 off the bus for its duration. The
-    model MUST hold the CPU (m_cpu->spin_until_time, ~40us) during the data transfer. WITHOUT the
-    hold the CPU races ahead and the descriptor drain launches only 2 of 8 sectors; WITH it all 8
-    launch, D000 advances $4000..$4300, [$74b4] (the descriptor queue) drains to 0. (cont.405 - the
-    DTACK breakthrough.)
+    BUT the gate array bus-masters the DMA and holds the 68000 off the bus for its duration. The model
+    MUST hold the CPU. Model it as the LEVEL it is (cont.406): suspend(SUSPEND_REASON_HALT) at the
+    kickoff, resume() at the transfer end with the IRQ4 - NOT a fixed timeout, which other code on a
+    five-CPU machine can pre-empt. Duration falls out of the byte count (~600ns/Multibus word: 128B
+    ~38us, and the 1024B ESDI sector scales by itself). WITHOUT the hold the CPU races ahead and the
+    descriptor drain launches only 2 of 8 sectors; WITH it all 8 launch, D000 advances $4000..$4300,
+    [$74b4] (the descriptor queue) drains to 0. (cont.405 discovery, cont.406 as a level.)
+  byte_order: >
+    Control blocks (node -> host IOPB) byte-swap each 16-bit word - that is how the 68000's BE low byte
+    node+3 reaches the host's IOPB+2, and it is verified (it is how the host ever sees 0x81). DATA
+    fields must NOT swap: the gate array presents the recovered byte stream to the bus, and the label
+    buffer base is ODD (0x0FC0DD), which no word-boundary swap could serve. Swapping data delivers
+    "OV1LISIN0X" instead of "VOL1SINIX0" (cont.406, measured both ways). The real board almost certainly
+    selects this from a swap-control bit in the IOCB/UIB - NOT decoded; the model keys it on field type.
   scheduler: "$3abc queues a launch (sets channel+$20 pending, [$7a6c]++, busy-lock [$7a1a]); IRQ4 $3bfe clears the lock and re-dispatches the next pending channel via $3afe->$3cd4"
   conf: V
 
@@ -183,7 +283,82 @@ completion:   # the op42 wait -> terminate -> node+$26=0x0C chain (the remaining
   conf: V
 
 open_frontier:
-  - id: op42-return0-transfer-phase   # cont.405 - THE remaining gate
+  - id: first-field-has-no-chunk   # cont.406, narrowed cont.407
+    state: >
+      R=01 is dropped. At the first data field there has been no prior $8018 done, and [$741e] is still
+      0 (the first $7BA8 setup is what initialises it to $2000), so every arm writes 0 and the sector
+      has no destination. Host slots end up [R02,R02,R03..R08]; the duplicate at the head is the
+      FIRMWARE's own descriptor sourcing an unarmed chunk, not a model artifact.
+      NARROWED (cont.407): this is NOT the load-vs-run ordering. Deferring the window to load-complete
+      is now implemented and verified - no record is delivered mid-load - and R=01 is UNCHANGED. The
+      two are independent. C800[0] for field k is written at field k-1's done, and for k=0 there is no
+      k-1, so the first field's destination must come from op18 itself.
+    next: >
+      Find what op18 leaves as the initial chunk. Candidates: one of the descriptor pushes (the 8
+      port-$3F pushes, or the cell-0 sequence whose last value is $3F), or a register the model does
+      not decode. Test the push-count prediction: drive a read with a sector count other than 8 and
+      watch the port-$3F push count - all nine observed loads are identical 8-sector label reads, so
+      it is untested, not falsified.
+    conf: "?"
+  - id: transfer-launch-path-for-the-read   # cont.408
+    state: >
+      op $3E ($8F74) is the TRANSFER-LAUNCH micro-op: it forks on node+$20 bit11 (set -> build the $7442
+      staging-channel descriptor + call the $3ABC scheduler at $8FEA; clear -> a local memory fill).
+      node+$20 = $8C27 = the READ's param word from the $92 dispatch table; bit11 IS set, bit9 clear,
+      bit14 clear. BUT op$3E is dispatched ZERO times and is NOT in cmd=95's ladder - so the read's
+      transfer must be launched from the interrupt path, not a micro-op. The descriptor IS queued
+      ([$74b4]=74c4 after sector 1's done) but nothing dispatches it: [$743a] stays 748a, never $7442,
+      and DESCGO ($4102) never runs.
+    next: "identify which of the $3ABC callers ($3DAC/$3F36/$3FB2/$44A2/$496E/$8FEA/$9E86) is meant to launch the read's per-sector transfer, and what gates it. Compare only between HEALTHY runs - check stages/program-load counters first (cont.408)."
+    conf: "?"
+  - id: dma-engine-park-kick   # cont.409 - the synchronisation method, DECODED
+    state: >
+      The DMA engine is a self-clocking IRQ4 chain (launch -> DMA -> IRQ4 -> callback $3F68 -> $3FD0 ->
+      $3FF2 -> $3E3A -> queue walk -> $3F36 -> launch next). Nothing polls the gate array for transfer
+      completion: the completion signal is IRQ4 and the "wait" is the busy lock [$7a1a]. When the queue
+      empties the engine PARKS ($3DE2 bset #0,$7a30 = idle) and is restarted by an atomic test-and-clear
+      KICK at the tail of the done handler ($833C bclr #0,$7a30 / beq / bsr $3dbc). The only busy-wait
+      in the path is $8FF4, on the op$3E path.
+      DEAD KICK (cont.409): [$7a30] is written by two DIFFERENT-SIZED accesses. 68000 bit ops on memory
+      are always BYTE-sized, so bset/bclr #0 act on the byte at $7a30 (the HIGH byte of the word), while
+      $70D4 `move.w #$1,$7a30` is a WORD write that zeroes that high byte. Once $70D4 runs, every $833C
+      kick finds the flag already clear and the engine can never restart.
+      TRIGGER (cont.409a): $70A0 runs once in BOTH timing models but takes a different branch - at true
+      speed it runs BEFORE any sector completes (count still 8 -> $70D4 -> clobber); in the arm-driven
+      model it runs at the END (count 0 -> $70A6, no clobber). The firmware is not running ahead of the
+      hardware: at true speed it is given idle time it never had, and in that gap it runs a path that
+      disables its own DMA restart.
+    next: "find what reaches $70A0 during the op42 wait gap, and whether the drive stimulus the model does not present during that gap (index/rotation) is what the firmware is actually waiting on there"
+    conf: V
+  - id: physical-record-timing   # cont.408 - attempted and reverted
+    state: >
+      Records are delivered on a 200us model pump; the disk's real rate is 12.5ms/sector (FM 16x128B at
+      300rpm), so the run is ~60x too fast, and the first record was being delivered INSIDE op18's block
+      copy (before its rts, so op42 was never entered). Making the timing physical kept the handler
+      cadence perfect but killed the transfers, and the reconstructions used to diagnose that were in a
+      runaway retry loop - so the cause is NOT established. Reverted.
+    next: "re-introduce physical record timing as its own isolated, repeat-verified step; watch aggregate health counters (stages / program loads), not just the DMA count"
+    conf: "?"
+  - id: op18-selector-bit-unmodelled   # cont.406
+    state: "each op18 descriptor carries a one-bit selector on the UDS/LDS choice of a dummy $6000/$6001 read; the model backs $6000 with plain RAM and drops it. Meaning unknown - 1d/1d and 3f/3f pair as sel=0 then sel=1, suggesting it picks between two banks/halves."
+    next: "model $6000/$6001 as a gate-array push strobe and see what the selector distinguishes; correlate against the E000 step words"
+    conf: "?"
+  - id: data-swap-control-bit   # cont.406
+    state: "control blocks swap bytes, data must not; the model keys on field type as a stand-in"
+    next: "find the swap-control bit in the IOCB/UIB that the real gate array uses"
+    conf: "?"
+  - id: op42-gate-is-798e   # cont.413 - REPLACES the op42-return0 entry below
+    state: >
+      op42's master control is [$798e]: <0 -> DONE at once ($6BC2 blt $6CDA); >0 -> the bit7/settle
+      path; ==0 -> falls to $6C28 where (A1)=node+$18 (the ERROR field, not a status word) is zero, so
+      it returns $FE (WAIT) forever. Measured [$798e]=0000, and node+$12=$40 so bit7 is clear too.
+      [$798e] is the SEEK-COMPLETION flag: op28 (the seek engine) either sets it to 1 immediately at
+      $68FA (no settle needed) or clears it at $6904 and schedules a deferred write of 1 after
+      (steps * UIB+$19)/10 + 1 ticks, pending cell [$7990]. Sibling of the spin-up settle [$7a36]
+      (armed in op24 from UIB+$14, 6*10 ticks = 1.55s, VERIFIED firing correctly).
+    next: "does op28 reach $68EA during the read at all? Its only traced gate-array access is one E804 write at $6B20, consistent with the seek short-circuiting on an on-track drive - in which case [$798e] is never written and simply retains its power-on zero. Tap $68EA/$68FA/$6904 and the [$7990] pending cell."
+    conf: V
+  - id: op42-return0-transfer-phase   # cont.405 - SUPERSEDED by op42-gate-is-798e
     state: >
       With the DTACK hold all 8 sectors transfer, [$74b4] drains, [$7a64]=1 - but the read stays at
       0x81. The completion is gated on op42 ($6BC2) returning 0, which needs the status word (A1)-bit7
@@ -206,6 +381,15 @@ open_frontier:
     conf: "?"
 
 superseded:   # readings the log overturned; recorded so they are not re-introduced
+  - {claim: "op18 loads the E000 block from a class-selected ROM template", corrected_by: "cont.406 - the param block is in RAM at [$7938]=$6E84, immediately after the UIB at $6E60. op18's program is BUILT PER-UNIT FROM THE UIB, so the field program is a function of the geometry the CPUAP supplied."}
+  - {claim: "C800 is a 16-entry field-boundary file paired 1:1 with the E000 block", corrected_by: "cont.406 - op18 pushes 16 descriptors through only THREE offsets, writing the same cell repeatedly (cell 0 six times). It is a set of write PORTS into a sequencer, not storage."}
+  - {claim: "the third byte of each op18 triple indexes a table at $6000", corrected_by: "cont.406 - it is only ever 0 or 1. $6000 is zeroed SRAM (the $073A boot clear) and the read data is discarded; the payload is WHICH BYTE STROBE is asserted."}
+  - {claim: "$7BA8 (setup) arms the chunk C800[0]=[$741e]; $8018 (done) advances the buffer", corrected_by: "cont.406 measurement - exactly backwards. $7BA8 ADVANCES [$741e]; $8018 WRITES C800[0]."}
+  - {claim: "the model stages each sector to 0x4000 + index*sector_len", corrected_by: "cont.406 - that is a record ahead of the firmware's pointer; stage into the COMMANDED chunk C800[0]<<1 or the last sector is never transferred."}
+  - {claim: "every local->host DMA byte-swaps each 16-bit word", corrected_by: "cont.406 - true for control blocks, WRONG for data fields (host reads OV1LISIN0X instead of VOL1SINIX0; the buffer base is odd)."}
+  - {claim: "the model delivers only 3 interrupts per sector so the alternator parity must net-flip", corrected_by: "cont.406 opcode taps - the firmware enters FOUR handlers per sector (verify, verify, setup, done) and parity does return to start. The objection is withdrawn."}
+  - {claim: "op18's eight port-$3F pushes are the eight commanded sectors", corrected_by: "cont.408 experiment - forcing the IOCB count 8->4 leaves the descriptor stream BYTE-IDENTICAL (still 8 pushes) while the records/DMAs drop to 4. op18's program describes the track FORMAT (built from the UIB), not the transfer length."}
+  - {claim: "the 8/8 transfers depend on the first record being delivered before op18's rts", corrected_by: "cont.408 - retracted. Drawn from a single bisect run; the follow-up A/B configurations were in a runaway retry loop (65799 program loads vs 9), so the comparison was void. The cause of the 0-DMA runs under physical timing is NOT established."}
   - {claim: "VGC7219 fronts a 74LS1811 ENDEC + 74LS1812 SERDES", corrected_by: "cont.405 (board photo) - board has 74LS1801/1802 ENDEC (data separation ONLY); the VGC7219 itself does SERDES/CRC/DMA (AM2147 = its bit buffer). No separate SERDES part."}
   - {claim: "cmd 0x95 is NEVER DISPATCHED (intake $0BF2/$0D54/$0DD6 drops it)", corrected_by: "cont.353 clean rebuild - with the HLE short-circuit removed the read DOES dispatch, arm (op18), capture, and (cont.405) transfer all 8 sectors. That root was an HLE-era artifact."}
   - {claim: "the read completes via a bulk-descriptor DESCGO stream / NATLAYOUT / flux->host short-circuit (s_desc)", corrected_by: "cont.353 - all HLE; retired. The firmware commands per-sector SRAM->host DMAs it bus-masters itself."}
@@ -216,3 +400,55 @@ superseded:   # readings the log overturned; recorded so they are not re-introdu
   - {claim: "E802 bit15 is the per-command arm signal", corrected_by: "cont.191 - mark-circular; the E000 bit11 engagement write is the arm."}
   - {claim: "doorbell auto-fetch is 0x1C bytes", corrected_by: "cont.209 - 0x18 bytes (12 words)."}
   - {claim: "IOPB count is 512-byte blocks (label read = 32 sectors / 2 tracks)", corrected_by: "cont.260 (media-verified) - count is NATIVE SECTORS; the label read is 8 sectors on one track (head1 is unformatted 0xe5)."}
+
+program_data_split:   # cont.417 - a DEDUCTION, not an observed board fact
+  claim: >
+    In $4000-$7FFF, INSTRUCTION FETCHES see ROM while DATA accesses see RAM - i.e. the board separates
+    program and data space, presumably by decoding the 68000's FC0-FC2 function-code lines.
+  why_we_think_so: >
+    (1) RAM is definitely $4000-$7FFF (16KB, matching the 2x MB8464A): the reset SSP is $7D96 and every
+    firmware variable lives there and reads back what was written.
+    (2) Code demonstrably EXECUTES in that range - measured PCs at $683E, $6854, $6BC2, $6C8E, $7F10
+    correspond exactly to the instructions the ROM image holds there (the [$798e] writes traced at
+    $683E/$6854 are `move.w #$ffff,$798e` / `move.w #$1,$798e` in the ROM).
+    (3) There is NO ROM->RAM code relocation anywhere in the firmware. Every block copy in the ROM was
+    enumerated: 24-byte IOPB moves ($C18/$1BB2), op18's 16-word E000 block ($310E/$3126), $A374's
+    24-word descriptor build, and ONE 8KB pair at $9D34/$9D46 which is the RAM TEST's save/restore
+    (its walking patterns 5151/8080/4b4b over $74xx/$79xx appear in every trace).
+    So the code cannot have been copied to RAM; it must be fetched from ROM in place.
+  caveats: >
+    Dave has never seen a 68000 board do this, which is significant evidence against. The weakest link
+    in (2) is that those PCs come from pcbase() inside write handlers, and pcbase() was proven
+    unreliable this session (it under-reported 16 of 144 op18 pushes) - though the PC/instruction
+    correspondence is too exact for coincidence. An alternative NOT ruled out from the ROM image alone
+    is a BANK/DECODE LATCH selecting ROM or RAM in that window; none has been identified, but E800/E802
+    still have undecoded bits.
+  decisive_evidence: >
+    EXECUTION ABOVE $8000.  Measured PCs at $833C (the bclr #0,$7a30 kick), $8A88 (the [$741c] clear),
+    $992E (the ID-match accept), $9D34/$9D46 (the RAM test) and $A374 (the descriptor build) each hold,
+    in the ROM image, exactly the instruction that produced the observed effect.  In the DATA space
+    $8000-$8007 is the PIT pair and $C000+ is the gate array - so execution at those addresses is
+    IMPOSSIBLE unless instruction fetches see ROM where data cycles see I/O.  This is positive evidence
+    from live traces, not an inference from absence, and no boot overlay, bank latch or code-in-RAM
+    explanation survives it.
+  corroboration: >
+    Every ROM constant actually used sits BELOW $4000 - the $192 op-jump table, $63E op-family, $22E
+    per-unit status masks - and reads correctly straight from the ROM image.  Every structure at/above
+    $4000 is RAM-built at runtime: the $7696 chunk table, the $6E84 op18 param block, the ledger $7654,
+    the nodes.  That is the discipline a split-I&D machine forces: code high, constants low.
+    Mechanism (Dave, cont.417): FC1 alone discriminates program from data; one line into the decode PAL
+    selects "ROM only" vs "RAM + I/O".  Motivation: the board decodes only A1-A15 (a 24-bit CPU wired as
+    a 64KB machine to save decode logic and address buffers), and one FC line buys the space back.
+    Lineage is the PDP-11's split I&D; the everyday analogues are the 8051's /PSEN vs /RD and the Z80's
+    /M1.  Rare on a 68000 but explicitly supported by Motorola.
+  consequence: >
+    CAUTION (Dave): because only A1-A15 are decoded, ANY address above 64K seen on the bus must be
+    examined very carefully - the Storager may be using those upper bits for completely unrelated
+    purposes rather than as an address.  Two confirmed instances of exactly that idiom already exist:
+    the C000 host-address counter takes host bits 23-16 on address lines A1-A8, and op18's $6000 push
+    strobe carries its selector bit on the UDS/LDS choice.  The model's Multibus window at
+    $010000-$FEFFFF should be re-examined against this - if the board truly decodes only A1-A15, the
+    CPU cannot reach host memory by direct addressing at all, and every host access must go through the
+    gate array's bus-master path.
+  model: "storager.cpp: mem_map (RAM wins $4000-$7FFF for data) + opcodes_map (ROM everywhere). Predates this session; was previously only an unexplained source comment."
+  conf: "V"
