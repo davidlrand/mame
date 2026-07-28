@@ -8,7 +8,7 @@
 #           "?" = provisional / open frontier.
 
 meta:
-  as_of: "cont.414 (2026-07-25)"
+  as_of: "cont.420 (2026-07-25)"
   sources: ["DESIGN.md (append-only log)", "siemens/disasm/storager/storager_v260.asm (commented disasm)", "storager.cpp (the clean-rebuild model)", "storager_3030.webp (Plamen's board photo)"]
   synthesis_note: >
     The cont.353 clean rebuild re-authored storager.cpp from the gate-array spec with ALL HLE
@@ -19,13 +19,37 @@ meta:
     forward (they were live-verified and still hold); the read/transfer/completion model is rewritten.
 
 board:
-  cpu: "MC68000P12 (50MHz/4 = 12.5MHz on-card disk controller)"
+  cpu: "MC68000 at 10MHz. Parts vary by revision: MC68000-10 on the Storager II (which carries the 058200xx260 / v260 ROMs), MC68000L10 on the v180 and SGI revisions; an MC68000P12 is noted in an older v260 ROM header. All are run at 10MHz."
+  oscillators:
+    cans: "a 32/10 MHz can and a 50 MHz can (storagerii.webp); earlier ROM headers note 50+32 MHz on v260 and 40+32 MHz on v180/sgic"
+    cpu_clock: >
+      10 MHz, from the 10 MHz output. CONFIRMED cont.420 by the fitted part: the Storager II board
+      carries an MC68000-10 (Dave), and the v180/SGI revisions an MC68000L10 - both 10 MHz devices.
+      The model previously used 50MHz/4 = 12.5MHz, which is 4% over a P12 and 25% over an L10/-10,
+      i.e. impossible for production. All timing-sensitive analysis done before this (cont.409a's
+      "true speed vs arm-driven branch") was calibrated 25% FAST and should be re-checked.
+    pit_clock: "pit0 counters 10MHz/8 = 1.25MHz; pit1 ctr0 10MHz/4 = 2.5MHz. The 2.5MHz is REQUIRED by the firmware's own self-test (see self_test_idle): count 0xFF00 mode 3 -> 26.1ms, half-period 13ms, inside the certified window. The /8-vs-/4 split between the two PITs is an ASSUMPTION - each 8253 counter has its own CLK pin so it is physically possible, but it is not derived from the board."
+    conf: R
   identity: "Interphase 3030-class (Siemens S26361-F415); PC-MX2/MX300 disk controller"
   media: ["5.25in QD floppy", "ESDI hard disk", "1/4in tape/streamer"]
   gate_array: "VGC7219-0419 (Interphase S8526-G class) - proprietary, no datasheet"
   endec: "74LS1801F + 74LS1802A - FM/MFM data separator ONLY (recovers RXDAT/RXCLK/SYNC + address-mark detect). There is NO separate SERDES MSI part (the cont.242 74LS1811/1812 SERDES reading was WRONG)."
-  serdes_owner: "the VGC7219 gate array itself deserialises, does CRC-16/CCITT, and bus-masters the Multibus DMA. The AM2147-55 (4Kx1 fast SRAM) is its serial bit buffer (~one sector)."
-  sram_buffer: {parts: "2x MCM6164C45 (8Kx8)", range: "0x4000-0x7FFF", role: "local staging buffer + the firmware's node/ledger work area"}
+  serdes_owner: "the VGC7219 gate array itself deserialises, does CRC-16/CCITT, and bus-masters the Multibus DMA."
+  am2147:
+    part: "AM2147-55 - 4K x 1 static RAM, 55ns"
+    size: "4096 BITS = 512 bytes. NOT '~one sector' as previously written: it is 4 sectors' worth of 128B FM, but only HALF a 1024B ESDI sector - the point where the HD path is heading."
+    purpose: >
+      OPEN. The long-standing 'serial bit buffer for one sector' reading is WEAKENED by a measurement
+      we already have: recovered data demonstrably lands in the 6164/8464 main SRAM (the chunk at
+      C800[0], $4000-$43FF) and the capture record at the D800-latched address - so the data path
+      already has a destination and does not need a second sector buffer. See open_frontier
+      am2147-purpose for the alternative (position/event bitmap or bit-serial control store) and the
+      12-bit address correspondence that motivates it.
+    conf: "?"
+  sram_buffer:
+    parts: "2x 8Kx8 = 16KB. BOTH types occur - MCM6164C45 on some revisions, MB8464A-80 on others (Dave, cont.420); this is a board-revision difference, not a documentation error."
+    range: "0x4000-0x7FFF"
+    role: "local staging buffer + the firmware's node/ledger work area"
   proms: "2x AM27S19APC (32x8 bipolar) - the E800 op-family / mask ROM ($63E table)"
   doctrine: >
     (1) LLE, no shim - the 68000 firmware runs every disk command end to end; the model provides
@@ -58,7 +82,7 @@ address_map:
   - {range: "0x00E000-0x00E01F", device: VGC7219, role: "channel/ENDEC command window (16-word command block + status)", conf: V}
   - {range: "0x00E800-0x00E807", device: VGC7219, role: "control registers (kickoff / arm / direction)", conf: V}
   - {addr: "0x00F000", device: VGC7219, role: "drive/aux status word (sampled lines + timer OUT)", conf: V}
-  - {range: "0x010000-0xFEFFFF", device: Multibus, role: "bus-master window into host memory (CPUAP RAM at 0x0Fxxxx)", conf: V}
+  - {range: "0x010000-0xFEFFFF", device: Multibus, role: "VESTIGIAL in the CPU map. MEASURED cont.420: ZERO CPU reads and ZERO CPU writes into this range across a full boot that reached cmd 0x95, with a live control (324 gate-array writes in the same run). The CPU never addresses host memory directly - every host access goes through the gate array's bus-master path, which uses the Multibus space directly and not this mapping. Consistent with A1-A15-only decode. It is also actively wrong: it OVERRIDES the ROM mirror across 15/16 of the address space, so a firmware alias into this range would read the Multibus instead of ROM. Candidate for removal.", conf: V}
 
 host_address_note: >
     The host DMA address is NOT a latch through C800/D800/D000 (all three are local). It is preset
@@ -73,12 +97,21 @@ pit:
     ctrl: "0x9A"
     mode: 5
     role: >
-      PIT1 ctr2 = the ROTATIONAL/SECTOR one-shot, and (cont.414) the LAST GATE on the read. op28 arms it
-      at $684C immediately after finding the head on-track, then sets [$798e]=1 meaning "wait for this
-      one-shot"; op42 waits for it. Control is written at op28/$684C and op42/$6CC2; the COUNT comes
-      from UIB+$13 at $6CD2 ($8005 = odd byte = pit1 register 2), gated on [$796e]==$FFF0.
-    model_gap: "timer2_out() is an EMPTY STUB - ctr2's OUT goes nowhere, so the wait can never end. Also m_timer_out (F000 bit11, 'i8253 timer OUT') is fed from ctr0, the system tick, which is probably the wrong counter."
-    open: "mode 5 is hardware-triggered so it needs a GATE edge (the model drives no gate on pit1 ctr2); and whether OUT lands on F000 bit11 or raises an interrupt is undetermined"
+      PIT1 ctr2 = the ROTATIONAL/SECTOR one-shot. Control byte $9A is written at TWO sites, op28/$684C
+      and op42/$6CC2; the COUNT comes from UIB+$13 at $6CD2 ($8005 = odd byte = pit1 register 2).
+    corrected_cont420: >
+      cont.414 read this as "the LAST GATE on the read - op42 waits for it". That is INVERTED on both
+      halves. (1) $6CC2 sits on op42's DONE RETURN path: $6CC2 control write -> $6CCA gate -> $6CDA
+      `clr.l D0` -> rts, and D0=0 IS op42's DONE code ($6CDE `move.w #$fe,D0` is the WAIT return, on a
+      different leg). op42 is finishing there, not blocking. Same shape at op28/$684C, which is
+      immediately followed by `move.w #$1,$798e` - it accompanies completion. The likeliest reading is
+      that ctr2 is ARMED FOR THE NEXT operation as this one completes.
+      (2) The count load at $6CD2 is gated on `cmpi.w #$fff0,$796e / bne` - and [$796e] is
+      structurally 0 for the read (node+$12=$40 -> &3 != 3 -> the $110A/$1134 leg), never $FFF0. So on
+      the read path ctr2 gets a control byte but NEVER A COUNT. Wiring timer2_out() cannot open a gate
+      that was never armed.
+    model_gap: "timer2_out() is an EMPTY STUB. Per the above this is probably NOT the read's blocker; F000 bit11 being fed from ctr0 is CORRECT, not a bug - the firmware's own $A0CC self-test certifies a ~26ms half-period on bit11, which is ctr0's tick (see self_test_idle)."
+    open: "mode 5 is hardware-triggered so it needs a GATE edge (the model drives no gate on pit1 ctr2); what consumes ctr2's OUT is still undetermined"
     conf: V
   bus_note: "the two PITs sit on alternate bytes of the 16-bit bus (pit0 = even/high byte, pit1 = odd/low byte), so a word write would program BOTH. This firmware never does one - measured zero mask=ffff writes; it always accesses them as separate bytes."
 
@@ -131,7 +164,7 @@ registers:
   E800:
     role: "control / DMA kickoff"
     bits:
-      "5-7": {meaning: "op-family select (from the $63E PROM table)", conf: V}
+      "5-7": {meaning: "op-family select (from the $63E PROM table). NOTE cont.420: this range COLLIDES with the bit7 entry below, which claims bit7 as the field-program load-enable. One of the two is mis-scoped - most likely the family field is bits 5-6. Testable against the $63E table's values (if none exceeds 0x60, bit7 is not part of the field).", conf: R}
       "7": {meaning: "FIELD-PROGRAM LOAD-ENABLE (cont.407): op18 frames every C800 descriptor push with `ori #$80` (D2) and restores the raw shadow (D3) after; $79F6's resting $0C1F has bit7 clear. A C800 write with bit7 asserted is a PUSH onto the program stack; without it it is an ordinary register write (the per-record chunk arm through cell 0). Validated on live stimulus - it captures exactly the 16 expected descriptors.", conf: V}
       "6": {meaning: "DMA enable / active", conf: V}
       "9": {meaning: "PIT ctr0 gate", conf: V}
@@ -261,17 +294,34 @@ transfer:   # cont.405 - the firmware-commanded per-sector SRAM->host DMA
     descriptor drain launches only 2 of 8 sectors; WITH it all 8 launch, D000 advances $4000..$4300,
     [$74b4] (the descriptor queue) drains to 0. (cont.405 discovery, cont.406 as a level.)
   byte_order: >
-    Control blocks (node -> host IOPB) byte-swap each 16-bit word - that is how the 68000's BE low byte
-    node+3 reaches the host's IOPB+2, and it is verified (it is how the host ever sees 0x81). DATA
-    fields must NOT swap: the gate array presents the recovered byte stream to the bus, and the label
-    buffer base is ODD (0x0FC0DD), which no word-boundary swap could serve. Swapping data delivers
-    "OV1LISIN0X" instead of "VOL1SINIX0" (cont.406, measured both ways). The real board almost certainly
-    selects this from a swap-control bit in the IOCB/UIB - NOT decoded; the model keys it on field type.
+    REWRITTEN cont.426 - the previous derivation was taken through an inverted SRAM byte mapping and
+    is void. See the top-level `sram_byte_order` section, which is the authority.
+    With byte accesses to $4000-$7FFF resolving to the OTHER half of the word (the measured board
+    behaviour), the compensation INVERTS: `swap = is_data ? 1 : 0`. Control blocks are NOT swapped by
+    the channel (the SRAM already presents them swapped); DATA fields ARE. Measured: the firmware's
+    busy stamp ($1314 move.w #$81,($2,A0)) and its done stamp ($1A54 move.b #$80,($2,A0)) now BOTH
+    land in node+2 - one status field, as a firmware would actually write it - and reach the host at
+    host+3. The old text's "node+3 reaches host+2" was an artifact of the inverted mapping.
+    Getting this wrong is not subtle: leaving the old `swap = is_data ? 0 : 1` under the corrected RAM
+    double-corrects and the boot dies at the FIRST command (measured cont.426).
   scheduler: "$3abc queues a launch (sets channel+$20 pending, [$7a6c]++, busy-lock [$7a1a]); IRQ4 $3bfe clears the lock and re-dispatches the next pending channel via $3afe->$3cd4"
   conf: V
 
 completion:   # the op42 wait -> terminate -> node+$26=0x0C chain (the remaining frontier)
-  op42_wait: "$6BC2; the read is Branch A (guard timer, node+$12 bit1 clear via template $49E). Returns $FE (WAIT) while waiting; DONE=0 needs a status word (A1)-bit7 + the settle flag [$7a36] (set at $661a). This return-0 is the UPSTREAM gate."
+  op42_wait: >
+    $6BC2. Returns $FE (WAIT) while waiting, 0 = DONE, other = error. The master control is [$798e]
+    (cont.413): <0 -> DONE at once ($6BC2 blt $6CDA); >0 -> the bit7/settle path; ==0 -> falls to
+    $6C28 where (A1) = node+$18, the ERROR field, is zero, so it returns $FE forever. Measured
+    [$798e] = 0000. See open_frontier op42-gate-is-798e.
+    RETIRED (cont.420): the earlier reading "DONE needs a status word (A1)-bit7 + the settle flag
+    [$7a36]" is WRONG on both halves - (A1) is node+$18 (an error field, not a status word), and
+    [$7a36] was verified firing correctly. Do not re-chase it; see superseded.
+    RE-DERIVE (cont.426): the entire "[$798e]==0 -> returns $FE forever" reading, and the 1.83s guard
+    built on it (UIB+$18=$46 = 70 ticks at the 26ms PIT1-ctr0 tick), were taken through the inverted
+    byte mapping. With the mapping corrected op42 completes in **0.5ms** - the read posts 0x80 at
+    t=8.11261 against a disarm at t=8.11208. There is no 1.83s watchdog; op42 was spinning on a byte
+    gate that could not match. The UIB+$12 bit7 "operation complete" deposit that existed to bypass
+    that guard is retired with it (verified unnecessary, cont.426).
   node_done: "$843e clears [$72d6]/[$72da]/[$72de]/[$72e0] and sets node+$26=0x0C (= host status 0x80); reached from the $8200 done handler, gated on [$7968]=0"
   terminate_chain: >
     node+$26=0x0C requires [$72d6]=0, which requires [$7968](chunk-pending)=0. The $8200 handler
@@ -282,7 +332,255 @@ completion:   # the op42 wait -> terminate -> node+$26=0x0C chain (the remaining
     $9dd4/$974c run 0 times -> the transfer-phase state is never entered.
   conf: V
 
+phase_dispatch:   # RESTORED cont.420 (decoded cont.244; deleted by the cont.404 rewrite)
+  dispatcher: "$2244 sets phase<-8 at dispatch; $2304 does jsr [$222+phase]"
+  table: "$222 ROM: +8 = $156A (the micro-op walker), +0x0A = $15FE (the watch-record pump); 0/2/4/6 = 0 (death spin)"
+  pump_scan: >
+    $15FE walks the watch-slot table $72D6..$72EC (12 slots) from [$727c]: for each occupied slot with
+    an idle record it compares the NODE phase byte - [$71b6]+$26 above $72E2, else [$71bc]+$26 - against
+    0x0A, and only on a match ($1646) does it run the slot's callback ($1676 jsr). No match anywhere ->
+    it wraps at $163C and rescans forever.
+  two_phases_caution: >
+    There are TWO different "phase" values and conflating them has cost time: the DISPATCHER phase
+    (selects $156A vs $15FE through the $222 table) and the NODE phase byte (node+$26). Being in the
+    pump means dispatcher-phase 0x0A; it says nothing about node+$26.
+  fast_path_71b6: "$2258's phase-0x0A fast path needs [$71B6], installed at $1144 ONLY when the IOPB options have bit4 set - the monitor's 0x95s (options 0x00) never install it, so [$71b6]=0 for the read and the $161C gate is for another command class."
+  conf: V
+
+watch_pump:   # cont.421 - the read's completion architecture, traced end to end
+  dispatcher: "$222 table: phase 8 -> $156A (walker); phase 0x0A -> $15FE (watch pump). op36 PARK sets phase 0x0A, after which the walker NEVER runs again - so the ladder's trailing op00 (which would set phase 0x0C = status 0x80) is never executed. Completion must come through the pump."
+  engine: >
+    $15FE is a WATCH ENGINE, not a sequencer. It scans 11 slot words $72D6..$72EA from [$727c]; each
+    slot points at an 8-byte record {+0 flags, +2 watch-addr, +4 expected, +6 callback}. Three gates:
+    (1) $1606 slot non-zero; (2) $160E record flags == 0 (ffff = banked off); (3) $162A/$161C
+    `cmpi.b #$a,($26,A1)` - the NODE PHASE BYTE. On pass it compares *(watch) against expected and
+    fires the callback only if they DIFFER ($1666 cmp / $166A beq skip / $1676 jsr).
+  records_are_ROM_templates: >
+    op54 ($A356 - and op54 IS in the read's ladder) BULK-COPIES the whole table from one of two ROM
+    templates, chosen by node+$20 bit14 ($A362 btst #$e): bit14 CLEAR -> $66A, bit14 SET -> $6A6.
+    24 words to $727E (6 records) + 6 words to $72D6 (the slots). $A388 then patches ONE watch address
+    at runtime ([$7290] = [$71be]). The read has bit14 clear (its ROM dispatch flags are $8C27), so it
+    always gets template A. NOTE: no instruction anywhere writes a record flags word directly - the
+    flags exist only as immediates in these two ROM templates.
+  template_A_66A: "727e{0000,$0248,ffff,$7964 ACTIVE} 7286{ffff,..,$3DBC} 728e{0000,[$71be],0000,$9188 ACTIVE} 7296{ffff,..,$94EC} 729e{ffff,..,$9984} 72a6{ffff,..,$9398}"
+  template_B_6A6: "727e{0000,..,$836C} 7286{0000,..,$4362 ACTIVE} 728e{0000,..,$9188} 7296{0000,0000,0000,0000 - callback NULL and its slot ptr is 0000} 729e/72a6 banked"
+  null_watch_is_backwards: >
+    CORRECTION (cont.421): $0246/$0248 are NOT inert parks. ROM holds $0246=ffff and $0248=0000 - the
+    OPPOSITE of the expected values - so a record watching $0248 expecting ffff ALWAYS differs and fires
+    on the first scan that reaches gate 3. Banking is done by the FLAGS word, never by the watch target.
+  the_read_completion_callback: >
+    $727E -> **$7964** is the read's completion routine, and it is ACTIVE and armed-to-fire in template A.
+    $7964: gates on [$79b6]==0, [$79ba]==0, **[$7956]==0 (all sectors read)**, [$7958]==0, then
+    $79A6 tst [$796c] -> $79BE bsr $32ac (chunk walk) -> **$79CA clr.w $7968**, which is precisely the
+    cell whose being 1 blocks $843E/$8460 (node+$26 = 0x0C = status 0x80).
+  conf: V
+
+# ============================================================================================
+sram_byte_order:   # cont.426 - THE correction; read this before trusting any byte-level claim
+  finding: >
+    Byte accesses to the local $4000-$7FFF SRAM resolve to the OPPOSITE half of the 16-bit word from
+    what a plain big-endian mapping gives. Word accesses are unaffected. The model had `map(...).ram()`
+    in a BE space, which is the standard wiring and was the wrong premise for this board.
+  the_tell: >
+    Three independent sites share one signature - the firmware writes a WORD and then tests that same
+    value as a BYTE at the identical effective address, expecting the word's LOW half:
+      $15A0 move.w d1,($26,a2) D1=$000A   vs  $161C/$162A cmpi.b #$a,($26,a1)
+      $70D4 move.w #1,($7a30).w           vs  $833C       bclr   #0,($7a30).w
+      $1314 move.w #$81,($2,a0)  busy     vs  $1A54       move.b #$80,($2,a0)  done
+    Under BE the byte op reads the high half and gets $00 - every time, at three unrelated sites. The
+    third is the tell that should have been caught first: busy and done are ONE status field, and no
+    firmware stamps them into adjacent bytes.
+  measured_result: >
+    With the mapping corrected and BOTH standing patches disabled (Q2_PRESERVE_KICK_ARM and the
+    node+$26 deposit), the 8-sector FM read completes and posts 0x80, the 4-sector read completes, and
+    the run reaches 12 commands / 10 clean 0x80 completions. Corroboration beyond the criterion:
+      - busy ($81) and done ($80) now both land in node+2 - one field
+      - op42's 1.83s guard vanishes (completion 0.5ms after the last sector, not 1.67s)
+    Neither was something the hypothesis was tuned to produce.
+  what_it_retires:
+    - "Q2_PRESERVE_KICK_ARM - $70D4 now ARMS the kick, which is what a failure branch should do"
+    - "the node+$26 gate-array deposit - the park's own word write satisfies the pump's cmpi.b"
+    - "the 1.83s op42 guard and the UIB+$12 bit7 'operation complete' deposit built to bypass it"
+    - "'busy and done land in different bytes' - they do not"
+  hardware_mechanism: >
+    HYPOTHESIS, not established. A 68000 defines even-byte = D15-D8 via /UDS, so a board cannot invert
+    byte addressing by swapping strobes alone - it would have to cross both the strobes and the data
+    halves at the two byte-wide SRAMs, i.e. store every word byte-swapped. That is an unusual thing to
+    build and is invisible except through exactly this signature. The BEHAVIOUR is measured; the WHY is
+    not. Do not write the mechanism up as fact.
+  THE_RULE: >
+    Firmware-internal byte structures stay self-consistent, because both ends flipped together. The
+    ledger ($706C move.b #$aa, the $8120/$8128 stakes, the $7E6C walk's cmpi.b) is written AND read
+    entirely by firmware, so cont.419's layout SURVIVES unchanged.
+    What inverts is any boundary where the MODEL touches SRAM at byte granularity and the other end is
+    not the firmware. Enumerated, there are three, and all three are now load-bearing:
+      1. run_channel_dma  - local read_byte/write_byte vs the host. The compensation inverts to
+         `swap = is_data ? 1 : 0`. Getting this wrong kills the boot at command 1.
+      2. the capture record at $7DAC - model write_byte -> firmware byte reads.
+      3. the chunk data staging - model write_byte -> DMA read_byte.
+    (2) and (3) are currently correct BY ACCIDENT, because both of their ends flipped together. That is
+    now a load-bearing property and must be stated, not assumed.
+  re_derive_not_correct: >
+    Every byte-granularity observation in this campaign was taken through the inverted mapping -
+    INCLUDING the ones that appeared to confirm something. Byte-level claims elsewhere in this file are
+    RE-DERIVE, not correct, unless they fall under THE_RULE's firmware-internal case.
+  cheap_general_check: >
+    Whenever a byte gate "can never match", compare it against the WIDTH of whatever writes it. A
+    firmware that writes a word and then tests the same value as a byte at the same effective address
+    is telling you your byte mapping is wrong. This cost four months of halved resolution.
+  conf: "V (behaviour, measured) / ? (hardware mechanism)"
+
+gate_array_deposits_node26:   # RETIRED cont.426 - the mechanism was wrong; do not amend, do not revive
+  RETIRED: >
+    The whole section is void. Its central argument was: "27 word writes, 6 word reads, exactly 3 byte
+    accesses at node+$26, no byte writer exists in the ROM, therefore the gate array must produce the
+    byte." The word writes WERE the byte writer - $15A0 `move.w D1,($26,A2)` with D1=$000A puts the $0A
+    in the half the `cmpi.b` reads, once the SRAM byte mapping is right (see `sram_byte_order`).
+    The behavioural evidence recorded below was REAL - depositing the byte did flip $1646/$1676/$7964/
+    $32AC/[$72d6] exactly as described. That is why this looked so solid for so long: a correct
+    observation attached to a wrong mechanism. The deposit worked because it manufactured, by hand, the
+    value the firmware's own word write should have produced.
+    The model's deposit is REMOVED as of cont.426; the read completes without it.
+    Original text retained below for provenance only - none of its reasoning should be reused.
+  claim: >
+    The gate array writes the BYTE at node+$26 (=$7216 for node $71F0). It has the means and the
+    mechanism: it is a bus master over the same 16KB SRAM, and the firmware hands it the node base via
+    D000 ($38F8 -> $71F0), so node+$26 is directly calculable from a value it already holds.
+  why: >
+    node+$26's byte is the ONLY field in the fully-traced completion path that the firmware CONSUMES but
+    can never PRODUCE: enumerated across the whole ROM there are 27 word writes, 6 word reads and
+    exactly 3 byte accesses at +$26 - all of them `cmpi.b #$a` compares ($161C/$162A/$16BA). No byte
+    writer exists. The word writes ($15A0 `move.w D1,($26,A2)` with D1=0x000A) put the 0A at +$27 and
+    leave +$26 = 00, so the three byte gates are unsatisfiable by firmware alone.
+  measured_effect: >
+    DIAGNOSTIC (TEMP, not shipped): depositing byte 0x0A at node+$26 after the firmware parks the node
+    flips the behaviour decisively - $1646 DISPATCH 0 -> 353162, $1676 jsr callback 0 -> 1,
+    **$7964 (the read's completion routine) 0 -> 1**, $32AC chunk walk 0 -> 18, and **[$72d6] clears
+    727e -> 0000**. None of that happens without the deposit. This is behavioural evidence, not a
+    static-signature argument (the earlier "byte-tested, never byte-written" signature was shown to be a
+    common firmware idiom - e.g. $6C54 deliberately reads the HIGH byte of node+$18 as the guard count).
+    NOTE cont.426: that $6C54 reading INVERTS with the corrected byte mapping and is RE-DERIVE, not
+    correct. It was the first claim predicted to stop making sense if the byte-order hypothesis held.
+  remaining_gap: >
+    $7964 clears every gate that mattered - including [$7956]==0 - and then exits at $79A6 because
+    **[$796c] == 0**, so it never reaches $79BE/$79CA and [$7968] stays 1, leaving status 0x81.
+    [$796c] is set at $70C6 (`move.w #$1,$796c`) inside the drain/builder region that runs only twice,
+    so it is plausibly a casualty of the same upstream stall rather than a second hardware signal.
+    OPEN: the TRIGGER - when the gate array should perform the deposit. Structural constraint: the pump
+    only runs at phase 0x0A, which only exists after op42 returns, so the deposit cannot be consumed
+    before the park. Depositing at count-exhaustion (t=8.16) is clobbered by the firmware's own word
+    write of 0x000A at the park (t=9.7867).
+  conf: "V (mechanism, per Dave) / ? (trigger)"
+
 open_frontier:
+  - id: phase0A-byte-gate-cannot-match   # RESOLVED cont.426 - see sram_byte_order
+    RESOLVED: >
+      The gate could not match because the model's SRAM byte mapping was inverted, not because the
+      firmware cannot produce the byte. $15A0's word write puts $0A exactly where $161C/$162A's
+      cmpi.b reads it, once the mapping is right. Watch-pump gate 3 resolves with it. Do not reopen:
+      the argument is closed by construction, not by evidence that could shift.
+    state: >
+      The read PARKS AT PHASE 0x0A and then spins forever because a byte-gate can never match a
+      word-written phase. Measured with RETAINED tap handles and a LATE control ($224a, 3 hits - once
+      per command):
+        node [$71bc] = $71F0 (even). Phase trace for cmd 95:
+          6.4129 [$7216]<=0004 ($262c) ; 6.4130 <=0006 ($2006) ; 6.4139 <=0008 ($224a dispatcher)
+          9.7867 <=000a ($15a4 = op36 park) -> stays 000a to the end
+        node bytes +20..+29 = 00 00 00 00 7f f8 | 00 0a | 8c 27   i.e. **+$26=$00, +$27=$0A**
+      The park writes a WORD: `$159C move.w #$a,D1 / $15A0 move.w D1,($26,A2)` = 0x000A, so on the
+      big-endian 68000 the byte at +$26 is $00 and the $0A sits at +$27. But THREE readers test a
+      BYTE at +$26 - `$161C` and `$162A` (the two $15FE pump legs) and `$16BA` - so none can ever
+      match. The firmware is internally inconsistent here: phase 0x0C is tested as a WORD
+      (`$1582 cmpi.w #$c,($26,A2)`) while phase 0x0A is tested as a BYTE.
+      The other pump leg is dead too: [$71b6]=0000 (installed only for IOPB options bit4, which the
+      monitor's 0x95 never sets - see phase_dispatch.fast_path_71b6), so $161C indexes from address 0
+      and reads ROM[$0026] = $02, also no match.
+      Counts over the stall: walker $156A 31847, op42 $6BC2 31844, op36-park 31865, op00-done 31862,
+      pump $15FE 141913.
+      **READ THESE CORRECTLY (Dave, cont.420):** they are NOT evidence of healthy activity. They are
+      the RETRY LOOP - the read never completes, so the firmware re-arms and tries again as each
+      Address Mark comes round, and op42 is re-entered once per attempt. A large count here means the
+      failure is repeating quickly, not that the machinery is working. An earlier draft of this entry
+      called it "a healthy live spin, NOT a dead stop"; that was wrong emphasis and is retracted.
+      Corollary: the count is mark-driven, so it scales with the model's record-delivery rate (a 200us
+      pump, ~60x faster than real media) and carries no information about progress.
+    RETRACTED_EARLIER_IN_THE_SAME_SESSION: >
+      An earlier cont.420 measurement claimed "the walker runs 0 times and op42 runs 0 times". That was
+      a GARBAGE-COLLECTION artifact: MAME's Lua install_*_tap returns a handler object, and if the
+      handle is not retained Lua GC removes the tap silently. Its control ($9C3E) fired 49164x at
+      t~0.1 - BEFORE the GC - so it never validated the tap at t=6.4 when the walker actually runs.
+      Retaining the handles turned 0 into 31847. A control must fire at the SAME TIME as the event.
+    corrected_values: >
+      All re-measured safely and stable from
+      t=11.58 to t=30 (1058 samples): [$798e]=0001 (NOT 0000 - so even if op42 ran it would take the
+      >0 settle path, not the $FE path), [$7a36]=0001 (settle IS satisfied), [$7a40]=0000 with
+      [$7a3e]=0001 (guard timer armed at 7360 then expired at t=9.80), [$7a64]=0001, [$7968]=0001,
+      [$72d6]=727e, [$727e]=0000, [$7b40]=0000, [$7a70]=0000, node+$20=8c27 bit14=0, [$7956]=0000
+      (count fully consumed 8->0 between t=7.97 and t=8.16), [$7a0c]=0003, node+$18=4603.
+      ALSO CORRECTED: **[$74b4]=74c4 persists** - the descriptor queue does NOT drain to 0. The
+      cont.405/406 "drains to 0" claim does not reproduce and should be re-taken.
+    WHY_73FA_IS_NEVER_CALLED:   # cont.420 - answered, validated (control $15FE = 141913)
+      caller_of_op42: >
+        op42's ONLY caller is the walker's generic micro-op dispatch: the return address on the stack
+        at op42 entry is **$0015BC** in 400 of 400 samples ($15B4 `move.w (A0,D0.w),D0` -> jsr through
+        the $192 table). $9492 and $9A2E - the two routines that contain the $73FA calls - NEVER CALL
+        IT, and never execute at all. That is why $94AE and $9A48 measure 0: not "op42 returned
+        non-zero there", but "that code does not run".
+      op42_does_reach_done: >
+        Measured with a PREFETCH-IMMUNE write tap (op42's done-leg passes $6CC2 `move.b #$9a,$8007`,
+        an 8-byte instruction, so the PC logs as $6CCA): it fired **exactly once** in the run, next to
+        $6854 (op28's ctr2 arm, also once). So of 31844 op42 calls, ONE returned D0=0 and the rest
+        returned WAIT. An earlier tentative "op42 never returns 0" is WITHDRAWN. The single DONE lines
+        up with the phase trace - op42 returned 0 at ~t=9.79, the walker advanced, and $15A4 wrote
+        phase 0x0A (the op36 park).
+      the_structural_answer: >
+        $9D6E - the routine holding $9DD4 `[$7a70]<=ffff`, which is what makes $974C set node+$20 bit14
+        - is **micro-op 0x4E** in the $192 table. The read's ladder is 24 28 56 58 1A 18 54 4A 42 36 00
+        and contains NO op 0x4E. So the transfer-phase flag is set by a micro-op the read never
+        executes; bit14 stays 0; and even if $9492/$9A3E did run, both $73FA call sites are gated on
+        that bit. Two independent reasons the terminator is unreachable.
+      next: >
+        Decide which is the real question: (a) should the read's ladder contain op 0x4E (i.e. is the
+        ladder built wrongly, or built right and 0x4E belongs to another command class)? or (b) is the
+        read meant to terminate through a path that does NOT involve $73FA at all, given $73FA's only
+        two callers are dormant? Enumerate what dispatches $9492/$9A3E before assuming either.
+    SUPERSEDING_MEASUREMENT: >
+      cont.420 (late): the count-reaches-zero terminator **$73FA IS NEVER EXECUTED** for cmd 0x95.
+      Tapped with a validated control ($15FE, 178580 hits): $73FA shows 1 hit but $75A6 shows 0 - and
+      EVERY path out of $73FA reaches $75A6 ($7410 bra; $7596 falls through to $75A4/$75A6; $749E bra),
+      so the single hit cannot be an execution. It is PREFETCH: $73F8 is an `rts` and the 68000
+      prefetches $73FA straight past it (discipline failure class 2 again).
+      CONSEQUENCE: the analysis below of node+$0e, op44's return and the [$7b40]->[$727e] chain
+      describes DORMANT CODE. Those gates were measured accurately but they never run, so they cannot
+      be the reason the read fails to terminate. $73FA's only callers are **$94D8 and $9A5E** (both in
+      the op42-completion region), so the real question is why NEITHER caller is reached.
+      METHOD NOTE, generally applicable to this whole file: establish that a routine EXECUTES before
+      analysing its gates. Several long investigations here (the phase byte-gate, this [$7b40] chain,
+      and the earlier "(A1)-bit7" reading) analysed code that was never running on the read path.
+    next: >
+      FIRST establish which of $94D8 / $9A5E should call $73FA for the read and why neither is reached
+      (validated control mandatory - a late one, and retained tap handles). Only then re-open the gate
+      analysis below, which is retained because the measurements are sound even though the code is
+      dormant. HOW DOES A REAL BOARD EVER PASS THIS GATE? Candidate answers:
+      (1) CLOSED cont.420 - NOT a host/IOPB problem, and not a model bug. The [$71b6] install at $1144
+      is gated on `btst #4,D5`, and D5 is NOT an IOPB options byte: `$0EAE move.w ($20,A6),D5` with
+      A6=$6E60 gives D5 = [$6E80], measured **8c27**, whose bit4 is 0. That word is FIRMWARE CONSTANT
+      DATA: 8c27 occurs in the ROM at offset **$128**, which is the flags half of the cmd-0x95 entry in
+      the $92 dispatch table (4-byte {handler,flags} entries; index 0x95-0x70=0x25 -> entry $126,
+      flags $128). The same word is what lands at node+$20. So bit4 is clear BY DESIGN for cmd 0x95,
+      [$71b6] correctly stays 0000, and the $161C pump leg is dead by design for the read - only the
+      $162A leg on [$71bc] is ever in play. The old note's phrasing "IOPB options bit4" was wrong;
+      the deleted cont.252 note ("D5 = [UIB+$20]") had the right cell but it is ROM-sourced, not host.
+      (Also confirmed while measuring: $6E84 onward is op18's descriptor list - the observed bytes
+      00 17 01 / 00 1c 01 / 00 1d 00 / 00 1d 01 / 00 3f 00 / 00 3f 01 / 02 01 01 / 02 1f 01 / 7e 3f...
+      match the documented op18_descriptors exactly, so [$7938]=$6E84 is verified.)
+      (2) The read may not be meant to park at 0x0A at all: cmds 87 and 89 both reach phase 000c and
+      complete, and 0x0C is WORD-tested so it works. The read parks only because op42 keeps returning
+      WAIT and the ladder walks on to op36. Fixing whatever makes op42 wait may make the byte gate moot.
+      (3) Only if both fail: consider that +$26/+$27 is a two-BYTE field (a state byte plus a phase
+      byte) rather than a word, which would make every "phase word" reading in this file wrong.
+      Do NOT patch the model to force the gate - that is HLE.
+    conf: V
   - id: first-field-has-no-chunk   # cont.406, narrowed cont.407
     state: >
       R=01 is dropped. At the first data field there has been no prior $8018 done, and [$741e] is still
@@ -347,7 +645,11 @@ open_frontier:
     state: "control blocks swap bytes, data must not; the model keys on field type as a stand-in"
     next: "find the swap-control bit in the IOCB/UIB that the real gate array uses"
     conf: "?"
-  - id: op42-gate-is-798e   # cont.413 - REPLACES the op42-return0 entry below
+  - id: op42-gate-is-798e   # RE-DERIVE cont.426 - measured through the inverted byte mapping
+    RE_DERIVE: >
+      op42 now completes in 0.5ms with the byte mapping corrected, so the "[$798e]==0 -> $FE forever"
+      reading and everything built on it must be re-taken. [$798e] may still matter; the evidence that
+      made it look like THE gate does not survive. See sram_byte_order.
     state: >
       op42's master control is [$798e]: <0 -> DONE at once ($6BC2 blt $6CDA); >0 -> the bit7/settle
       path; ==0 -> falls to $6C28 where (A1)=node+$18 (the ERROR field, not a status word) is zero, so
@@ -357,30 +659,138 @@ open_frontier:
       (steps * UIB+$19)/10 + 1 ticks, pending cell [$7990]. Sibling of the spin-up settle [$7a36]
       (armed in op24 from UIB+$14, 6*10 ticks = 1.55s, VERIFIED firing correctly).
     next: "does op28 reach $68EA during the read at all? Its only traced gate-array access is one E804 write at $6B20, consistent with the seek short-circuiting on an on-track drive - in which case [$798e] is never written and simply retains its power-on zero. Tap $68EA/$68FA/$6904 and the [$7990] pending cell."
-    conf: V
-  - id: op42-return0-transfer-phase   # cont.405 - SUPERSEDED by op42-gate-is-798e
-    state: >
-      With the DTACK hold all 8 sectors transfer, [$74b4] drains, [$7a64]=1 - but the read stays at
-      0x81. The completion is gated on op42 ($6BC2) returning 0, which needs the status word (A1)-bit7
-      and the settle flag [$7a36]; and on the node entering the TRANSFER PHASE (node+$20 bit14 via
-      [$7a70]=ffff / $9dd4 / $974c), which never runs. So even though the DMAs physically complete,
-      the firmware never marks the node as 'in transfer phase' -> the terminate chain
-      ([$7b40]->[$727e]->[$7968]->[$72d6]) never fires -> no 0x80. The recurring theme: the model
-      delivers the hardware ACTION (the DMA) but not the STATE TRANSITION the firmware waits on.
-    next: >
-      trace what (A1) points to inside op42 + why (A1)-bit7 / [$7a36] don't assert after the 8
-      transfers; and what stimulus makes the fw set [$7a70]=ffff / enter node+$20 bit14 (likely the
-      transfer-channel node $7442 becoming [$799a]-current, or a status $9dd4 reads - $9dd4 checks
-      [$71bc] first byte == 0x8b). Carry the DTACK discipline in - the phase transition may itself
-      hinge on a DMA completing with the CPU held. Use a debugger breakpoint on $6c8e (op42 done
-      check) with the guard-timer state, NOT opcode taps (they segfaulted / false-negatived here).
+    RE_MEASURE_FIRST: >
+      cont.420: the "[$798e]=0000" that defines this whole frontier must be RE-TAKEN with a
+      non-corrupting probe. See lua-sram-reads-corrupt-the-model - polling SRAM from Lua clobbers
+      m_term_bit0 and can drive the board into self-test idle, so any tick-polling measurement of a
+      firmware variable is suspect. A few-shot probe at 10MHz measured **[$798e]=0001**, not 0000,
+      which if correct would put op42 on the >0 (bit7/settle) path rather than the "$FE forever" path
+      and would change what this frontier even is.
     conf: "?"
-  - id: op42-completion-signal
-    state: "op42 DONE hinges on [$7a36] (settle flag, $661a: set immediately when a settle-count is 0, else armed as a D0*10 timer via $29f8) and the status word (A1)-bit7. Neither asserts after the transfers."
-    next: "identify (A1)'s node/status word in op42's wait; determine whether [$7a36] is a settle the model owes after the final transfer"
+  # RETIRED cont.420: op42-return0-transfer-phase and op42-completion-signal both rested on the
+  # "(A1)-bit7 status word + [$7a36] settle" reading, which cont.413 disproved. Their one surviving
+  # OBSERVATION - that node+$20 bit14 (transfer phase) is never entered and $9dd4/$974c run 0 times -
+  # is kept in the completion.terminate_chain block. See superseded.
+  # RESOLVED-AND-RETRACTED cont.420: "10MHz breaks INIT" was an INSTRUMENTATION ARTIFACT, not a
+  # defect. Kept as a worked example because it cost most of a session and the mechanism is general.
+  # See measurement_hazard below and the storager-measurement-discipline memory (failure class 7).
+  - id: lua-sram-reads-corrupt-the-model   # cont.420 - a MEASUREMENT HAZARD, permanent caution
+    state: >
+      The model installs its OWN read tap across the whole SRAM range:
+        cs.install_read_tap(0x4000, 0x7fff, "dma_snoop_r",
+          [this](offs_t, u16&, u16 mem_mask){ if (m_dma_active) m_term_bit0 = (mem_mask==0x00ff)?1:0; });
+      So ANY Lua read of storager RAM fires it and clobbers m_term_bit0, which is a live input to the
+      F000 bit12 address comparator (term = 0x4000 | m_dma_term | m_term_bit0). A probe that polls a
+      firmware variable each tick therefore corrupts the comparator; the $9C00 DMA-loopback self-test
+      then reads wrong bit12 answers, exits with error $67 to $367A self-test idle, and the board
+      never services another command. Observed as "stuck after cmd 0x87, spinning in $9Cxx".
+    evidence: >
+      Probes that poll SRAM every tick (readout.lua, final.lua, timeline2.lua) report the board stuck
+      at cmd 0x87 - timeline2 over 0..40s recorded ONLY 00/03/87 in 1928 samples. Probes that read
+      SRAM only a few times, after the self-test (pcwhere.lua, disambig.lua), reproducibly report
+      cmd=95 st=0081 with the read live - 3 of 3, and at t=22, 30 AND 40. A probe using OPCODE taps
+      only (loopback.lua) measured the self-test PASSING at 10MHz (body 49164, success 1, error 0).
+      Removing a cpu.state["PC"] read changed nothing, isolating the SRAM read as the variable.
+    consequences: >
+      (1) The read DOES run at 10MHz; there is no 10MHz INIT defect. The earlier "10MHz 0-of-6 vs
+      12.5MHz 4-of-4" is WITHDRAWN - the clock correlation was spurious (at 10MHz the self-test takes
+      25% longer in wall-clock, so ~25% more probe reads land inside it and tip it over).
+      (2) Any past conclusion drawn from a tick-polling SRAM probe is suspect and should be re-taken.
+      (3) RULE: do not read $4000-$7FFF from Lua on a running model. Use opcode taps, model-side
+      logerror, or read SRAM at most once at a known-safe point.
+    FIXED: >
+      cont.420: both snoop taps are now gated on a REAL BUS CYCLE - `machine().scheduler().
+      currently_executing()` must be the storager's own CPU. A debugger/Lua access arrives from timer
+      context with no device executing, so it is ignored and cannot mutate m_term_bit0 / m_last_bw.
+      VERIFIED by the falsifiable prediction: readout.lua, the very probe that tick-polls SRAM and
+      previously reached cmd 0x95 in 0 of 6 runs, now reaches it in 4 of 4 at 10MHz, and the read
+      lands on cmd=95 st=0081 at t=6.418 - identical to the 12.5MHz trajectory. cmd 0x87 also now
+      shows st=0081 (busy) where it previously read 0000.
+      NOTE the same hazard class applies to any future tap the model installs over memory the
+      firmware uses; gate them the same way.
+    conf: V
+  - id: transfer-phase-never-entered   # the surviving half of the two retired entries
+    state: >
+      With the DTACK hold all 8 sectors transfer and [$74b4] drains, but node+$20 bit14 (TRANSFER
+      PHASE, set by $974c when [$7a70]!=0, [$7a70]=ffff at $9dd4) is never set and $9dd4/$974c run
+      ZERO times, so the terminate chain [$7b40]->[$727e]->[$7968]->[$72d6] never fires. The DMAs
+      physically complete but the firmware never makes the STATE TRANSITION. Note this is downstream
+      of op42: $9492 (which reads bit14) runs only after op42 returns 0, and op42 is stuck on [$798e].
+      So op42-gate-is-798e is the one to solve first; this may resolve with it.
+    next: "solve op42-gate-is-798e first, then re-measure whether bit14 is still unset"
+    conf: "?"
+  - id: am2147-purpose   # cont.420 - reopened
+    state: >
+      The "serial bit buffer for ~one sector" reading is weak. (a) It is 4096 BITS = 512 bytes, not a
+      sector for the ESDI path (1024B). (b) Recovered data is OBSERVED landing in the main SRAM chunk
+      (C800[0], $4000-$43FF) and the capture record at the D800 address, so the data path already has
+      its destination and does not need a second buffer. SPECULATION worth testing: the AM2147 is the
+      gate array's PROGRAM store, not a data buffer - a 1-bit-wide 4096-entry memory is the natural
+      shape for a position/event BITMAP or a bit-serial control store, and op18 "loads a program that
+      does not run until the load completes" (doctrine 5) is exactly the act of filling it.
+      Arithmetic that motivates it: $3066 masks the computed field position with $FFF - a 12-BIT
+      position space, 0..4095 - and the AM2147 has exactly 4096 addressable locations. The one-bit
+      selector each op18 push carries on the UDS/LDS choice would then be the DATA bit written.
+      Supporting evidence already in hand: cont.408 showed the op18 push stream is byte-identical when
+      the IOCB sector count changes 8->4, i.e. it describes the track FORMAT, not the transfer - which
+      is what a position bitmap would be.
+    next: >
+      (1) count the distinct positions op18 can express and see whether they span 0..4095; (2) check
+      whether the op18 descriptor values (17,1c,1d,1f,3f = 23,28,29,31,63) line up with the $4E2 field
+      length list (44,6,32,4,6,5,4,20,29,8,30,3,6,161...) - note 29 appears in both; (3) if it is a
+      bitmap, the model can stop snooping firmware RAM for field geometry and read it from the program.
     conf: "?"
 
+self_test_idle:   # RESTORED cont.420 - decoded cont.243c, lost when board.yaml was rewritten at cont.404
+  note: >
+    This section existed only in the pre-cont.404 board.yaml, which was never committed, so the
+    rewrite destroyed the only copy - and "A0CC" appears ZERO times in DESIGN.md. Re-derived from
+    the ROM at cont.420. It matters because it is the firmware's own hard constraint on the PIT.
+  entry: "$367A; every entry loads D0 with an error code ($F0/$67/$66/$65/$6B); runs MASKED (SR=$2700), drive-select nibble scan"
+  timer_test:
+    pc: "$A0CC"
+    code: >
+      D2 = $50000; loop { D0 = F000; if (D0 bit11 CLEAR) exit; D2--; } then
+      if D2 > $4F600 -> error $6B (too FAST: fewer than $A00 = 2560 iterations elapsed)
+      if D2 < $1000  -> error $6B (too SLOW: more than $4F000 = 323584 iterations elapsed)
+      on error: andi #$fcff,[$79f6] -> E800, D0=$6B, clr [$71b2], bra $367A
+    meaning: >
+      The firmware CERTIFIES the PIT OUT half-period on F000 bit11 against a window. The loop body is
+      ~48 cycles, so at 10MHz the accepted half-period is roughly 12ms .. 1.55s. pit1 ctr0 (count
+      0xFF00, mode 3, 2.5MHz) gives a 26.1ms period / 13.05ms half-period - inside the window, but
+      not by much at the fast end.
+    consequence: >
+      F000 bit11 must be fed by the ~26ms SYSTEM TICK counter (pit1 ctr0), NOT by ctr2. The cont.414
+      model_gap note suggesting bit11 is "probably the wrong counter" is contradicted by this test -
+      had this section not been lost, that note would not have been written.
+  per_rom_set:   # cont.420 - the constants differ BETWEEN ROM SETS, and v180 pins the clocks
+    measured: >
+      Interleaving all three dumped ROM sets and locating the test by its signature (3038 f000 /
+      0800 000b) rather than by address:
+        v260 (StoragerII) test@$A0D2 : window 2560 .. 323584 iterations  (loose - lower bound only)
+        sgic (05808423A)  test@$A0AA : window 2560 .. 323584 iterations  (loose)
+        v180              test@$95AE : window 2560 ..   2816 iterations  (TIGHT, +-5%)
+    what_it_pins: >
+      The v180 firmware CERTIFIES the CPU:PIT ratio to ~10%. Loop = 48 cycles (12+10+8+8+10).
+      At 10MHz that is 4.8us/iteration, and pit1 ctr0 (0xFF00, mode 3, 2.5MHz -> 13.056ms half-period)
+      gives 2720 iterations - almost exactly the centre of 2560..2816 (midpoint 2688).
+      At 12.5MHz it is 3.84us/iteration -> 3400 iterations, OUTSIDE the window: the v180 board would
+      reject itself with error $6B. So the v180 ROM independently pins BOTH constants - CPU 10MHz and
+      PIT ctr0 2.5MHz - and independently refutes the old 50MHz/4 = 12.5MHz reading.
+    verified: >
+      Empirically: `-slot1 storager,bios=v180` (switch confirmed loaded - [$95AE]=3038, [$A0D2]=ffff)
+      passes self-test at 10MHz and proceeds to INIT. Also retires the cont.420 worry that v260's
+      6%-margin implied a wrong PIT rate: v260 merely has a loose bound; v180 shows the design point.
+    conf: V
+  conf: V
+
 superseded:   # readings the log overturned; recorded so they are not re-introduced
+  - {claim: "op42 DONE needs a status word (A1)-bit7 plus the settle flag [$7a36]", corrected_by: "cont.413 - op42's master control is [$798e]; (A1) is node+$18, an ERROR field, not a status word, and [$7a36] was verified firing correctly. Two open_frontier entries (op42-return0-transfer-phase, op42-completion-signal) rested on this and were retired at cont.420."}
+  - {claim: "PIT ctr2 is the LAST GATE on the read - op42 waits for it (cont.414)", corrected_by: "cont.420 - inverted. $6CC2 writes ctr2's CONTROL byte on op42's DONE return path ($6CDA clr.l D0 = DONE), not while waiting; and the COUNT load at $6CD2 is gated on [$796e]==$FFF0, which is structurally FALSE for the read (node+$12=$40 -> &3 != 3 -> the $1134 leg leaves [$796e]=0). On the read path ctr2 therefore receives a control word but never a count, so wiring timer2_out() cannot open a gate that was never armed."}
+  - {claim: "the CPU runs at 50MHz/4 = 12.5MHz", corrected_by: "cont.420 - 10 MHz, CONFIRMED by the fitted part: the Storager II carries an MC68000-10 and the v180/SGI revisions an MC68000L10, both 10 MHz devices; storagerii.webp shows a 32/10 MHz can and a 50 MHz can. 12.5MHz is 4% over a P12 and 25% over a -10. Timing analysis done before this (cont.409a) is calibrated 25% fast."}
+  - {claim: "the AM2147-55 is the gate array's serial bit buffer holding ~one sector", corrected_by: "cont.420 - it is 4096 bits = 512 bytes (half a 1024B ESDI sector), and recovered data is observed landing in the MAIN SRAM chunk, so a second sector buffer is redundant. Purpose reopened - see open_frontier am2147-purpose."}
+  - {claim: "the MCM6164C45-vs-MB8464A SRAM discrepancy is a documentation error", corrected_by: "cont.420 (Dave) - BOTH types genuinely occur, on different board revisions."}
+  - {claim: "the CPU can address host memory directly through the $010000-$FEFFFF Multibus window", corrected_by: "cont.420 MEASURED - zero CPU reads and zero CPU writes into that range across a full boot that reached cmd 0x95, with a live control (324 gate-array writes seen in the same run). The window is vestigial; every host access goes through the gate array's bus-master path. Consistent with A1-A15-only decode."}
   - {claim: "op18 loads the E000 block from a class-selected ROM template", corrected_by: "cont.406 - the param block is in RAM at [$7938]=$6E84, immediately after the UIB at $6E60. op18's program is BUILT PER-UNIT FROM THE UIB, so the field program is a function of the geometry the CPUAP supplied."}
   - {claim: "C800 is a 16-entry field-boundary file paired 1:1 with the E000 block", corrected_by: "cont.406 - op18 pushes 16 descriptors through only THREE offsets, writing the same cell repeatedly (cell 0 six times). It is a set of write PORTS into a sequencer, not storage."}
   - {claim: "the third byte of each op18 triple indexes a table at $6000", corrected_by: "cont.406 - it is only ever 0 or 1. $6000 is zeroed SRAM (the $073A boot clear) and the read data is discarded; the payload is WHICH BYTE STROBE is asserted."}
@@ -451,4 +861,315 @@ program_data_split:   # cont.417 - a DEDUCTION, not an observed board fact
     CPU cannot reach host memory by direct addressing at all, and every host access must go through the
     gate array's bus-master path.
   model: "storager.cpp: mem_map (RAM wins $4000-$7FFF for data) + opcodes_map (ROM everywhere). Predates this session; was previously only an unexplained source comment."
+  conf: "V"
+
+command_class_bit14:   # cont.422 - bit14 is a HANDLER-FAMILY tag, not a per-request mode
+  finding: >
+    node/UIB+$20 bit14 selects op54's watch template ($A362: clear=A $66A, set=B $6A6), op58's
+    $73B6/$73BC seeds, $948C's second op4A, and $94B6/$94CA's [$727e] handling.  It was suspected of
+    being a host-supplied "single-shot vs continuation" mode whose value disagreed with the measured
+    zero remainder.  It is not.
+  evidence: >
+    UIB+$20 sits at $6E80.  The UIB's host DMA is 0x20 bytes ($6E60-$6E7F), so +$20 is OUTSIDE the
+    transferred block and cannot be host-written.  Its value $8C27 is exactly the flags word of cmd
+    $95's entry in the ROM dispatch table at $92 (4-byte entries {handler, flags}, index cmd-$70).
+    Across all 29 populated entries bit14 correlates 1:1 with the HANDLER: $5FC0 (cmds 71 81 83 93 94
+    95 97 99) is always 0; $6102 (72 82 96), $6208 (84 85 8c 90 9f), $3900 (8d) always 1.
+  consequence: >
+    There is no configuration in which cmd 0x95 carries bit14 set - that would be a different handler.
+    Template A is definitionally what the read gets, and the zero transfer remainder ([$7abe] cleared
+    by op58's $738C on a single-track request) is correct arithmetic.  Both halves are consistent; the
+    apparent contradiction was a mis-reading of what bit14 selects.  Do not go looking for a bit14
+    anomaly.
+  conf: "V"
+
+ladder_builders:   # cont.422 - three command architectures, one per handler family
+  finding: >
+    Each command handler writes its own micro-op ladder and its own watch table.  They differ in
+    whether the $7A30 kick is armed and whether $72D8 is seeded.
+  detail: >
+    $5FC0 (cmd 0x95 read): ladder 24,28,56,58,[1A],18,54,4A,42,36,0.  $6042 ARMS the kick; op54 seeds
+    $72D8 = $7286 from template A; rec0 callback $7964.
+    $3736 (cmd $88): ladder 24,28,56,58,[1A],18,4A,32,42,36,0.  $37A0 CLEARS the kick, $37A4 clears
+    $72D8, rec0 callback $7964 written inline - no op54.
+    $3900 (cmd $8D): ladder [24],28,56,58,[1A],18,48,32,42,36,0.  $3976 clears $72D8, rec0 callback
+    $836C written inline - the self-driving architecture ($836C -> $8382 -> $8398 -> $842E -> $843E ->
+    $8460 phase 0x0C, with $840A un-banking rec1).  op32 = $4EC2 is a host-status handshake, not a
+    completion driver.
+  consequence: >
+    op54's $72D8 seed is INTENDED for the read; it is not a stray re-seed to be undone.  Only cmd 0x95's
+    family is kick-dependent.
+  conf: "V"
+
+dbc_two_routines:   # cont.422 - $3DBC forks on the CALLER's interrupt mask
+  finding: >
+    $3DC0 captures the caller's SR into D2; $3E08 btst #$a,D2 forks on IPM bit10.  SET -> $3E0E
+    un-banks record $7286 (arm).  CLEAR -> $3E1C clears $72D8/$72DA, then $3E24 requires [$72d6]==0
+    and $3E30 writes node phase 0x0C (terminate).
+  callers: >
+    $70F4 (drain tail, entered at SR $2000 via $6F40) -> bit10 CLEAR -> terminates.
+    $7106 -> $710C sets SR $2400 before bra $6F44, so a drain entered THAT way arms instead.
+    $732A (SR $2400 at $7326) and $8344 (SR $2400 at $8338) -> arm.
+    The watch pump's jsr (A1) at $1676 -> mainline -> terminates.
+  consequence: >
+    Interrupt-context calls ARM, mainline calls TERMINATE.  The $7A30 kick can never clear $72D8; that
+    is the design, not a defect.  The same call site ($70F4) behaves oppositely depending on how the
+    drain was entered.
+  conf: "V"
+
+descriptor_queue:   # cont.422 - [$74b4] has a second source; the launch is one drain away
+  finding: >
+    [$74b4]/[$74b6] is a linked descriptor queue enqueued by the PER-RECORD ISR at $81F8/$81FC/$820A,
+    independent of the drain.  The fork at $8154 is the SAME word tested at $8116 for the ledger arm,
+    so the c0 path (which every commanded record takes) is exactly the path that enqueues.
+  measured: >
+    [$74b4] = $74C4 from the first record (7.9726) and is never consumed for the rest of the run.
+  launch_route: >
+    $70EA tst.w $74b4 / $70F4 bsr $3dbc -> $3DE0 non-empty -> $3E50 -> $3E6A -> $4062 -> $40BE ->
+    $40C2 bit11 (set in $8C27) -> $4122 -> $414C installs [$743a]=$7442 and arms pit0 ctr1.
+    $731E/$732A and the $7208/$721A tail are the same shape.
+  consequence: >
+    The drain ran once at 7.9602, twelve milliseconds BEFORE the descriptor it needs existed.  Any
+    later drain invocation would launch the transfer outright.
+  conf: "V"
+
+bootstrap_deadlock:   # cont.422 - the whole gap in one condition
+  chain: >
+    [$741c] is set ONLY when the firmware REJECTS a record ($7D4A -> $7D5C) and CLEARED when it accepts
+    one ($7CA4).  [$741c] is the sole gate (with [$796a], measured constant 1) on $82B2, which is the
+    only reachable setter of [$7968].  [$7968] flips [$742C] at $7E8E, which selects $8128 (drainable
+    index) over $8120 (c0).  op4A samples [$7968] at $6EDC: zero -> arm and immediately disarm [$7b10]
+    ($6ED6/$6F3A) and drain inline against an empty ledger; non-zero -> leave [$7b10] armed for the
+    ISR.  [$7b10] has ONE setter ($6ED6) and three testers ($7D68/$7D94 in the record ISR, $8320,
+    $8352), all of which call $7106.
+  measured: >
+    [$7968] is 0 at op4A on every path.  Whole-boot trace: the only writes before the read are the
+    $9C00 self-test's own patterns ($9CEA/$9D14/$9D4A), cleared by 0.2s; cmd $87 leaves it 0.
+    op18 -> op54 -> op4A is uninterrupted (op18's four exits $30A2/$3114/$318E/$31EA are all clr.l D0,
+    so the walker never waits; op54 is single-exit $A38E/$A390), giving a 0.4-0.5 ms window that cannot
+    hold the three interrupt services (IRQ6 -> IRQ5 setup -> IRQ5 done -> $82B2) the bootstrap needs.
+  eliminated: >
+    - records before op18: BREAKS the read (7 records not 16, $7956 decremented spuriously, command
+      aborts cmd=00).  op18 is genuinely the gate.
+    - rotational start + immediate first record: both implemented and correct, neither sufficient.
+    - a prior command leaving [$7968] set: measured 0 across the whole boot; CPUAP is faithful.
+    - injecting IRQ4: [$743a]=$748A until $414C runs, so it dispatches the idle descriptor's callback.
+    - node+$18 (rec2/$9188): that is the ERROR teardown ($1206 epilogue); a callback returning non-zero
+      makes the pump post phase 0x0C at $169E with the code in the error field.
+    - $92B4/$9312's f0 stake: gated on [$742C]!=0 (our state, opposite arm from $8128) but f0 is
+      NEGATIVE, so the drain's $6FDC bge rejects it - not drainable.
+    - rec5/$9398 and the second op4A: correctly banked, all four un-banks ($70B4, $721A, $8276, $799A)
+      require [$7958]!=0 and the remainder is legitimately 0.
+    - pit1 ctr2: armed mode-5 by op28 ($684C) and op42 ($6CC2) but the COUNT is never loaded, because
+      [$796e]=0 for this command ($1042: UIB+$12 & 3 != 3).  Parked by the firmware.
+    - host DMA: 1839 E800 writes during cmd 0x95, ZERO with bit12 set.  No transfer is ever requested,
+      so no IRQ4 exists during the data phase (9 in the whole run, all before 6.414).
+  frontier: >
+    The per-record re-invoker EXISTS and is disabled: $7D68 tests [$7b10] and $7D94 calls $7106.  One
+    surviving [$7b10] at any record after 7.9726 completes the command.  What the gate array must
+    present so that op4A samples [$7968] non-zero is the open question.
+  conf: "V"
+
+record_delivery:   # cont.422b - what the gate-array trace settled about the per-record stimulus
+  cadence: >
+    Measured from docs/storager-lle/ga-trace-8sector.txt: one IRQ6 (ID address mark) plus two IRQ5
+    (data field armed, data field done) per record, records spaced a uniform 12.80-12.84 ms - one
+    sector period at 16 sectors on a 200 ms revolution.  The IRQ5 #1/#2 split in the trace is the
+    FIRMWARE's alternator fork ($7950 -> $7BA8 vs $8018), not a model phase: 142 vs 16 means the
+    alternator does not settle until the first data-done, not that the model emitted 142 of one kind.
+  index_verified: >
+    F000 bit4 asserts correctly - sampled directly off the drive at 200 us, a 2.00 ms pulse every
+    200.0 ms, 11 pulses in the window, motor on.  The firmware's 16 F000 reads are POINT samples
+    covering ~16% of a revolution (16 x 2 ms / 200 ms), so their never showing bit4 is expected and
+    proves nothing.  Do not re-open this as an INDEX defect.
+  status_polarity: >
+    F000 bit13 (track 0) is ACTIVE LOW - always clear MEANS the head is at track 0, matching the single
+    E804 position latch and the absence of any stepping.  bit12 (DMA address match) correctly follows
+    the absent host DMA.  Neither is a defect.
+  host_dma_path: >
+    E800 bit12 is exercised and decoded: exactly two writes have it set, both inside the IOCB-fetch
+    IRQ4 at 6.4129, each paired with a D000/C000 load, and a real IRQ4 follows.  Its absence across
+    1839 writes in the data phase is therefore a firmware-state result, not a modelling gap.
+  d800: "constant $3ED6 = $7DAC across all 300 writes - the firmware commands the same capture buffer every record; the model's fallback never engages."
+  open_chunk_overrun: >
+    C800+000 advances by $40 words (128 bytes, one FM sector) per record, 17 distinct values for 16
+    data-done records, covering 2048 bytes against a 1024-byte 8-sector command.  Records 9-16 land at
+    $4400-$47FF, outside the commanded buffer, and [$7956] has already drained to 0 by record 8 - so
+    the per-record path is not gated on the commanded count.  PER_ADDRESS_MARK's justification ("the
+    firmware stops re-arming when it is done") is not what happens.  Note the alternative was tested:
+    PER_ADDRESS_MARK=false gives the same end state but removes the rejected out-of-window records that
+    are the ONLY source of [$741c].  There is also a double-advance at 8.06088/8.06133 (45 us apart
+    against a 1.28 ms step) - one record allocating two chunks, which is where the 17th value comes
+    from, and probably the same re-entrancy class as the deadline bug below.
+  conf: "V"
+
+model_regressions_found:   # cont.422b - two defects introduced by this session's own changes
+  deadline_reset: >
+    "Immediate first record" set m_next_rec = machine().time() unconditionally in start_field_program.
+    Every per-record ISR re-issues the program's first command (E000 <= $0a6d, bit11 set), which
+    re-enters that routine - so the rotational deadline was reset to NOW on every record.  Measured
+    effect: the phase machine free-ran at ~200 us per phase instead of 1.875/8.75 ms, producing an
+    IRQ6/IRQ5 runaway at 64 us with no data-done after the last real record.  FIXED: the reset is now
+    guarded by first_arm.  Spacing is a flat 12.84 ms for the whole run.
+  instrument_gate: >
+    gatrace.lua gated recording on a PERIODIC poll of the command byte, which opened ~4.5 ms after the
+    IOCB was written and swallowed op24's dispatch entirely - reading as a firmware anomaly ("op24 is
+    absent from the executed ladder") when it was a sampling lag.  FIXED: an exact write tap on $71F0.
+    The executed ladder is 24 28 56 58 18 54 4A 42, matching the builder ($5FE6..); op1A is conditional
+    and op36/op00 never dispatch because op42 never returns 0.
+  conf: "V"
+
+end_marker_experiments:   # cont.423 - the $AA end-of-transfer marker, three forms, all measured
+  the_fork: >
+    $7E8E forks on [$7968] and the two arms consult the $AA end marker DIFFERENTLY.  They are
+    ALTERNATIVES, not a sequence:
+      [$7968]==0 -> $7EB2: accept, $7EBE decrements the remaining count, and the marker is tested
+                    ONCE at $7ED0, one instruction after the count reaches zero.
+      [$7968]!=0 -> $7E90: the marker is tested at $7E9A on EVERY record, no count precondition.
+    Measured cells: $7ED0 reads [9] ($765D) at the remain->0 edge; $7E9A reads [10], [11], [12] on
+    successive records - D0 advances by one per record because every cell past the window already
+    holds $fe, so the scan halts one further along each time.  There is no single fixed cell.
+  addressing_rule: >
+    Within ONE record the firmware TESTS then STAKES: $7E9A reads S+1, then $8120/$8128 writes S.
+    So the cell the NEXT record will test is LAST STAKE + 2 (Dave's "immediately after the last
+    stake" was one cell short for exactly this reason).  For the $7ED0 arm the target is instead
+    FIRST STAKE + COUNT.  Both addresses are derivable from bus-visible writes plus the op18
+    program's own port-$3F push count - no IOCB or firmware-cell read.
+  trigger: >
+    $82B8 bset #0,$7ac2 - written once, read NOWHERE in the ROM - fires one instruction after $82B2
+    sets [$7968].  It is the firmware signalling hardware that it has bootstrapped, and it is the
+    only such signal available.  Measured 8.9 ms AFTER the remain->0 edge, so it can arm the $7E9A
+    arm but can never serve $7ED0.
+  results: >
+    v1 (unconditional next=$AA, Dave): broke mid-read - $AA planted in front of still-wanted $ff
+    walls off the want-scan.
+    v2 (next != $ff guard, Dave): 8 DMAs restored, fires once, but on the OVERRUN stake - 8.8 ms
+    after the terminate fork has already taken $7F14.
+    v3 (first stake + count, deposited from device context): planted at [765D] 81 ms before the
+    edge and $7ED0 READ IT - but with the address mark still free-running the read ran to 114
+    records.
+    Q3c (sliding, last stake + 2, armed by the strobe): $7E9A read $AA at [765F] and took $7ED8 -
+    the FIRST time the firmware has ever taken a terminate branch.  But $7ED8 is only
+    "move.w #$0,$741c / bra $7F1A": it suppresses the re-arm FLAG and does not stop the ISR issuing
+    the E802 bit11 capture re-arm, so records kept arriving (116 vs 16), remain ran negative, and
+    $7C92 cleared [$7968] again.  Not a completion.
+  doctrine: >
+    Deposits must be made from the DEVICE's context, never from inside a CPU write tap: in a tap
+    currently_executing() is the local CPU, so the model's own $4000-$7FFF snoop sees the access and
+    clobbers m_term_bit0 (peek) or m_last_bw (write), both live inputs to the F000 bit12 comparator.
+    From device context it is a bus-master cycle and the snoop correctly ignores it.
+  conf: "V"
+
+counted_stop_open:   # cont.423 - the address-mark disarm, and an unexplained truncation
+  question: >
+    Does the last sector's DATA phase disarm the address-mark interrupt in the gate array?  That is
+    the physically right reading of a counted op18 program, and VAR_COUNTED_STOP already implements
+    it (m_data_done_n >= m_sec_count && m_sec_count > 0, at the top of advance_read).
+  measured: >
+    VAR_COUNTED_STOP ALONE truncates the read to 4 records, not 8 - with the end marker disabled, so
+    the truncation is the variant itself.  This also casts doubt on the earlier reading that v1's
+    4-DMA result was caused by the $AA; the marker may have been innocent there.
+  hypothesis_untested: >
+    The check sits at the TOP of advance_read, which runs on every pump tick AND every E802 re-arm,
+    so it may trip on a partially-advanced count rather than only after a completed data phase.
+    NOT confirmed - needs m_data_done_n / m_sec_count logged at each entry.
+  why_it_matters: >
+    With the address mark disarmed no record is ever rejected, so [$7968] stays 0, the handler takes
+    the $7EB2 arm, and the marker is consulted at $7ED0 - the arm the first-stake+count rule was
+    built for, which plants correctly 81 ms ahead of the edge.  That combination is the one worth
+    testing once the truncation is understood.
+  conf: "P"
+
+model_traps:   # cont.423 - two standing hazards that have each bitten more than once
+  reentrant_start_field_program: >
+    start_field_program() is RE-ENTERED on every record: each ISR re-issues the program's first
+    command (E000 <= $0a6d, bit11 set).  Anything stateful reset there is reset per record, not per
+    command.  This has caused two defects: m_next_rec being reset every record (free-ran the phase
+    machine to a 64 us IRQ6/IRQ5 runaway) and the end-marker's done-flag being cleared every record
+    (planted a fresh marker one cell along until remain went negative).  Per-command state belongs
+    in the "if (!m_read_active && cmd == 0x95)" block, never above it.
+  sec_index_is_a_position: >
+    Since the rotational-start change m_sec_index is the head's position on the track, NOT a tally of
+    sectors delivered.  Any "have we finished?" test must use m_data_done_n.  Testing m_sec_index
+    against m_sec_count stops the read before the first record whenever the rotational phase starts
+    above the commanded count.
+  conf: "V"
+
+alternator_reclear:   # cont.424 - why the counted disarm truncates, and it is not the disarm
+  finding: >
+    The IRQ5/IRQ6 stubs fork on [$7950] bit0 (bchg, so the OLD bit decides), but the handlers
+    RE-CLEAR it before returning: $8A3E and $88D6 both write $7950 = 0.  $88D6 runs at the end of
+    every handler, so the alternator never survives to present old=1 on a following IRQ5.  Every
+    IRQ5 is therefore seen as a FIRST one and routes to $7BA8 (data field armed); the second never
+    reaches $8018 (data field done).
+  measured: >
+    With VAR_COUNTED_STOP the model delivered exactly the right stimulus for 8 sectors - 8 IRQ6 and
+    16 IRQ5 - and the firmware routed them 12 setup / 4 done instead of 8/8.  Sequence per record:
+    IRQ6 -> stub toggles 0->1 -> verify -> $8A3E clears -> $88D6 clears -> IRQ5 toggles 0->1, old=0
+    -> SETUP -> $88D6 clears -> next IRQ5 toggles 0->1, old=0 -> SETUP again.
+    The baseline shows the same defect masked: 194 setup / 16 done, reaching 16 only because records
+    keep arriving until enough dones accumulate.
+  consequence: >
+    The model's premise - "IRQ5 #1 arms the data field, IRQ5 #2 completes it" - is NOT what the
+    firmware implements.  The interrupt alone does not distinguish arm from complete; the firmware
+    re-clears the discriminator inside the handler, so something else must carry that distinction.
+    This is the blocker under the counted disarm and under the $AA end marker, one level below where
+    both were being investigated.  Settle it before either.
+  not_the_disarm: >
+    VAR_COUNTED_STOP itself is correct: it fires exactly at done == count == 8 ("GA disarm: done=8
+    count=8 idx=4 phase=0").  The read truncates to 4 firmware-processed sectors only because of the
+    routing above.  Do not treat the truncation as evidence against the counted disarm.
+  conf: "V"
+
+source_cleanup:   # cont.424
+  what: >
+    storager.cpp 1955 -> 1382 lines.  Removed 494 lines of diagnostic address-space taps from
+    device_reset, the orphaned TEMP members they fed, the ga_log helper and its call sites, and the
+    TEMPPROG/UIB/VECTOR/CHUNKTBL, TRACK, TEMPSTAGE and TEMPDMA dumps.  logerror 68 -> 9; taps 100 ->
+    2 (only the functional dma_snoop pair, which feeds m_term_bit0 / m_last_bw for the F000 bit12
+    comparator and must never be removed).  The one line kept from the TEMPPROG block is the port-$3F
+    push count, which is how the gate array knows the commanded sector count without reading the IOCB.
+  verified: >
+    Baseline behaviour identical after the cut: 16 records, 16 data-done, [$7968]=1, st=0081.
+  note: >
+    The equivalent coverage now lives in the Lua instruments under docs/storager-lle (timeline.lua,
+    gatrace.lua, blocks.lua, dmareq.lua) - nothing needs compiling into the device to observe it.
+  conf: "V"
+
+converged_read:   # cont.425 - cadence, disarm and end marker all correct simultaneously
+  the_wrong_assumption: >
+    The counted disarm was counting DATA FIELDS DELIVERED.  That is not the number of sectors read.
+    The gate array has no header comparator - it raises every address mark and the FIRMWARE decides
+    ($7C7A / $7D34).  A rejected record is torn down at $7DA2 -> $88AC, which clears the capture
+    re-arm (E802 bit11) AND the $7950 alternator; an accepted one is staked $c0 into the ledger.
+    With the rotational start the first records are sectors outside the want-list, so delivered
+    exceeded accepted (12 vs 8) and the disarm fired four sectors early.  That, not the $AA slot,
+    was what broke the cadence.
+  disarm_rule: >
+    Count the ACCEPTED sectors - the $c0 stakes, which are bus-visible writes - and disarm the
+    address mark when that reaches the op18 program's own port-$3F push count.  Measured:
+    "GA disarm: accepted=8 delivered=12 count=8 t=8.11203", with 8 records / 8 data-done / 8 stakes
+    and 16 setup, the 1:2 ratio expected once every accepted sector completes.  Compare 4/12 with the
+    delivered-count rule and 16/194 free-running.  Genuine read failures remain the firmware's to
+    retry ([$79a4]) - the gate array simply stops after the last VALID sector.
+  marker_rule: >
+    The terminate fork tests ONE cell, one instruction after the last accepted sector takes the
+    remaining count to zero ($7EBE -> $7EC2 not taken -> $7ED0).  Within a record the firmware TESTS
+    S+1 then STAKES S, so the cell that test will read is (stake address + 2).  The PENULTIMATE
+    accepted stake is the last chance to write it - measured 8.0992 against an edge at 8.1037, a
+    4.4 ms margin.  Arming on any earlier stake plants in front of a still-wanted $ff and walls off
+    the want-scan; arming on the last stake is 8.8 ms too late.
+  inputs_are_the_gate_arrays_own: >
+    Cell = the stake write address seen on the local bus, + 2.  Length = the port-$3F push count of
+    the program the firmware loaded into the gate array.  Neither is an IOCB or firmware-cell read.
+    The deposit is made from the device's own context so it is a bus-master cycle and the model's
+    $4000-$7FFF snoop correctly ignores it.
+  measured: >
+    "Q3D $AA -> [765d] (bus-master) remain=0001" then
+    "$7ED0: cell [9] @765d = aa *** IS $AA - would terminate ***".  Reproduces run to run.
+  still_open: >
+    $7ED8 is only "move.w #$0,$741c / bra $7F1A" - it stops the re-arm but is not a completion, so
+    st stays 0081 and [$72d6] is not torn down.  And because the terminate branch is taken, $82B2
+    never runs, so [$7968] ends 0 rather than 1: the marker and the bootstrap still contend for
+    [$741c].  That contention is now visible on a HEALTHY 8-sector read rather than a degenerate one.
   conf: "V"

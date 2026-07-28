@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <vector>
 
 #define VERBOSE (0)
@@ -104,6 +105,91 @@ void storager_hd_image_device::img_write(u64 off, void const *src, u32 len)
 
 namespace {
 
+// TEMP (STRIP): A/B knob for the record-timing model.  false = the arm-driven model (records as fast
+// as the firmware re-arms) which currently transfers 8/8; true = physically timed records (one sector
+// per 12.5ms at 300rpm), which is correct but exposes the dead $833C restart path (cont.409).
+constexpr bool PHYSICAL_TIMING = true;
+
+// TEMP (STRIP): A/B knob for record delivery.  false = the model walks the COMMANDED run and stops
+// after [$7abc] sectors - i.e. the gate array chooses which sector, which is the firmware's job.
+// true = one record per address mark as the disk rotates, and the FIRMWARE decides whether to arm the
+// data phase (cont.411: $89F2 inspects the raw capture cells in software; there is no hardware sector
+// comparator).  The firmware stops re-arming when it has what it wants, which is what ends the run.
+constexpr bool PER_ADDRESS_MARK = true;
+
+// Q3b: the gate array's end-of-transfer marker.
+//
+// The firmware's record handler forks at $7E8E on [$7968], and the two arms consult the $AA end marker
+// DIFFERENTLY:
+//   [$7968]==0 -> $7EB2: accept, $7EBE decrements the remaining count, and the marker is tested ONCE,
+//                 at $7ED0, one instruction after the count reaches zero.
+//   [$7968]!=0 -> $7E90: the marker is tested at $7E9A on EVERY record, with no count precondition.
+// They are alternatives, not a sequence: the bootstrap ([$7968] set at $82B2) happens 8.9 ms AFTER the
+// remain->0 edge, so nothing can serve $7ED0 - but $7E9A is open from the next record onward.
+//
+// Trigger: $82B8 bset #0,$7ac2, one instruction after $82B2.  Nothing in the ROM ever reads $7AC2 - it
+// is a write-only strobe, i.e. the firmware signalling hardware that it has bootstrapped.
+// Address: the FIRST stake's write address (bus-observed) plus the op18 program's own port-$3F push
+// count.  Neither is an IOCB or firmware-cell read.
+// RESULT (measured): the rule works - $7E9A read $AA at [765f] and took $7ED8, the first time the
+// firmware has ever taken a terminate branch.  The +2 offset is right: within a record the firmware
+// TESTS S+1 ($7E9A) then STAKES S ($8120/$8128), so the next record's test cell is last stake + 2.
+// BUT $7ED8 is not a completion - it only does move.w #$0,$741c and falls to $7F1A.  It does not stop
+// the ISR issuing the E802 bit11 capture re-arm, so records keep arriving (116 vs a baseline 16),
+// remain runs negative, and a later matched record clears [$7968] again at $7C92.  Left OFF: an
+// enabled path that quadruples the record count would poison every other measurement.
+// DISPROVED (cont.426).  The marker forces $7ED8, which is the EXCEPTION exit - the same place a
+// failed chunk allocation lands ($7EF4 unlk / bra $7ED8).  The NORMAL exit for the count-drain record
+// is $7ED6 bne -> $7EE0 -> $32AC allocates -> $7F14 sets [$741c], which $82B2 then consumes on the
+// same interrupt to set [$7968].  Measured A/B with the accepted-sector disarm: marker OFF gives
+// 8 records / 8 data-done / [$7968]=1; marker ON gives 8 / 8 / [$7968]=0.  The marker's only effect
+// is to suppress the bootstrap.  Kept behind the flag as a disproved hypothesis, not a fix.
+constexpr bool Q3B_END_MARKER = false;
+
+// TEMP (STRIP): stimulus/response experiment matrix.  Firmware drives; the model only changes how
+// the gate array *responds* to programmed arms + disk rotation.  No free-form writes into firmware
+// work RAM (UIB/node) except where the GA is known to DMA into a firmware-programmed latch.
+//
+//   V0 BASELINE     - current behaviour (shims off)
+//   V1 COUNTED_STOP - after commanded data-done count, stop delivering marks even if re-armed
+//                     (models a finite op18 program: the sequencer terminates)
+//   V2 PIT2_OUT     - surface PIT1 ctr2 OUT on F000 bit8 (Branch-B busy line candidate; read is
+//                     Branch A so this should be a no-op for op42 - control experiment)
+//   V3 STOP+IRQ4    - V1, then one channel-done IRQ4 after the last data field (program-complete
+//                     interrupt, no RAM deposit).  Tests whether IRQ4 alone unblocks the drain.
+enum { VAR_BASELINE = 0, VAR_COUNTED_STOP = 1, VAR_PIT2_OUT = 2, VAR_STOP_IRQ4 = 3 };
+constexpr int VARIANT = VAR_STOP_IRQ4;
+
+// Q2 hypothesis test (TEMP): $70d4 `move.w #$1,$7a30` zeros the HIGH byte that $6042's
+// `bset #0,$7a30` armed for the done-tail kick.  If that clobber is accidental, preserving
+// high-byte bit0 through the word write lets $833c actually bsr $3dbc.  false = stock firmware
+// behaviour; true = rewrite the $70d4 store to $0101 (low=1 soft flag + high bit0 kick arm).
+// This is a temporary CPU-side patch of one store, not a GA SRAM deposit.
+constexpr bool Q2_PRESERVE_KICK_ARM = false;   // RETIRED cont.426 - $70D4 ARMS the kick; the patch was an artifact
+// EXPERIMENT (temporary): start the capture at E804 drive-select rather than at op18's program load.
+// op18 -> op4A is only ~50us, far too short for a complete record (IRQ6 -> IRQ5 setup -> IRQ5 done ->
+// $8018, which is what writes [$74b4] at $81F8/$81FC).  drive-select -> op4A is ~1.67ms, enough for one.
+// CRITERION: [$74b4] != 0 with [$791a] == 0 at $6ED2 means $70F4 launches with no patch, regardless of
+// whether the read survives afterwards.  Still zero, with records delivered beforehand, kills the lever.
+constexpr bool EXP_EARLY_CAPTURE = false;
+// The $4000-$7FFF SRAM's byte order (cont.426).  Three independent sites have the SAME signature -
+// the firmware writes a WORD and then tests that value as a BYTE at the identical effective address,
+// expecting the word's LOW half:
+//   $15A0 move.w d1,($26,a2)=000A  vs  $161C cmpi.b #$a,($26,a1)
+//   $70D4 move.w #1,($7a30).w      vs  $833C bclr   #0,($7a30).w
+//   $1314 move.w #$81,($2,a0) busy vs  $1A54 move.b #$80,($2,a0) done   (one status field!)
+// Under big-endian RAM the byte op reads the HIGH half and gets $00 every time, which is what the
+// node+$26 deposit and Q2 exist to paper over.  If byte accesses resolve to the other half, all three
+// resolve at once with no patch.  Word accesses are unaffected by construction.
+constexpr bool SRAM_BYTE_SWAPPED = true;
+
+// Q3 hypothesis test (TEMP): end-marker after a ledger stake, using only the write address.
+// When firmware stakes $c0 ($8120), if the NEXT ledger byte is NOT still a want ($ff), deposit
+// $AA there.  That skips mid-window (next=$ff → leave wants visible) and fires when the stake
+// lands against $fe/$aa/end - i.e. the filled prefix has no remaining $ff beyond it.  No IOCB
+// count, no [$7956] snoop.  v1 (unconditional next=$AA) interleaved $AA in front of $ff and
+// cut the read to 4 DMAs / remain stuck at 4 - so the $ff guard is required.  false = off.
+
 class multibus_storager_device
 	: public device_t
 	, public device_multibus_interface
@@ -162,6 +248,8 @@ private:
 	// (get_next_transition) and the gate array deserialises it, doing address-mark detect and filling the
 	// gate array's capture cells + raising IRQ5/IRQ6 per field boundary.
 	bool flux_density_fm() const;
+	attotime sector_period() const; // one sector's rotation at 300 rpm
+	void start_field_program();     // the loaded op18 program begins running: open the read window
 	void advance_read();            // stage + deliver the next record of the counted read (IRQ6 then IRQ5)
 	void deliver_mark();            // arm + held-mark -> one interrupt
 	TIMER_CALLBACK_MEMBER(pump_tick);
@@ -169,7 +257,8 @@ private:
 	// channel DMA: on the E800 bit12 kickoff the gate array bus-masters one field between the local
 	// SRAM buffer and host memory via the C000 up-counter, then raises IRQ4 (channel/DMA done).
 	void run_channel_dma();
-	TIMER_CALLBACK_MEMBER(dma_done);   // async channel-done: raise IRQ4 after the transfer time (STORAGER_ASYNCDMA)
+	attotime dma_time(u32 len) const;  // bus-hold / transfer time for a len-byte bus-master DMA
+	TIMER_CALLBACK_MEMBER(dma_done);   // transfer end: release the bus hold, raise the channel-done IRQ4
 
 	required_device<m68000_device> m_cpu;
 	required_device_array<pit8253_device, 2> m_pit;
@@ -188,20 +277,57 @@ private:
 
 	// DMA + status sampled into F000
 	bool m_dma_active = false;   // E800 bit6
+	bool m_bus_held = false;     // the gate array holds the 68000 off the local bus for a DMA's duration
+
+	// The loaded field program (op18).  op18 pushes a descriptor stream through the C800 write ports
+	// while E800's load-enable is asserted, then block-writes the 16-word E000 step program.  NOTHING
+	// RUNS UNTIL THE LOAD COMPLETES: the firmware masks interrupts across the push phase and copies the
+	// E000 block in one straight-line loop, so a record delivered mid-load would be captured against a
+	// half-built program (which is what dropped the run's first sector).  The sequencer starts on the
+	// write that completes the block (E01E), which is also what makes the first record possible at all -
+	// the per-record re-engagement writes are issued from the record ISR, so they cannot start the run.
+	u16 m_prog[16] = {};         // E000..E01E, the field step program as op18 loads it
+	u8  m_desc_port[32] = {};    // the C800 descriptor stack, in push order (a port takes many pushes)
+	u16 m_desc_val[32] = {};
+	u8  m_desc_n = 0;
+	bool m_prog_loaded = false;  // the E000 block load has completed - the program may run
 	u16  m_dma_term = 0;         // transfer terminal, latched from a C800 write while DMA active
 	u8   m_term_bit0 = 0;
 	u32  m_last_bw = 0;          // last local-bus write address (transfer-pointer snoop -> F000 bit12)
+	u32  m_node_base = 0;         // node local address, latched from D000 on a node-class block
+	u32  m_uib_base = 0;         // UIB local address, latched from D000 on a UIB-class control block
+	int  m_data_done_n = 0;      // data fields delivered this command (arms the completion deposit)
+	int  m_accepted_n = 0;        // sectors the firmware has ACCEPTED (ledger $c0 stakes observed)
+	int  m_prog_count = 0;        // Q3b: sectors the op18 program commands (its port-$3F push count)
+	u32  m_aa_cell = 0;           // Q3b: ledger cell for the end marker (first stake + count)
+	bool m_aa_armed = false;      // Q3b: bootstrap strobe seen, deposit owed
+	bool m_aa_done = false;       // Q3b: deposited this command
+	u32  m_aa_last = 0;           // Q3b: last cell written, so each is deposited once
+	int  m_aa_n = 0;              // Q3b: log cap
+	bool m_status_armed = false; // all commanded sectors captured - completion byte owed at node+$26
 	bool m_timer_out = false;    // PIT1 ctr0 OUT -> F000 bit11
 	bool m_settle_out = true;    // PIT0 ctr1 mode-5 one-shot OUT; F000 bit1 seek/settle busy = !OUT
+	bool m_pit2_out = false;     // PIT1 ctr2 OUT (VARIANT 2/3 experiment surface)
 	bool m_r0_busy = false;      // R0 status bit1: latched at host GO, cleared at the firmware's DONE stamp
 	bool m_r0_doneint = false;   // R0 status bit2: OPER-DONE-INT, set at DONE, cleared by CLR-INT
 	bool m_gate0 = false;        // E800 bit9 -> PIT1 ctr0 gate
 	bool m_e800_bit12_prev = false;   // bit12 kickoff edge detect
 	bool m_host_int_prev = false;     // E802 bit7 host-completion interrupt level
 	bool m_floppy_loaded = false;
+	bool m_prog_done_irq4 = false;    // V3: one-shot IRQ4 after counted program ends
+
+	// E804 drive/head select, latched in the gate array (spec: op24 $6576-$65A0 builds it from the UIB -
+	// head from UIB+$D4 shifted into bits 8-11 and COMPLEMENTED, drive/control byte from UIB+$DC).  The
+	// gate array holds this until the firmware changes it; the read path uses the latched head to pick
+	// the side, rather than reading the firmware's own copy out of its work area.
+	u8 m_sel_head = 0;           // 0-15, decoded from E804 bits 8-11
+	u8 m_sel_drive = 0;          // E804 low byte: drive select + motor/write-current/precomp controls
 
 	// host doorbell / IOPB
 	u8  m_iopb_cmd = 0;          // command byte from the auto-fetched IOPB (drives the model's channel)
+	std::unique_ptr<u16[]> m_lram;   // SRAM_BYTE_SWAPPED backing store
+	u16 lram_r(offs_t offset, u16 mem_mask);
+	void lram_w(offs_t offset, u16 data, u16 mem_mask);
 	u32 m_iopb_addr = 0;         // host IOPB base (the auto-fetch source)
 	u8  m_mb_in[8] = {};         // inbound host register-file latch (pio 73F4-73FB)
 
@@ -249,6 +375,7 @@ private:
 	int  m_sec_count = 0;           // commanded sectors this operation ([$7abc])
 	int  m_sec_index = 0;           // sector currently being delivered
 	int  m_sec_phase = 0;           // 0 = ID (IRQ6) next, 1 = data (IRQ5) next
+	attotime m_next_rec = attotime::never;   // when the next field has physically passed the head
 };
 
 // ---------------------------------------------------------------------------
@@ -272,9 +399,11 @@ void multibus_storager_device::capture_track()
 	floppy_image_device *const fdd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
 	if (!fdd || !fdd->exists())
 		return;
-	int const side = m_cpu->space(AS_PROGRAM).read_word(0x7436) & 1;   // firmware target head [$7436]
+	// The side comes from the head the firmware SELECTED through E804, which the gate array latches -
+	// not from the firmware's own work area.  The gate array has no visibility into [$7436]; it knows
+	// only what it was commanded.
 	fdd->mon_w(0);
-	fdd->ss_w(side);
+	fdd->ss_w(m_sel_head & 1);
 	bool const fm = flux_density_fm();
 	fdc_pll_t pll;
 	pll.set_clock(attotime::from_nsec(fm ? 4000 : 2000));
@@ -335,6 +464,74 @@ void multibus_storager_device::capture_track()
 
 
 
+// op18's load has completed and the gate array's sequencer begins running the field program: open the
+// read window, decode the track, and arm the counted delivery of the commanded run.  This is the point
+// the program starts - not the E000 word[0] write that merely begins loading it.
+
+// 300 rpm = 200ms/revolution, divided by the sectors on the track (FM 16x128B -> 12.5ms).
+attotime multibus_storager_device::sector_period() const
+{
+	return attotime::from_msec(200) / std::max(1, m_track_n);
+}
+
+void multibus_storager_device::start_field_program()
+{
+	if (m_iopb_cmd != 0x94 && m_iopb_cmd != 0x95)
+		return;
+	// The commanded sector count is carried by the program the firmware just loaded - one port-$3F
+	// push per sector - so the gate array has it without reading the IOCB or any firmware cell.
+	{
+		int p3f = 0;
+		for (int i = 0; i < m_desc_n; i++)
+			if (m_desc_port[i] == 0x3f)
+				p3f++;
+		m_prog_count = p3f;
+	}
+	m_read_window = true;
+	m_armed = true;
+	bool const first_arm = !m_read_active;
+	if (!m_read_active && m_iopb_cmd == 0x95)
+	{
+		capture_track();
+		// per-COMMAND state.  NOTE: start_field_program is re-entered on EVERY record (the ISR
+		// re-issues the program's first command, E000 <= $0a6d, bit11 set), so anything that must
+		// happen once per read belongs in this block, never above it.
+		m_aa_cell = 0; m_aa_armed = false; m_aa_done = false;
+		m_accepted_n = 0; m_aa_last = 0; m_aa_n = 0;
+		int n = m_cpu->space(AS_PROGRAM).read_word(0x7abc) & 0xff;   // commanded sectors this track [$7abc]
+		if (n < 1 || n > m_track_n) n = m_track_n;
+		m_sec_count = n;
+		// Where is the head NOW?  The disk has been turning since power-on, so the first address mark
+		// the gate array meets is whichever sector happens to be passing - essentially never sector 1.
+		// This matters to the FIRMWARE, not just to realism.  The drain marks its want-list ($ff at the
+		// commanded positions $7654+base..) and the per-record handler ACCEPTS those ($7C7A -> $7E0A,
+		// and $7CA4 CLEARS [$741c]) while REJECTING everything else ($7D34 -> $7D4A -> $7D5C, which
+		// SETS [$741c]).  [$741c] is the sole bootstrap for [$7968] (via $82B2's gate), and [$7968] is
+		// what flips [$742C] at $7E8E so $8128 stakes a drainable index instead of $8120 writing c0.
+		// Starting every read at sector 1 means the firmware only ever sees wanted records, never
+		// rejects one, and can never bootstrap - the ledger stays undrainable and the drain finds D3=0.
+		double const rev = sector_period().as_double() * std::max(1, m_track_n);
+		double const phase = rev > 0.0 ? std::fmod(machine().time().as_double(), rev) / rev : 0.0;
+		m_sec_index = int(phase * m_track_n) % std::max(1, m_track_n);
+		m_sec_phase = 0;
+		m_read_active = true;
+	}
+	// The gate array holds the whole track in its bit buffer (capture_track - detection-is-capture, the
+	// AM2147 + 1801 preamble search absorb positional slop), so the FIRST record of a read is available
+	// at once rather than a sector-period later.  Do not deliver from here - that would land inside
+	// op18's own block-copy loop before it returns; arm the time and let the pump release it.
+	//
+	// ONLY on the first arm.  Every per-record ISR re-issues the program's first command (E000 <= $0a6d,
+	// bit11 set), which re-enters this routine; resetting the deadline there would destroy the
+	// rotational spacing and free-run the phase machine (measured: 200us per phase instead of
+	// 1.875/8.75ms, a 64us IRQ6/IRQ5 runaway with no data-done).
+	if (first_arm)
+		m_next_rec = machine().time();
+	m_pump->adjust(attotime::from_usec(PHYSICAL_TIMING ? 100 : 200));
+	if (!PHYSICAL_TIMING)
+		advance_read();      // stage + deliver the first record if the firmware is armed
+}
+
 // Deliver the held mark's interrupt IFF the firmware has armed (a bit-change PRIOR to the interrupt).
 // arm + held-mark -> exactly one IRQ; consumes both, so only one interrupt is ever live at a time.
 void multibus_storager_device::deliver_mark()
@@ -357,19 +554,53 @@ void multibus_storager_device::deliver_mark()
 // whole track is decoded up front (capture_track - detection-is-capture, the AM2147 bit-buffer + the
 // 1801 preamble search absorb positional slop); this delivers the wanted run to the firmware lock-step
 // with its per-record arm.  Per sector: IRQ6 (ID address mark, C/H/R/N staged in $7DAC where the
-// node+$c8..$ce POSPTR verify reads it) then a SINGLE IRQ5 (data field already DMA'd into the firmware-
-// programmed chunk C800[0] = [$741e]) = 8xIRQ6 + 8xIRQ5 for an 8-sector read.  When the count exhausts,
+// node+$c8..$ce POSPTR verify reads it) then TWO IRQ5 - the data field armed, then the data field done
+// (the firmware's $7BA8 setup and $8018 done handlers) = 8xIRQ6 + 16xIRQ5 for an 8-sector read.  Only
+// one IRQ5 dead-ends every sector at $7BA8 so $8018 never runs.  When the count exhausts,
 // capture stops; the firmware then launches the SRAM->host transfer whose channel-done IRQ4
 // (run_channel_dma) is the operation-complete op42 waits on.
 void multibus_storager_device::advance_read()
 {
 	if (m_mark_pending || !m_read_active)
 		return;                             // a record is held awaiting the arm, or the read is complete
-	if (m_sec_index >= m_sec_count)
+	// V1/V3: a finite field program stops raising marks once the commanded count is done, even if
+	// the firmware keeps re-arming (measured: it does).  That is a GA response to the loaded program
+	// + count, not a firmware-RAM poke.
+	if ((VARIANT == VAR_COUNTED_STOP || VARIANT == VAR_STOP_IRQ4)
+		&& m_accepted_n >= m_sec_count && m_sec_count > 0)
 	{
-		m_read_active = false;              // all commanded sectors delivered - capture complete, stop
+		logerror("GA disarm: accepted=%d delivered=%d count=%d t=%.5f\n",
+			m_accepted_n, m_data_done_n, m_sec_count, machine().time().as_double());
+		// V3: the counted program is COMPLETE - the commanded number of sectors has been accepted.
+		// Signal it the way a channel does, with one channel-done IRQ4 and no firmware-RAM write.
+		// This must hang off the ACCEPTED count, not the delivered one: delivered includes the
+		// records the firmware rejected ($7DA2 -> $88AC), so arming on it fires while sectors are
+		// still outstanding.
+		if (VARIANT == VAR_STOP_IRQ4 && !m_prog_done_irq4)
+		{
+			m_prog_done_irq4 = true;
+			m_dma_done->adjust(attotime::from_usec(50));
+			logerror("GA program-done IRQ4 armed t=%.5f\n", machine().time().as_double());
+		}
+		m_read_active = false;
 		return;
 	}
+	if (PER_ADDRESS_MARK)
+	{
+		// The disk keeps turning and every address mark that passes the head raises a record.  The gate
+		// array cannot know which sector is wanted - it has no header comparator; the firmware compares
+		// the captured field itself ($89F2) and simply stops re-arming when it is done.  So wrap, and
+		// let the arm/hold handshake be what ends the run.
+		if (m_sec_index >= m_track_n)
+			m_sec_index = 0;
+	}
+	else if (m_data_done_n >= m_sec_count && m_sec_count > 0)
+	{
+		m_read_active = false;              // counted program exhausted (same rule as VAR_COUNTED_STOP)
+		return;
+	}
+	if (PHYSICAL_TIMING && machine().time() < m_next_rec)
+		return;                             // this field has not passed the head yet
 	captured_sector const &s = m_track[m_sec_index];   // physical order = ascending R for the boot read
 	address_space &cs = m_cpu->space(AS_PROGRAM);
 	// The gate array runs op18's field sequence autonomously.  Per sector it raises the ID address mark
@@ -380,32 +611,70 @@ void multibus_storager_device::advance_read()
 	// via a second pump-delivered IRQ6 mis-times the transfer cadence and regresses to zero transfers).
 	if (m_sec_phase == 0)
 	{
-		cs.write_byte(0x7dac, 0xfe);            // normalised IDAM
-		cs.write_byte(0x7dad, s.c);             // C
-		cs.write_byte(0x7dae, s.h);             // H
-		cs.write_byte(0x7daf, s.r);             // POSITION (sector R)
-		cs.write_byte(0x7db0, s.nn);            // N
+		// Deposit the RAW RECOVERED ID FIELD at the address the firmware COMMANDED through the D800
+		// latch - the gate array writes where it was told, it does not know about $7DAC.  The layout is
+		// exactly what came off the surface, so it is density-dependent, and the firmware's readers
+		// expect precisely that: $9884 (the real sector-select compare) combines bytes 0-2 to $A1,
+		// requires $FE at byte 3 and takes the cylinder from byte 4(+5), gated on UIB+$12 bit2; the FM
+		// reader $7C7A instead expects $FE at byte 0, because FM HAS NO $A1 SYNC BYTES.
+		u32 dst = u32(m_d800) << 1;
+		if (dst < 0x4000 || dst + 8 > 0x8000)
+			dst = 0x7dac;                       // not yet latched (first record of a command)
+		int k = 0;
+		if (!flux_density_fm())
+			for (int p = 0; p < 3; p++)
+				cs.write_byte((dst + k++) & 0xffff, 0xa1);   // MFM sync preamble
+		cs.write_byte((dst + k++) & 0xffff, 0xfe);           // ID address mark
+		cs.write_byte((dst + k++) & 0xffff, s.c);            // C
+		cs.write_byte((dst + k++) & 0xffff, s.h);            // H
+		cs.write_byte((dst + k++) & 0xffff, s.r);            // R (sector)
+		cs.write_byte((dst + k++) & 0xffff, s.nn);           // N
 		m_mark_pending = 6;
 		m_sec_phase = 1;
+		m_next_rec = machine().time() + sector_period() * 15 / 100;   // ID -> gap -> data field
 	}
 	else if (m_sec_phase == 1)
 	{
-		// The firmware assembles the whole run in a linear SRAM buffer, advancing the local address by one
-		// field per sector ($4000, $4080, ...); its per-sector host DMA sources D000 = that advancing address.
-		// (This only becomes visible once the transfer chain actually runs all 8 - it needs the DMA to hold
-		// the CPU so the firmware doesn't race ahead; see run_channel_dma.)  Stage each sector to its slot.
-		u32 const dst = 0x4000 + m_sec_index * s.len;
-		if (dst >= 0x4000 && dst + s.len <= 0x8000)
-			for (int k = 0; k < s.len; k++)
-				cs.write_byte((dst + k) & 0xffff, s.data[k]);
-		m_mark_pending = 5;                     // data field armed (IRQ5 #1 -> $7BA8)
+		m_mark_pending = 5;                     // data field armed (IRQ5 #1 -> $7BA8 setup)
 		m_sec_phase = 2;
+		m_next_rec = machine().time() + sector_period() * 70 / 100;   // the data field passing
 	}
 	else
 	{
+		// The setup handler this record's arm ran ($7BA8) has just programmed the destination chunk into
+		// C800[0] - the live SRAM chunk word pointer, = [$741e].  The gate array deserialises the data field
+		// into exactly the chunk it was COMMANDED with, so the model must use that address rather than one of
+		// its own: staging at a self-computed 0x4000 + index*len puts each sector a record ahead of the
+		// firmware's pointer, so its per-sector DMA sources the previous chunk, the first chunk is sent twice
+		// and the last sector is never transferred at all.
+		u32 const dst = u32(m_c800[0]) << 1;
+		// TEMP (STRIP): correlate the sector the FIRMWARE accepted ([$7428], written only at $992E in
+		// the ID-match routine) against the chunk it is actually landing in.  Both are model-side reads
+		// at a point we control - no prefetch semantics involved.
+		// The FIRST data field of a run is structurally discarded: the firmware arms C800[0] only in
+		// RESPONSE to the data-done record ($8018), so field 0 can have no destination, and withholding
+		// its record to wait for one deadlocks (measured: 9293 attempts, never armed).  The field is
+		// genuinely lost - it arms the pipeline - and the wanted data must be caught on a later pass.
+		if (dst >= 0x4000 && dst + s.len <= 0x8000)
+			for (int k = 0; k < s.len; k++)
+				cs.write_byte((dst + k) & 0xffff, s.data[k]);
 		m_mark_pending = 5;                     // data field captured (IRQ5 #2 -> $8018 done)
 		m_sec_phase = 0;
 		m_sec_index++;                          // one sector completed after its data-done record
+		m_next_rec = machine().time() + sector_period() * 15 / 100;   // trailing gap -> next ID
+		if (++m_data_done_n == m_sec_count)
+		{
+			// COUNT EXHAUST (model observation only).  Do NOT write firmware RAM here.
+			// A prior experiment OR'd UIB+$12 bit7 (op42 guard bypass at $6C32) and deposited a
+			// phase byte at node+$26 from the pump - both are unproven "GA writes firmware RAM"
+			// hypotheses.  cont.414c: even when op42 times out the host still never sees 0x80, so
+			// short-circuiting op42 is not the real completion path.  Probe with these deposits
+			// GATED OFF so the log reflects firmware-only state.
+			m_status_armed = true;
+			logerror("GA count-exhaust n=%d var=%d t=%.4f (no UIB+12 / node+26 deposit)\n",
+				m_data_done_n, VARIANT, machine().time().as_double());
+
+		}
 	}
 	deliver_mark();
 }
@@ -418,6 +687,57 @@ TIMER_CALLBACK_MEMBER(multibus_storager_device::pump_tick)
 	deliver_mark();
 	if (m_read_window)
 		advance_read();
+	// Q3b: deposit the end marker once the firmware has signalled it bootstrapped.  Done HERE, from the
+	// device's own context: currently_executing() is not the local CPU, so the model's $4000-$7FFF snoop
+	// taps ignore it and m_term_bit0 / m_last_bw stay clean.  From the next record onward the firmware
+	// tests it at $7E9A (the [$7968]!=0 arm) and terminates via $7ED8.
+	if (Q3B_END_MARKER && m_aa_armed && m_aa_cell >= 0x7654 && m_aa_cell <= 0x76bf)
+	{
+		address_space &cs2 = m_cpu->space(AS_PROGRAM);
+		if (!m_aa_done)
+		{
+			cs2.write_byte(m_aa_cell & 0xffff, 0xaa);
+			m_aa_done = true;
+			m_aa_armed = false;
+			logerror("Q3D %10.1fus $AA -> [%04x] (bus-master) [7968]=%04x remain=%04x\n",
+				machine().time().as_double() * 1e6, m_aa_cell,
+				cs2.read_word(0x7968), cs2.read_word(0x7956));
+		}
+	}
+
+	// Intentionally NO firmware-RAM completion deposit here (see count-exhaust note above).
+	// Log once when count has exhausted and the walker has parked, so we can see the window
+	// without inventing the byte the watch pump supposedly needs.
+	// The phase byte is not a completion signal - it is the gate array's "service me" handshake.  The
+	// walker parks by writing the phase as a WORD ($15A0), which leaves $00 in the HIGH half, and the
+	// watch pump gates on a BYTE read of exactly that half ($162A).  Supply it at EVERY park while a
+	// capture is live, not once at the end: the pump is what dispatches $7964, whose $32AC query sets
+	// [$7968] ("a record is pending"), and [$7968] is what makes op4A DEFER its drain ($6EE2) instead
+	// of running it inline against an empty ledger.  The deferred drain then runs from the ISR once
+	// records exist, finds [$74b4] non-empty, and launches at $70F4 - no kick involved.
+	if (!SRAM_BYTE_SWAPPED && (m_status_armed || m_read_active))
+	{
+		u32 const node = m_node_base;
+		if (node >= 0x4000 && node + 0x26 < 0x8000)
+		{
+			address_space &cs = m_cpu->space(AS_PROGRAM);
+			if (cs.read_word((node + 0x26) & 0xffff) == 0x000a)
+			{
+				// The walker parks by writing the phase as a WORD ($15A0 move.w #$a,($26,A2)), which
+				// leaves $00 in the HIGH half - and the watch pump gates on a BYTE read of exactly that
+				// half ($162A cmpi.b #$a,($26,A1)).  No firmware path can set it, so the gate array
+				// must, after the park (the park would otherwise overwrite it).  Address derived from
+				// the D000 latch; written from device context, so it is a bus-master cycle the model's
+				// own $4000-$7FFF snoop ignores.
+				cs.write_byte((node + 0x26) & 0xffff, 0x0a);
+				bool const final = m_status_armed;
+				m_status_armed = false;
+				logerror("GA phase byte -> node+26 (%04x) node=%04x %s t=%.5f\n",
+					(node + 0x26) & 0xffff, node, final ? "(count exhausted)" : "(capture live)",
+					machine().time().as_double());
+			}
+		}
+	}
 	m_pump->adjust(attotime::from_usec(200));
 }
 
@@ -455,44 +775,84 @@ void multibus_storager_device::run_channel_dma()
 	// captured field length rather than the control-block size.
 	bool const is_data = to_host && m_sec_count > 0 && ld >= 0x4000 && ld < 0x7000;   // the linear data buffer
 	u32 const len = is_data ? m_track[0].len : (BIT(e800, 13) ? 0x18 : 0x20);   // node = 0x18, UIB = 0x20
+	// D000 is the GENERIC local-DMA address latch - it carries the node for one control block and the
+	// UIB for the next (both loaded at $3D42).  The class is what distinguishes them, so latch the UIB
+	// base here: it is where the operation-complete bit (UIB+$12 bit7) has to be deposited.
+	// D000 is the GENERIC local-DMA latch - it carries the node for one control block and the UIB for
+	// the next, and once the transfer is launched it carries data addresses too.  Latch each base by
+	// its class (E800 bit13: set = node/0x18, clear = UIB/0x20) so later traffic cannot move them.
+	if (!is_data && ld >= 0x4000 && ld < 0x8000)
+	{
+		if (BIT(e800, 13)) m_node_base = ld;
+		else               m_uib_base  = ld;
+	}
 	if ((to_local || to_host) && ld >= 0x4000 && ld + len <= 0x8000 && m_c000 >= 0x010000 && m_c000 < 0xff0000)
 	{
-		// The status write-back (local->host) byte-swaps each 16-bit word: the 68000 writes the status as
-		// its BE low byte (node+3), and the CPUAP polls IOPB+2 - the swap lands node+3 at host+2.  The
-		// host->local fetches (IOPB/UIB) are consumed byte-wise by the firmware and copy straight.
+		// Control blocks (local->host) byte-swap each 16-bit word: the 68000 holds the status as its BE low
+		// byte (node+3) and the CPUAP polls IOPB+2, so the swap is what lands node+3 at host+2 (verified -
+		// it is how the host ever sees 0x81).  DATA fields do NOT swap: the gate array presents the recovered
+		// byte stream to the bus, and the host data buffer is byte-addressed (the label read targets the ODD
+		// address 0x0FC0DD, which no word-boundary swap could serve).  Swapping data delivers the label as
+		// "OV1LISIN0X" instead of "VOL1SINIX0".  The real board almost certainly selects this per transfer
+		// from a swap-control bit in the IOCB/UIB; that bit is not decoded yet, so key it on the field type.
+		// Under SRAM_BYTE_SWAPPED the local read_byte already returns the other half, so the
+		// compensation inverts - otherwise the host's view double-corrects back to raw big-endian.
+		u32 const swap = SRAM_BYTE_SWAPPED ? (is_data ? 1 : 0) : (is_data ? 0 : 1);
+		// TEMP: the host's completion verdict is node+3, which the swap lands at host+2.
+		if (to_host && !is_data && len > 3)
+		{
+			u8 const stv = cs.read_byte((ld + 3) & 0xffff);
+			u8 const st2 = cs.read_byte((ld + 2) & 0xffff);
+			// The swap sends node+2 -> host+3 and node+3 -> host+2.  The firmware's two stamps differ in
+			// operand size: $1314 move.w #$81,($2,A0) puts BUSY in node+3; $1A54 move.b #$80,($2,A0) puts
+			// the COMPLETION verdict in node+2, with node+3 then taking D5 (the clamped retry byte, $1A78).
+			logerror("HOST POST: node+2=%02x node+3=%02x  -> host+2=%02x host+3=%02x  %s t=%.5f\n",
+				st2, stv, stv, st2,
+				st2 == 0x80 ? "*** COMPLETION (0x80) ***" : (stv == 0x81 ? "busy" : "other"),
+				machine().time().as_double());
+		}
 		for (u32 k = 0; k < len; k++)
 		{
 			if (to_local) cs.write_byte((ld + k) & 0xffff, bs.read_byte((m_c000 + k) & 0xffffff));
-			else          bs.write_byte((m_c000 + (k ^ 1)) & 0xffffff, cs.read_byte((ld + k) & 0xffff));
+			else          bs.write_byte((m_c000 + (k ^ swap)) & 0xffffff, cs.read_byte((ld + k) & 0xffff));
 		}
 	}
-	// The bus-master transfer completes and the gate array raises the channel-done IRQ4.  For the read's
-	// per-slot channel transfers, raising it synchronously re-enters the firmware's launch sequence mid-
-	// flight; schedule it a few microseconds out (real DMA time) so the launch completes first.  INIT/UIB
-	// fetches (0x87) and node write-backs expect it synchronously - the firmware polls the result at once.
-	if (m_iopb_cmd == 0x94 || m_iopb_cmd == 0x95)
-	{
-		// The gate array bus-masters the transfer and holds the 68000 off the bus for its duration (DTACK), so
-		// the firmware cannot start the next sector's work until the DMA completes.  Modelling that hold (spin
-		// the CPU for the transfer time) is what lets the transfer chain run to completion: without it our
-		// instant DMA lets the CPU race ahead and the descriptor drain launches only 2 of 8 sectors; with it,
-		// all 8 launch and the descriptor queue drains.
-		if (is_data)
-			m_cpu->spin_until_time(attotime::from_usec(40));
-		m_dma_done->adjust(attotime::from_usec(40));
-	}
-	else
-		m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE);
+	// The gate array bus-masters the transfer: it takes the local bus for the transfer's duration and the
+	// 68000 stalls on DTACK, so the firmware cannot start the next field's work until the DMA completes.
+	// Model that as the level it is - hold the CPU off the bus at the kickoff, release it when the transfer
+	// ends - rather than as a fixed timeout, so the hold is bounded by this transfer alone (nothing else on
+	// the machine can pre-empt it) and its length falls out of the byte count.  Without the hold the CPU
+	// races ahead of the instant DMA and the read's descriptor drain launches only 2 of 8 sectors; with it
+	// all 8 launch and the descriptor queue drains.
+	m_cpu->suspend(SUSPEND_REASON_HALT, true);
+	m_bus_held = true;
+	m_dma_done->adjust(dma_time(len));
 }
 
+// Transfer time for a bus-master DMA of len bytes.  The gate array moves a 16-bit word per Multibus
+// cycle; ~600ns/word (rev A handshake at 10MHz) puts a 128-byte FM sector at ~38us.
+attotime multibus_storager_device::dma_time(u32 len) const
+{
+	return attotime::from_nsec(600) * ((len + 1) / 2);
+}
+
+// End of the bus-master transfer: the gate array releases the local bus and raises the channel-done IRQ4.
 TIMER_CALLBACK_MEMBER(multibus_storager_device::dma_done)
 {
-	m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE);    // channel / DMA done (after the transfer time)
+	if (m_bus_held)
+	{
+		m_cpu->resume(SUSPEND_REASON_HALT);
+		m_bus_held = false;
+	}
+	m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE);
 }
 
 // ---------------------------------------------------------------------------
 // gate-array registers
 // ---------------------------------------------------------------------------
+
+// TEMP (STRIP): one ordered, timestamped trace of every gate-array access during the read, so the
+// op18 -> op42 transition and the IRQ5/IRQ6 cadence can be read against each other on one clock.
 
 u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 {
@@ -503,7 +863,9 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 	// status - it does NOT byte-assemble the bit stream; the gate array deserializes each record into SRAM
 	// itself and signals via the IRQ6/IRQ5 marks).  Return the register echo.
 	if (a == 0xe000)
+	{
 		return m_ch[offset];
+	}
 
 	// E01E: the gate array's record-status latch.  Reading it is the firmware's ACK - it CLEARS the latch
 	// so the gate array can deliver the next record.  The read value itself is discarded by the firmware
@@ -514,7 +876,17 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		m_rec_latch = false;
 	}
 
-	// F000: drive + auxiliary status (spec §3.3).
+	// F000: drive + auxiliary status (spec §3.3).  Decoded from op24 ($651C), the unit-select/status
+	// micro-op, which is the only reader before a transfer starts:
+	//   bit0  FAULT      $663C btst #0 -> if SET the op aborts with error $10
+	//   bit3  FAULT      $65AE btst #3 -> if SET the op aborts with error $1B
+	//   bit4  INDEX      $6746 btst #4
+	//   bit5  UNIT READY $66D6 masks F000 and compares == $20, i.e. ready with no other status bits
+	//   $6772 composes the per-unit status byte: [$794e] = ~F000 & table[$22E + unit], so a CLEAR F000
+	//   bit becomes a SET fault bit.  Table @$22E = 00 06 00 27 00 3f 00 2d ef ff cf ef 2f ff 0f ef,
+	//   i.e. a different mask per device class (floppy / ESDI / tape).
+	// Both fault bits must read back CLEAR and bit5 SET for a unit to be usable - which is what lets
+	// the firmware decide a unit is present before it will boot from it.
 	if (a == 0xf000)
 	{
 		if (!m_floppy_loaded)
@@ -535,6 +907,14 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		d = (d & ~0x0400) | (wprot ? 0x0400 : 0);         // bit10 = write-protect
 		d = (d & ~0x0010) | (index ? 0x0010 : 0);         // bit4  = index pulse
 		d = (d & ~0x0002) | (m_settle_out ? 0 : 0x0002);  // bit1  = seek/settle busy (PIT ctr1 one-shot, low = busy)
+		// V2: surface PIT1 ctr2 OUT on bit8 (suspected op42 Branch-B busy/fault).  Baseline leaves
+		// bit8 clear.  Read path is Branch A so a change here should not move op42 by itself.
+		if (VARIANT == VAR_PIT2_OUT)
+			d = (d & ~0x0100) | (m_pit2_out ? 0x0100 : 0);
+		else
+			d &= ~0x0100;
+		d &= ~0x0200;                                    // bit9 unmodeled; keep clear
+		d &= ~0x0009;                                    // bits 0/3 = drive faults (errors $10 / $1B); a healthy unit reports none
 	}
 	return d;
 }
@@ -543,6 +923,19 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 {
 	u32 const a = 0xe000 + offset * 2;
 	COMBINE_DATA(&m_ch[offset]);
+
+	// E000-E01E doubles as the field step program's 16 words.  op18 block-writes them in ascending
+	// order; the write that completes the block (E01E) is the load-complete edge on which the gate
+	// array's sequencer starts running the program.
+	if (offset < std::size(m_prog))
+	{
+		m_prog[offset] = m_ch[offset];
+		if (offset == std::size(m_prog) - 1 && !m_prog_loaded)
+		{
+			m_prog_loaded = true;
+			start_field_program();
+		}
+	}
 
 	if (a == 0xe000)
 	{
@@ -560,24 +953,13 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		// the operation autonomously.  On the rising edge we capture the whole track (detection-is-capture)
 		// and arm the counted delivery of exactly the commanded run (advance_read).  Each per-record re-arm
 		// (E802 bit11) releases the next mark.
-		bool const win = BIT(data, 11) && (m_iopb_cmd == 0x94 || m_iopb_cmd == 0x95);
+		// Once the program is loaded, an E000 bit11 write is the firmware's per-record RE-engagement
+		// (the 022f -> 023f -> 0a6d cycle each record ISR issues, whose third word re-issues the
+		// program's first command).  Before the load completes the identical bit pattern is merely
+		// word[0] of the block being copied in - not a command - so it must not start anything.
+		bool const win = BIT(data, 11) && m_prog_loaded && (m_iopb_cmd == 0x94 || m_iopb_cmd == 0x95);
 		if (win && !m_e000b11_prev)
-		{
-			m_read_window = true;
-			m_armed = true;
-			if (!m_read_active && m_iopb_cmd == 0x95)
-			{
-				capture_track();
-				int n = m_cpu->space(AS_PROGRAM).read_word(0x7abc) & 0xff;   // commanded sectors this track [$7abc]
-				if (n < 1 || n > m_track_n) n = m_track_n;
-				m_sec_count = n;
-				m_sec_index = 0;
-				m_sec_phase = 0;
-				m_read_active = true;
-			}
-			m_pump->adjust(attotime::from_usec(200));   // start the mark clock
-			advance_read();      // stage + deliver the first record if the firmware is armed
-		}
+			start_field_program();
 		m_e000b11_prev = win;
 	}
 	else if (a == 0xe800)
@@ -589,7 +971,27 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		bool const kick = BIT(data, 12) && !m_e800_bit12_prev;
 		m_e800_bit12_prev = BIT(data, 12);
 		if (kick)
+		{
+			// TEMP (STRIP): every bit12 rising edge, including those that do not transfer
+			// (missing C000, wrong direction, etc.) - settles the "0 vs 8/8 DMA" measurement gap.
+			logerror("E800b12 %10.1fus rise e800=%04x d000=%04x c000=%06x c000v=%d pc=%06x\n",
+				machine().time().as_double() * 1e6, data, m_d000, m_c000, m_c000_valid ? 1 : 0,
+				m_cpu->pcbase());
 			run_channel_dma();
+		}
+	}
+	else if (a == 0xe804)
+	{
+		// Drive / head select.  op24 writes it twice (the second write merges the head nibble back over
+		// the control byte); op28's seek engine drives stepping through it.  Bits 8-11 carry the head
+		// ONE'S-COMPLEMENTED, so head 0 presents as $F (the observed $BF78 = head 0, the cyl0 label).
+		m_sel_head = u8(~(data >> 8) & 0x0f);
+		m_sel_drive = u8(data & 0xff);
+		if (EXP_EARLY_CAPTURE && m_iopb_cmd == 0x95 && !m_read_active)
+		{
+			logerror("EXP: early capture arm at E804 drive-select t=%.5f\n", machine().time().as_double());
+			start_field_program();
+		}
 	}
 	else if (a == 0xe802)
 	{
@@ -645,6 +1047,26 @@ u16 multibus_storager_device::c800_r(offs_t offset)
 void multibus_storager_device::c800_w(offs_t offset, u16 data, u16 mem_mask)
 {
 	COMBINE_DATA(&m_c800[offset & 0xff]);
+
+	// C800 is a set of write PORTS into the field sequencer, not a 256-cell file: op18 pushes a
+	// descriptor stream through three offsets, writing the SAME port repeatedly (cell 0 six times over,
+	// cell $3F eight times) - as storage all but the last would be lost, so each write is a push.  A
+	// push is framed by E800's load-enable (the ori #$80 op18 issues before every descriptor); a C800
+	// write WITHOUT it is an ordinary register access - the per-record chunk arm the record ISR issues
+	// through cell 0.  Recorded in push order; what the descriptors program is not yet decoded.
+	if (BIT(m_ch[(0xe800 - 0xe000) / 2], 7) && m_desc_n < std::size(m_desc_port))
+	{
+		m_desc_port[m_desc_n] = u8(offset & 0xff);
+		m_desc_val[m_desc_n] = data;
+		m_desc_n++;
+	}
+	if (m_cpu->pcbase() == 0x30e0)   // TEMP (STRIP): op18's triple loop - block ptr + the live triple
+		logerror("TEMPC800 cell[%02x] <= %04x  A2=%06x D1=%02x D0=%02x D5=%02x [7938]=%04x\n",
+			offset & 0xff, data, u32(m_cpu->state_int(M68K_A2)),
+			u32(m_cpu->state_int(M68K_D1)) & 0xff, u32(m_cpu->state_int(M68K_D0)) & 0xff,
+			u32(m_cpu->state_int(M68K_D5)) & 0xff, m_cpu->space(AS_PROGRAM).read_word(0x7938));
+	else
+		logerror("TEMPC800 cell[%02x] <= %04x pc=%06x\n", offset & 0xff, data, m_cpu->pcbase());   // TEMP (STRIP)
 	if (m_dma_active)
 		m_dma_term = (u16((offset & 0x7f) * 2) << 6) | ((data & 0x3f) << 1);
 }
@@ -734,8 +1156,10 @@ void multibus_storager_device::host_win_w(offs_t offset, u16 data, u16 mem_mask)
 		// stamps.  Without it the accept/status stamps land on garbage (addr 0).
 		cs.write_word(0x7b20, dst);
 		m_iopb_cmd = cs.read_byte(dst);
+		logerror("HOST GO: cmd=%02x iopb=%06x t=%.5f\n", m_iopb_cmd, dbi, machine().time().as_double());
 		m_iopb_addr = dbi;
 		m_window_seen = false; m_term_fired = false; m_idx_prev = false; m_read_active = false;   // per-command reset
+		m_prog_loaded = false; m_desc_n = 0;   // each command loads its own field program before it runs
 		// The firmware carries the STATUS/ERROR bytes back to the host IOPB itself, via its node->host
 		// bus-master DMA (run_channel_dma, E800 bit13); the model transcribes nothing here.
 		m_read_window = false;   // new command: a read re-arms its own window (no stale arm across the boundary)
@@ -784,6 +1208,10 @@ void multibus_storager_device::bus_mem_w(offs_t offset, u16 data, u16 mem_mask)
 		bool hit = false;
 		if (ACCESSING_BITS_8_15 && addr == st)     { stv = data >> 8;   hit = true; }
 		if (ACCESSING_BITS_0_7  && addr + 1 == st) { stv = data & 0xff; hit = true; }
+		if (hit)
+			logerror("HOST IOPB+2 stamp <= %02x  (%s) iopb=%06x t=%.5f\n", stv,
+				stv == 0x80 ? "*** 0x80 GOOD ***" : (stv == 0x82 ? "0x82 ERROR" : "busy/other"),
+				m_iopb_addr, machine().time().as_double());
 		if (hit && (stv & 0x80)) { m_r0_busy = false; m_r0_doneint = true; }
 	}
 }
@@ -804,6 +1232,12 @@ void multibus_storager_device::timer0_out(int state)
 
 void multibus_storager_device::timer2_out(int state)
 {
+	// PIT1 ctr2 is programmed by the firmware (op28/$684C, op42/$6CC2 control $9A).  Capture OUT
+	// so VARIANT 2 can surface it; baseline ignores it.
+	bool const rising = state && !m_pit2_out;
+	m_pit2_out = bool(state);
+	if (rising)
+		logerror("PIT2 OUT rise t=%.4f\n", machine().time().as_double());
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +1266,8 @@ void multibus_storager_device::floppy_swap_cb(floppy_image_device *)
 
 void multibus_storager_device::device_start()
 {
+	m_lram = std::make_unique<u16[]>(0x2000);
+	save_pointer(NAME(m_lram), 0x2000);
 	save_item(NAME(m_ch));
 	save_item(NAME(m_c000));
 	save_item(NAME(m_c000_valid));
@@ -853,16 +1289,89 @@ void multibus_storager_device::device_reset()
 		// data aperture the host reads kernel blocks through (0xF00000 = bus I/O 0x0000).
 		m_bus->space(AS_IO).install_read_handler(0x0000, 0x00ff,
 			read16sm_delegate(*this, FUNC(multibus_storager_device::bus_data_r)));
-		// snoop the local-bus buffer (0x4000-0x7FFF): the gate array's address comparator watches
-		// writes to advance the transfer pointer (F000 bit12 terminal match).
+		// Snoop the local-bus buffer (0x4000-0x7FFF): the gate array's address comparator watches the
+		// bus so it can answer the F000 bit12 address-match test - it latches the byte-strobe of a read
+		// and the address of a write.
+		//
+		// The snoop must fire only on a REAL BUS CYCLE.  A MAME tap is called for every access through
+		// the address space, and that includes debugger and Lua reads, which are not bus cycles at all
+		// (the Lua accessors call read_byte() with no side-effect guard).  Honouring those makes the
+		// device corruptible by observing it: a probe polling firmware RAM each tick clobbers
+		// m_term_bit0, the firmware's $9C00 address-comparator self-test then reads a wrong bit12, and
+		// the board exits to $367A self-test idle and never services another command - which looked
+		// exactly like a boot hang and cost a session to run down.  Gate on the storager's own CPU
+		// actually executing, so inspecting the model cannot change it.
 		address_space &cs = m_cpu->space(AS_PROGRAM);
+		auto const on_local_bus = [this]()
+		{
+			device_execute_interface *const exec = machine().scheduler().currently_executing();
+			return exec && (&exec->device() == m_cpu.target());
+		};
 		cs.install_read_tap(0x4000, 0x7fff, "dma_snoop_r",
-			[this](offs_t, u16 &, u16 mem_mask) { if (m_dma_active) m_term_bit0 = (mem_mask == 0x00ff) ? 1 : 0; });
+			[this, on_local_bus](offs_t, u16 &, u16 mem_mask)
+			{ if (m_dma_active && on_local_bus()) m_term_bit0 = (mem_mask == 0x00ff) ? 1 : 0; });
 		cs.install_write_tap(0x4000, 0x7fff, "dma_snoop_w",
-			[this](offs_t offset, u16 &, u16 mem_mask) { if (m_dma_active) m_last_bw = offset + ((mem_mask == 0x00ff) ? 1 : 0); });
+			[this, on_local_bus](offs_t offset, u16 &, u16 mem_mask)
+			{ if (m_dma_active && on_local_bus()) m_last_bw = offset + ((mem_mask == 0x00ff) ? 1 : 0); });
+		// Count the sectors the firmware ACCEPTS.  The gate array has no header comparator - it raises
+		// every address mark and the firmware decides ($7C7A/$7D34).  A rejected record is torn down at
+		// $7DA2 -> $88AC, which clears the capture re-arm (E802 bit11) and the $7950 alternator; an
+		// accepted one is STAKED $c0 into the ledger.  So delivered-field count != sectors read, and the
+		// counted disarm must follow the stakes.  Value only - no SRAM read, so the snoop above is not
+		// disturbed.
+		// Q2 DIAGNOSTIC, not a fix.  $70D4 `move.w #$1,$7a30' genuinely zeroes the high byte that
+		// $6042's `bset #0,$7a30' armed - a word write does that on real hardware, so this is firmware
+		// behaviour, not a modelling error.  Wired here only to answer one question: if the kick
+		// survives to the first ISR after the descriptor queue goes non-empty, does $8344 -> $3DBC ->
+		// (queue non-empty) -> $3E50 -> $4062 -> $4122 -> $414C launch, and does the rest of the chain
+		// then complete?  The $3E08 SR fork is only on the EMPTY path, so an interrupt-context call
+		// launches just as a mainline one would.
+		if (Q2_PRESERVE_KICK_ARM)
+			cs.install_write_tap(0x7a30, 0x7a31, "q2_kick",
+				[](offs_t, u16 &data, u16 mem_mask)
+				{
+					if (mem_mask == 0xffff && (data & 0xff00) == 0)
+						data |= 0x0100;      // keep the high-byte kick bit through the word store
+				});
+		cs.install_write_tap(0x7654, 0x76bf, "accept_count",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{
+				if (!m_read_active) return;
+				u8 const v = (mem_mask == 0x00ff) ? u8(data) : u8(data >> 8);
+				if (v != 0xc0)
+					return;
+				m_accepted_n++;
+				// End-of-transfer marker.  The firmware's terminate fork tests ONE cell, one
+				// instruction after the last accepted sector takes the remaining count to zero
+				// ($7EBE -> $7EC2 not taken -> $7ED0 cmpi.b #$aa,(A0,D0.w) -> $7ED8, stop re-arming).
+				// Within a record it TESTS S+1 then STAKES S, so the cell that test will read is
+				// (this stake's address + 2) - and the PENULTIMATE stake is the last chance to write
+				// it, 4.6 ms ahead of the edge.  Both inputs are the gate array's own: the write
+				// address it just saw on the bus, and the count from its op18 program's port-$3F
+				// pushes.  Record only; the pump deposits it as a bus-master cycle.
+				int const n = m_prog_count > 0 ? m_prog_count : m_sec_count;
+				if (Q3B_END_MARKER && n > 1 && m_accepted_n == n - 1 && !m_aa_done)
+				{
+					u32 const addr = (mem_mask == 0x00ff) ? (offset + 1) : offset;
+					u32 const cell = addr + 2;
+					if (cell >= 0x7654 && cell <= 0x76bf)
+					{
+						m_aa_cell = cell;
+						m_aa_armed = true;
+					}
+				}
+			});
+		// (Diagnostic taps removed.  The Lua instruments under docs/storager-lle carry the same
+		//  coverage without compiling anything into the device: timeline.lua for the completion
+		//  chain, gatrace.lua for every gate-array access, blocks.lua for the control blocks.)
 		m_installed = true;
 	}
 	m_cpu->set_input_line(M68K_IRQ_2, CLEAR_LINE);
+	if (m_bus_held)          // a reset mid-DMA drops the gate array's bus hold
+	{
+		m_cpu->resume(SUSPEND_REASON_HALT);
+		m_bus_held = false;
+	}
 	m_dma_active = false;
 	m_e800_bit12_prev = false;
 	m_host_int_prev = false;
@@ -873,7 +1382,18 @@ void multibus_storager_device::device_reset()
 	m_bit11_prev = false;
 	m_rec_latch = false;
 	m_mark_pending = 0;
+	m_sel_head = 0;
+	m_sel_drive = 0;
+	m_prog_loaded = false;
+	m_desc_n = 0;
+	m_prog_done_irq4 = false;
+	m_pit2_out = false;
+	m_data_done_n = 0;
+	m_status_armed = false;
+	m_read_active = false;
 	spin_drives();
+	logerror("GA VARIANT=%d (0=base 1=count-stop 2=pit2 3=stop+irq4) Q2_KICK=%d\n",
+		VARIANT, int(Q2_PRESERVE_KICK_ARM));
 }
 
 void multibus_storager_device::floppy_formats(format_registration &fr)
@@ -889,7 +1409,10 @@ static void storager_floppies(device_slot_interface &device)
 
 void multibus_storager_device::device_add_mconfig(machine_config &config)
 {
-	M68000(config, m_cpu, 50_MHz_XTAL / 4);
+	// Board oscillators (storagerii.webp): a 32/10 MHz can and a 50 MHz can.  The CPU runs from the
+	// 10 MHz output - the Storager II carries an MC68000-10 and the v180/SGI revisions an MC68000L10,
+	// both 10 MHz parts, so the earlier 50/4 = 12.5 MHz would have overclocked them by 25%.
+	M68000(config, m_cpu, 10_MHz_XTAL);
 	m_cpu->set_addrmap(AS_PROGRAM, &multibus_storager_device::mem_map);
 	m_cpu->set_addrmap(AS_OPCODES, &multibus_storager_device::opcodes_map);   // fetches see ROM at 0x4000+
 
@@ -923,13 +1446,32 @@ void multibus_storager_device::opcodes_map(address_map &map)
 	map(0x000000, 0x00ffff).rom().region("cpu", 0).mirror(0xff0000);
 }
 
+// Byte accesses resolve to the OTHER half of the stored word; word accesses pass through unchanged.
+u16 multibus_storager_device::lram_r(offs_t offset, u16 mem_mask)
+{
+	u16 const v = m_lram[offset];
+	if (mem_mask == 0xff00) return u16(v & 0x00ff) << 8;   // even byte -> low half
+	if (mem_mask == 0x00ff) return (v >> 8) & 0x00ff;      // odd byte  -> high half
+	return v;
+}
+
+void multibus_storager_device::lram_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	if (mem_mask == 0xff00)      m_lram[offset] = (m_lram[offset] & 0xff00) | ((data >> 8) & 0x00ff);
+	else if (mem_mask == 0x00ff) m_lram[offset] = (m_lram[offset] & 0x00ff) | ((data & 0x00ff) << 8);
+	else                         m_lram[offset] = (m_lram[offset] & ~mem_mask) | (data & mem_mask);
+}
+
 void multibus_storager_device::mem_map(address_map &map)
 {
 	// The board decodes only A1-A15 (A16-A23 don't-care); the firmware reaches ROM/RAM/I/O via 68000
 	// short-absolute and PC-relative addressing that sign-extends to 0xFFxxxx, so everything mirrors
 	// across A16-A23.
 	map(0x000000, 0x00ffff).rom().region("cpu", 0).mirror(0xff0000);
-	map(0x004000, 0x007fff).ram();
+	if (SRAM_BYTE_SWAPPED)
+		map(0x004000, 0x007fff).rw(FUNC(multibus_storager_device::lram_r), FUNC(multibus_storager_device::lram_w));
+	else
+		map(0x004000, 0x007fff).ram();
 
 	// two 8253 PITs interleaved at 0x8000 (#0 = high byte, #1 = low byte)
 	map(0x008000, 0x008007).mirror(0xff0000).rw(m_pit[0], FUNC(pit8253_device::read), FUNC(pit8253_device::write)).umask16(0xff00);
