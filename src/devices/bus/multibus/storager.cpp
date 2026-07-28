@@ -182,6 +182,11 @@ constexpr bool EXP_EARLY_CAPTURE = false;
 // node+$26 deposit and Q2 exist to paper over.  If byte accesses resolve to the other half, all three
 // resolve at once with no patch.  Word accesses are unaffected by construction.
 constexpr bool SRAM_BYTE_SWAPPED = true;
+// cont.428: does the gate array self-disarm at all?  Every counted variant needs a count the GA
+// cannot legitimately have - a raw mark count starves the read (rejected records count toward it),
+// and a stake tally is a firmware-RAM snoop.  The firmware already stops the records by ceasing to
+// re-arm E802 bit11, which IS a gate-array-visible signal.  Test: no self-disarm at all.
+constexpr bool NO_COUNTED_DISARM = true;
 
 // Q3 hypothesis test (TEMP): end-marker after a ledger stake, using only the write address.
 // When firmware stakes $c0 ($8120), if the NEXT ledger byte is NOT still a want ($ff), deposit
@@ -575,11 +580,20 @@ void multibus_storager_device::advance_read()
 	// V1/V3: a finite field program stops raising marks once the commanded count is done, even if
 	// the firmware keeps re-arming (measured: it does).  That is a GA response to the loaded program
 	// + count, not a firmware-RAM poke.
-	if ((VARIANT == VAR_COUNTED_STOP || VARIANT == VAR_STOP_IRQ4)
-		&& m_accepted_n >= m_sec_count && m_sec_count > 0)
+	// The count is the gate array's OWN: its op18 program's port-$3F push count.  It must not be the
+	// firmware's stake tally - the gate array cannot see how many sectors the firmware chose to stake,
+	// and snooping that is the shape the LLE mandate rules out.  (cont.428: m_accepted_n also
+	// over-reported badly - the drain's $6FF0 consume-mark writes the same $c0 the tap counted, 34
+	// against 14 real stakes - so the disarm fired at ~40% of the commanded sectors, stopping the marks
+	// while a chunk was armed with [$741c]=1, which is exactly the state $7B1C's 1.305s watchdog exists
+	// to catch: over-count -> early disarm -> armed chunk never fills -> $201C -> host 0x82/$1C.)
+	int const prog_n = m_prog_count > 0 ? m_prog_count : m_sec_count;
+	if (!NO_COUNTED_DISARM
+		&& (VARIANT == VAR_COUNTED_STOP || VARIANT == VAR_STOP_IRQ4)
+		&& m_data_done_n >= prog_n && prog_n > 0)
 	{
-		logerror("GA disarm: accepted=%d delivered=%d count=%d t=%.5f\n",
-			m_accepted_n, m_data_done_n, m_sec_count, machine().time().as_double());
+		logerror("GA disarm: delivered=%d prog_count=%d (accepted tally was %d, unused) t=%.5f\n",
+			m_data_done_n, prog_n, m_accepted_n, machine().time().as_double());
 		// V3: the counted program is COMPLETE - the commanded number of sectors has been accepted.
 		// Signal it the way a channel does, with one channel-done IRQ4 and no firmware-RAM write.
 		// This must hang off the ACCEPTED count, not the delivered one: delivered includes the
@@ -1012,7 +1026,12 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		{
 			bool const clk = BIT(data, 0);
 			if (m_ser_clk && !clk)
+			{
+				if (!m_ser_active)
+					logerror("SER: ack takes F000 bit1 (clock 1->0) cmd=%02x e802=%04x t=%.5f\n",
+						m_iopb_cmd, data, machine().time().as_double());
 				m_ser_active = true;    // a real transaction: the controller drove the clock low
+			}
 			m_ser_clk = clk;
 		}
 		// bit6 = the IRQ2 ack the doorbell handler toggles LOW on entry.
