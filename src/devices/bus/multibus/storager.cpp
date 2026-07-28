@@ -306,6 +306,15 @@ private:
 	int  m_aa_n = 0;              // Q3b: log cap
 	bool m_status_armed = false; // all commanded sectors captured - completion byte owed at node+$26
 	bool m_timer_out = false;    // PIT1 ctr0 OUT -> F000 bit11
+	// ESDI serial command/status interface (spec: $A118 send / $A1CE receive).  E802 bit0 = clock,
+	// E802 bit1 = data out (active low), F000 bit1 = the drive's TRANSFER-ACKNOWLEDGE, F000 bit4 = data
+	// in.  The drive follows the controller's clock: ack drops when the controller drops the clock and
+	// rises when it raises it, so the firmware's two-phase poll ($A17E waits ack low, $A1A2 waits ack
+	// high) completes without any timing model - it polls, so latency is absorbed.
+	// F000 bit1 is the floppy class's seek/settle busy, so the ack only takes over the bit once a
+	// serial transaction has actually clocked (m_ser_active), and that is reset per command.
+	bool m_ser_clk = true;       // last E802 bit0 seen
+	bool m_ser_active = false;   // a serial transaction has driven the clock this command
 	bool m_settle_out = true;    // PIT0 ctr1 mode-5 one-shot OUT; F000 bit1 seek/settle busy = !OUT
 	bool m_pit2_out = false;     // PIT1 ctr2 OUT (VARIANT 2/3 experiment surface)
 	bool m_r0_busy = false;      // R0 status bit1: latched at host GO, cleared at the firmware's DONE stamp
@@ -906,7 +915,10 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		d = (d & ~0x2000) | (trk0 ? 0 : 0x2000);          // bit13 = track 0, active-low (fw 0x5de4 btst #$d)
 		d = (d & ~0x0400) | (wprot ? 0x0400 : 0);         // bit10 = write-protect
 		d = (d & ~0x0010) | (index ? 0x0010 : 0);         // bit4  = index pulse
-		d = (d & ~0x0002) | (m_settle_out ? 0 : 0x0002);  // bit1  = seek/settle busy (PIT ctr1 one-shot, low = busy)
+		if (m_ser_active)
+			d = (d & ~0x0002) | (m_ser_clk ? 0x0002 : 0);  // bit1 = ESDI transfer-acknowledge, follows the clock
+		else
+			d = (d & ~0x0002) | (m_settle_out ? 0 : 0x0002);  // bit1 = seek/settle busy (PIT ctr1 one-shot, low = busy)
 		// V2: surface PIT1 ctr2 OUT on bit8 (suspected op42 Branch-B busy/fault).  Baseline leaves
 		// bit8 clear.  Read path is Branch A so a change here should not move op42 by itself.
 		if (VARIANT == VAR_PIT2_OUT)
@@ -995,6 +1007,14 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 	}
 	else if (a == 0xe802)
 	{
+		// bit0 = the ESDI serial clock.  The drive acknowledges by following it.
+		if (ACCESSING_BITS_0_7)
+		{
+			bool const clk = BIT(data, 0);
+			if (m_ser_clk && !clk)
+				m_ser_active = true;    // a real transaction: the controller drove the clock low
+			m_ser_clk = clk;
+		}
 		// bit6 = the IRQ2 ack the doorbell handler toggles LOW on entry.
 		if (!BIT(data, 6))
 			m_cpu->set_input_line(M68K_IRQ_2, CLEAR_LINE);
@@ -1162,6 +1182,7 @@ void multibus_storager_device::host_win_w(offs_t offset, u16 data, u16 mem_mask)
 		m_prog_loaded = false; m_desc_n = 0;   // each command loads its own field program before it runs
 		// The firmware carries the STATUS/ERROR bytes back to the host IOPB itself, via its node->host
 		// bus-master DMA (run_channel_dma, E800 bit13); the model transcribes nothing here.
+		m_ser_active = false; m_ser_clk = true;   // the serial ack does not carry across a command boundary
 		m_read_window = false;   // new command: a read re-arms its own window (no stale arm across the boundary)
 		m_cmd = CMD_IDLE;
 		m_armed = false;
@@ -1337,6 +1358,14 @@ void multibus_storager_device::device_reset()
 			[this](offs_t offset, u16 &data, u16 mem_mask)
 			{
 				if (!m_read_active) return;
+				// The stakes are BYTE writes ($8120 move.b #$c0,(0,a1,d1.w) / $8128 move.b d0,...),
+				// and for a byte access mem_mask identifies the logical lane, so the extraction below
+				// holds under SRAM_BYTE_SWAPPED.  A WORD write is a different matter - taking the high
+				// half is the wrong half once byte accesses resolve to the other one - and no stake is
+				// ever a word write, so ignore them rather than guess. (cont.427: this is a fourth
+				// model<->SRAM byte boundary, missed when THE_RULE enumerated three.)
+				if (mem_mask == 0xffff)
+					return;
 				u8 const v = (mem_mask == 0x00ff) ? u8(data) : u8(data >> 8);
 				if (v != 0xc0)
 					return;
