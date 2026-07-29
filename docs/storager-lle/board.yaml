@@ -387,6 +387,50 @@ watch_pump:   # cont.421 - the read's completion architecture, traced end to end
 # ============================================================================================
 # ============================================================================================
 # ============================================================================================
+# ============================================================================================
+ladder_ownership:   # cont.433 - who runs the read's builder.  READ THE RETRACTION FIRST.
+  RETRACTED from cont.432: >
+    "The builder emits the correct read ladder (0024 0028 0056 0058 ...), and something overwrites it
+    between build and walk."  FALSE, and it was an instrument artifact: $7228 is written with $00fe
+    tens of thousands of times per read, it was inside the build-tap range, and it set the image base
+    to $7228 - so the "correct ladder" was an image of a different address entirely.  With $7228
+    excluded the settled image at $7250 is `001c 0022 0016 0000`, and the trailing
+    `0018 0054 004a 0042 0036 0000` is STALE leftover from an earlier, longer ladder.  Nothing
+    overwrote anything.
+  measured: >
+    The builder invoked for cmd 0x95 emits FOUR words - 1c, 22, 16 and a 0 terminator - into $7250.
+    That is $5E64, not $5FC0:
+      $5E6E movea.w $799a,a3 / $5E72 move.w ($20,a3),d0 / $5E7C btst #$9,d0 / $5E80 bne $5E94
+      $5E82 move.w #$1c,(a6)+ / #$22 / #$16   then $5E94 move.w #$0,(a6)   (terminator, no advance)
+      $5E98 lea $e000,a1 / $5EA0 move.w #$23f,(a1)+ / dbra   - it loads the E000 program DIRECTLY
+    UIB+$20 = $8c27 so bit9 is CLEAR, which is exactly the condition that emits the three ops.
+    Loading E000 itself is why these reads capture at all despite never running op18.
+  HYPOTHESIS (not settled) - the descriptor holds the PREVIOUS command's builder: >
+    The dispatch table at $92-$1A0 holds pairs ($126:5fc0 $128:8c27 - and $8c27 is exactly the
+    UIB+$20 measured; $0AE/$0EE/$194 hold 5e64; $132 holds a63e for cmd 0x98).  BUT the table's
+    handler word is NOT what gets dispatched: at $0DE4 `move.w (A1)+,D7` / $0DE6 `beq $d60` D7 is
+    used ONLY as a zero/validity test and appears nowhere else in the intake path.  The builder that
+    actually runs comes from the CHANNEL DESCRIPTOR:
+      $2316 movea.w $721a,a1 / $233A movea.w ($6,a1),a1 / $2342 jsr (a1)
+    So $5E64 running for a read is most likely 0x87's builder still sitting in [$721a]+$6 - 0x87 is
+    the command immediately before every read in the preamble - and `1c 22 16 00` is then 0x87's
+    ladder, emitted CORRECTLY by the wrong builder.  Nothing is corrupt.
+  next: >
+    Write tap on [$721a]+$6 across the 87/89/95 sequence: does a per-command install fire, and what
+    value does it write?  Four candidate writers in the ROM - $0AA6, $27EE, $2AA4, $34BC - one of
+    which should be the per-command install.  If nothing fires between the 0x87 and the 0x95, that is
+    the whole defect.  Prediction to check against existing data: if earlier reads in the same run ran
+    $5FC0 correctly then the install DOES fire sometimes, and when it stops is the question.
+  instrument_notes: >
+    Two conflations fixed here, both of which had produced published numbers:
+    (1) node+$26 <- $000C has TWO writers - $15A0 move.w d1,($26,A2) is the WALKER's terminator and
+        $17F8 move.w #$c,($26,A0) is the phase-0x0C path.  Same value, same width; the only separator
+        is which base register holds the node.  Every A1 reported at cont.432 ($9188/$7664/$79F6) was
+        $17F8, never the walker.
+    (2) Overlapping write taps on one space do not both fire.  ONE tap must own a range and dispatch
+        internally by address (docs/storager-lle/ladder.lua does this).
+  conf: "V (which builder runs, and what it emits) / ? (why the descriptor holds it)"
+
 frontier_read_ladder_not_built:   # cont.431 - the named corruption, with a two-line test in front
   finding: >
     A cmd 0x95 posts 0x80 in 70ms having executed NO read ops.  The walker's list at $7250 holds
