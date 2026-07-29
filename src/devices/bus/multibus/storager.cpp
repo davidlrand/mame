@@ -388,9 +388,30 @@ private:
 // FM vs MFM cell rate.  The firmware programs the ENDEC format via E800 bits10-11 (latched from
 // UIB+$11 by op 0x16, spec §3.2); the boot FM label read was observed with bit10 cleared (spec
 // §3.1), so bit10 clear = FM (4us/cell, 128B), set = MFM (2us/cell, 256B).
+// Density comes from the op18 FIELD PROGRAM, not from E800 bit10.  The firmware demonstrably never
+// sets E800 bit10 for this purpose (measured: set once during the boot self-test at t=0.20, cleared at
+// t=0.51, never again), while cont.428 established that the program describes the TRACK FORMAT - which
+// is also why it is count-invariant.  Two distinct programs are observed, separating perfectly:
+//   0a6d 0829 0033 0a6d 0a09 ... 023f   bit7 clear in 16/16 words   (300k FM,  16x128)
+//   02ad 0aad 08a9 00b3 06ad ... 0cbb   bit7 set   in 16/16 words   (300k MFM, 16x256)
+//
+// TWO CAVEATS, both deliberate and both recorded rather than papered over:
+//  1. UNDERDETERMINED.  0a6d ^ 02ad = $08C0, so bits 11, 7 and 6 all separate the two programs and
+//     with only two samples each would test equally clean.  Bit 7 is chosen PROVISIONALLY; the data
+//     does not distinguish it from 11 or 6.
+//  2. The MFM sample's provenance is weak - $02ad is only ever observed at cylinder 69, i.e. after a
+//     seek has already gone wrong.  It is the only second program seen and it separates cleanly, but
+//     "$02ad is the MFM program" is inferred from a post-failure state.
+//
+// NOT taken from UIB+$12 bit1, which is the firmware's own decoded density flag ($8AE4/$7366/$9456/
+// $6536/$7C5C, all consistent) and would be a one-line fix: that is a firmware-RAM snoop, the shape
+// the LLE mandate rules out and that this campaign has spent months removing.  The program is what the
+// gate array is actually TOLD, so it is the correct source even while its semantics are undecoded.
 bool multibus_storager_device::flux_density_fm() const
 {
-	return !BIT(m_ch[(0xe800 - 0xe000) / 2], 10);
+	if (m_prog_loaded)
+		return !BIT(m_prog[0], 7);
+	return !BIT(m_ch[(0xe800 - 0xe000) / 2], 10);   // no program yet: fall back
 }
 
 // Detection-is-capture: sweep the whole track's flux once (the gate array is continuously reading the
@@ -463,6 +484,13 @@ void multibus_storager_device::capture_track()
 		}
 		state = 0;
 	}
+	// TEMP cont.439: the MFM path is exercised for the first time (media is mixed - cyl 0 is 300k FM
+	// 16x128, cyl 1+ are 300k MFM 16x256).  Report what the gate array actually decoded.
+	logerror("capture_track: cyl=%d head=%d density=%s  sectors=%d  first: r=%02x len=%d  last: r=%02x len=%d\n",
+		m_floppy[0] && m_floppy[0]->get_device() ? m_floppy[0]->get_device()->get_cyl() : -1,
+		m_sel_head, flux_density_fm() ? "FM" : "MFM", m_track_n,
+		m_track_n ? m_track[0].r : 0, m_track_n ? m_track[0].len : 0,
+		m_track_n ? m_track[m_track_n - 1].r : 0, m_track_n ? m_track[m_track_n - 1].len : 0);
 }
 
 
@@ -1015,6 +1043,27 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 				return;
 			}
 			m_prog_loaded = true;      // a fresh load REPLACES a retained one
+			// TEMP cont.439: is DENSITY encoded in the field program?  The firmware never commands
+			// E800 bit10 (the model's density source) but does set node+$12 bit1 for MFM, and cont.428
+			// established this program describes the TRACK FORMAT.  Dump it per load and compare the
+			// FM (cyl 0) and MFM (cyl 1) programs.
+			{
+				char h[16 * 5 + 1]; h[0] = 0;
+				for (int k = 0; k < 16; k++)
+					sprintf(h + k * 5, "%04x ", m_prog[k]);
+				// Correlate against the CYLINDER, whose density is known independently from the media
+				// (IMD: cyl 0 = 300k FM 16x128, cyl 1+ = 300k MFM 16x256).  bit7 of every program word
+				// is the candidate discriminator; print its tally so the labelling is measured, not
+				// assumed.
+				int b7set = 0;
+				for (int k = 0; k < 16; k++)
+					if (BIT(m_prog[k], 7)) b7set++;
+				floppy_image_device *const fdd0 = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
+				logerror("PROGRAM cyl=%d (media says %s)  bit7 set in %d/16 words  cmd=%02x: %s\n",
+					fdd0 ? fdd0->get_cyl() : -1,
+					(fdd0 && fdd0->get_cyl() == 0) ? "FM" : "MFM",
+					b7set, m_iopb_cmd, h);
+			}
 			start_field_program();
 		}
 	}

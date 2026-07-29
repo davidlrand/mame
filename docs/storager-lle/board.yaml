@@ -389,6 +389,48 @@ watch_pump:   # cont.421 - the read's completion architecture, traced end to end
 # ============================================================================================
 # ============================================================================================
 # ============================================================================================
+# ============================================================================================
+density_source:   # cont.439 - density comes from the field program, not E800 bit10
+  finding: >
+    The model took density from E800 bit10 (flux_density_fm = !BIT(m_ch[E800],10)).  The firmware
+    NEVER sets that bit for this purpose - measured: set once during the boot self-test at t=0.20,
+    cleared at t=0.51, never again.  Meanwhile cont.428 established that op18's field program
+    describes the TRACK FORMAT (which is also why it is count-invariant), and two distinct programs
+    are observed that separate perfectly:
+      0a6d 0829 0033 0a6d 0a09 ... 023f    bit7 clear 16/16
+      02ad 0aad 08a9 00b3 06ad ... 0cbb    bit7 set   16/16
+    Density is now taken from BIT(m_prog[0], 7), falling back to E800 bit10 before any program loads.
+  CAVEAT 1 - UNDERDETERMINED: >
+    0a6d ^ 02ad = $08C0, so bits 11, 7 and 6 ALL separate the two programs, and with only two samples
+    each would test equally clean.  Bit 7 is PROVISIONAL; the data does not distinguish it from 11
+    or 6.  Do not record it as decoded.
+  CAVEAT 2 - WEAK PROVENANCE for the MFM sample: >
+    $02ad is only ever observed at cylinder 69, i.e. AFTER a seek has already gone wrong.  It is the
+    only second program seen and it separates cleanly, but "$02ad is the MFM program" is inferred
+    from a post-failure state.
+  NOT taken from UIB+$12 bit1 - and this reasoning is on file so the shortcut is not re-taken: >
+    UIB+$12 bit1 is the firmware's own decoded density flag ($8AE4/$7366/$9456/$6536/$7C5C, all
+    consistent) and would be a ONE-LINE fix.  It is also a firmware-RAM snoop, the shape the LLE
+    mandate rules out and that this campaign has spent months removing.  The field program is what
+    the gate array is actually TOLD, so it is the correct source even while its semantics are
+    undecoded.
+  TEST RESULT - inconclusive, and it exposed a different defect: >
+    The switch WORKS: density now follows the program (FM at cyl 0/1, MFM at cyl 69).
+    The confirmation FAILS: cylinder 69 is definitively a 300k MFM 16x256 track (IMD: cyls 0..79,
+    160 tracks, cyl 0 both heads FM 16x128, cyl 1..79 MFM 16x256), and the model decodes it as
+    17 sectors with first r=00 len=128 and last r=03 len=256 - garbage, with sector IDs starting at
+    0 where the media has 1..16.
+    So the encoding is NOT confirmed from the second direction.  What the change exposed instead is
+    that capture_track's MFM DECODE PATH IS BROKEN - invisible until now because the MFM branch had
+    never run.
+  the_cylinder1_question_is_separate: >
+    At cyl 1 (MFM media) the firmware loads the SAME program as at cyl 0 (FM).  That is a claim about
+    the firmware's DECISION, not about what the program encodes.  Plausibly it tries FM first on a
+    mixed-density disk and is supposed to retry as MFM; the seek then runs away to cyl 69 instead.
+    Whether an FM-fails-retry-MFM path exists, and whether the runaway is what happens when it does
+    not, is its own investigation and is not blocked by the density source either way.
+  conf: "V (E800 bit10 is not the source; the switch works) / ? (which bit; whether $02ad is MFM)"
+
 floppy_boot_status:   # cont.436 - the fundamental question, answered
   ANSWER: >
     NO.  pcmx2 does not boot to a usable state from floppy.  Measured on the 97801 console
