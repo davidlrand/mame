@@ -450,8 +450,26 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
     Confirmed in passing: $7EB2 fires exactly 16 times, so all 16 MFM records take the [$7968]==0 leg
     as predicted.  ($7E90's count of 17 is prefetch-inflated - $7E8E beq $7EB2 makes $7E90 the
     fall-through - so only $7EB2, a branch TARGET, is trustworthy here.)
-    NEW QUESTION: what calls $92B4, and why is it not called on the MFM path?  $92B4 opens with
-    movem.l D0-D1/A0,-(A7), so it is a called routine, not fallen into.
+    THE ARM IS A REPLICATED IDIOM, not a shared routine (cont.446): `move.w $741e.w,$c800.w` appears
+    at TWELVE sites - 28f4 2920 293c 7fd0 7fee 8022 86a2 86f6 8754 926c 9284 92c4 - and
+    `move.w $7434.w,$d800.w` at thirteen.  Each path carries its own copy.  So $92C4 was never "the
+    only copy", and $92B4 is not a called routine despite its movem.l: its ONLY predecessor is
+    $2996 bra $92b4.
+    COUNTED ALL TWELVE, FM vs MFM (no inference):
+      $7FEE   FM 0   MFM 1
+      $8022   FM 12  MFM 4     <- the per-record arm, in the $801C/$8022 data-done handler
+      $9284   FM 0   MFM 1
+      $92C4   FM 0   MFM 0     (silent - independently confirms the cont.445 refutation)
+      the other eight: silent in both
+    So the arm is NOT absent on MFM - it UNDER-FIRES.  $8022 runs 4 times for 16 records against 12
+    on FM, and only ~4 transfers reach the host.  Twelve of sixteen MFM records never reach the
+    data-done handler at all.
+    FRONTIER: why 12 of 16 MFM records are dropped BEFORE data-done - which points at the record
+    verify / MFM ID compare ($89F2, $9884), the code this campaign long recorded as unreachable.
+    CAVEAT on the instrument: the FM/MFM labelling read UIB+$12 ($6E72) from inside a tap callback,
+    within the model's own $4000-$7FFF snoop range - the hazard in storager-measurement-discipline.
+    The split is coherent and $92C4=0 matches an independent run, but re-take with the density
+    latched in the periodic before relying on the exact 4-vs-16 ratio.
     NOT A LEAD - the failed allocations' "garbage indices": $3474/$347A write (-$6,A3) and (-$8,A3)
     TOGETHER on the success path only, so when the verdict is 0000 the index slot was never written
     and holds stale frame contents.  $74c4/$6ed6/$6b44/$71f0 being RAM addresses is exactly that.
