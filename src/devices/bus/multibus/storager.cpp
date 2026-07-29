@@ -241,7 +241,7 @@ private:
 	bool flux_density_fm() const;
 	attotime sector_period() const; // one sector's rotation at 300 rpm
 	void start_field_program();     // the loaded op18 program begins running: open the read window
-	void advance_read();            // stage + deliver the next record of the counted read (IRQ6 then IRQ5)
+	void advance_read();            // stage + deliver the next record while the window is armed (IRQ6 then IRQ5)
 	void deliver_mark();            // arm + held-mark -> one interrupt
 	TIMER_CALLBACK_MEMBER(pump_tick);
 
@@ -315,7 +315,6 @@ private:
 	bool m_e800_bit12_prev = false;   // bit12 kickoff edge detect
 	bool m_host_int_prev = false;     // E802 bit7 host-completion interrupt level
 	bool m_floppy_loaded = false;
-	bool m_prog_done_irq4 = false;    // V3: one-shot IRQ4 after counted program ends
 
 	// E804 drive/head select, latched in the gate array (spec: op24 $6576-$65A0 builds it from the UIB -
 	// head from UIB+$D4 shifted into bits 8-11 and COMPLEMENTED, drive/control byte from UIB+$DC).  The
@@ -367,12 +366,13 @@ private:
 	emu_timer *m_dma_done = nullptr;   // async channel-done IRQ4
 
 	// The gate array captures the whole track as it rotates (detection-is-capture) into m_track, then the
-	// counted engine (advance_read) delivers exactly the commanded run of sectors, one IRQ6 + one IRQ5 each.
+	// the engine (advance_read) delivers a record per address mark, one IRQ6 + one IRQ5 each, for as long
+	// as the firmware keeps re-arming E802 bit11 - it does NOT count down a commanded run.
 	struct captured_sector { u8 c = 0, h = 0, r = 0, nn = 0, dam = 0; u16 len = 0; u8 data[1200] = {}; };
 	captured_sector m_track[32];
 	int  m_track_n = 0;             // sectors recovered in the last full-track capture
 	void capture_track();          // synchronous full-revolution flux decode into m_track
-	bool m_read_active = false;     // a counted read is in progress (delivering the commanded run)
+	bool m_read_active = false;     // a read window is open (records delivered until the firmware stops re-arming)
 	int  m_sec_count = 0;           // commanded sectors this operation ([$7abc])
 	int  m_sec_index = 0;           // sector currently being delivered
 	int  m_sec_phase = 0;           // 0 = ID (IRQ6) next, 1 = data (IRQ5) next
@@ -466,7 +466,7 @@ void multibus_storager_device::capture_track()
 
 
 // op18's load has completed and the gate array's sequencer begins running the field program: open the
-// read window, decode the track, and arm the counted delivery of the commanded run.  This is the point
+// read window, decode the track, and arm record delivery.  This is the point
 // the program starts - not the E000 word[0] write that merely begins loading it.
 
 // 300 rpm = 200ms/revolution, divided by the sectors on the track (FM 16x128B -> 12.5ms).
@@ -551,7 +551,9 @@ void multibus_storager_device::deliver_mark()
 }
 
 // The gate array, armed by op18 with the field program + the commanded sector count, reads EXACTLY the
-// commanded sectors and terminates - it is a counted operation, not a free-running per-mark echo.  The
+// RETIRED framing (cont.428): this was described as a counted operation that terminates after the
+// commanded sectors.  It is not - op18 is count-invariant, its program describes the TRACK FORMAT, and
+// the firmware stops the records by ceasing to re-arm E802 bit11.  The
 // whole track is decoded up front (capture_track - detection-is-capture, the AM2147 bit-buffer + the
 // 1801 preamble search absorb positional slop); this delivers the wanted run to the firmware lock-step
 // with its per-record arm.  Per sector: IRQ6 (ID address mark, C/H/R/N staged in $7DAC where the
@@ -592,7 +594,7 @@ void multibus_storager_device::advance_read()
 	}
 	else if (m_data_done_n >= m_sec_count && m_sec_count > 0)
 	{
-		m_read_active = false;              // counted program exhausted (same rule as VAR_COUNTED_STOP)
+		m_read_active = false;              // window closed
 		return;
 	}
 	if (PHYSICAL_TIMING && machine().time() < m_next_rec)
@@ -676,7 +678,7 @@ void multibus_storager_device::advance_read()
 	deliver_mark();
 }
 
-// The mark clock: stage/deliver the next record of the counted read while the window is armed, then
+// The mark clock: stage/deliver the next record while the window is armed, then
 // reschedule.  advance_read() holds one record at a time and stops after the commanded count; deliver_mark
 // releases it once the firmware has armed and the CPU is unmasked.
 TIMER_CALLBACK_MEMBER(multibus_storager_device::pump_tick)
@@ -959,7 +961,7 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		// The firmware's channel-engagement write (E000 bit11) opens the read window.  op18 has already
 		// programmed the gate array with the field layout + the commanded sector count; the gate array runs
 		// the operation autonomously.  On the rising edge we capture the whole track (detection-is-capture)
-		// and arm the counted delivery of exactly the commanded run (advance_read).  Each per-record re-arm
+		// and arm record delivery (advance_read).  Each per-record re-arm
 		// (E802 bit11) releases the next mark.
 		// Once the program is loaded, an E000 bit11 write is the firmware's per-record RE-engagement
 		// (the 022f -> 023f -> 0a6d cycle each record ISR issues, whose third word re-issues the
@@ -1447,7 +1449,6 @@ void multibus_storager_device::device_reset()
 	m_sel_drive = 0;
 	m_prog_loaded = false;
 	m_desc_n = 0;
-	m_prog_done_irq4 = false;
 	m_pit2_out = false;
 	m_data_done_n = 0;
 	m_status_armed = false;

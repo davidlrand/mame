@@ -1,5 +1,12 @@
 # Storager LLE conversion — design
 
+> **⚠ PRE-cont.426 NARRATIVE. `board.yaml` is the live map, not this file.**
+> Everything here predates the SRAM byte-order correction (cont.426), which inverted the
+> premise behind every byte-level observation in the campaign and retired three standing
+> patches (Q2, the node+$26 deposit, the 1.83 s op42 guard). Byte-granularity claims below
+> are RE-DERIVE, not correct. See `board.yaml` → `sram_byte_order` and its `BASELINE` note
+> before citing anything in this document.
+
 > Reconciled 2026-07-11 onto the *autonomous gate-array* model after the read-handler
 > disassembly. Supersedes the earlier "firmware parses the E000 byte stream" framing.
 
