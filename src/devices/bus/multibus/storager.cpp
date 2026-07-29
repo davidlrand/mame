@@ -505,6 +505,19 @@ void multibus_storager_device::capture_track()
 				m_track[i].len);
 			break;
 		}
+	// TEMP cont.442: is the head where the operation TARGETS?  [$7438] is the firmware's expected
+	// cylinder and [$7436] its expected head - the values the record verify compares against
+	// ($7C52-$7C66 and $7C40-$7C46).  Compare them against the drive's actual position.
+	{
+		address_space &cs4 = m_cpu->space(AS_PROGRAM);
+		floppy_image_device *const f4 = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
+		int const act = f4 ? f4->get_cyl() : -1;
+		int const wantc = cs4.read_word(0x7438) & 0xff;
+		int const wanth = cs4.read_word(0x7436) & 0xff;
+		logerror("  SEEK CHECK: firmware wants cyl=%d head=%d | drive at cyl=%d head=%d | %s\n",
+			wantc, wanth, act, m_sel_head,
+			(act == wantc) ? "MATCH" : "*** MISMATCH - head not where the operation targets ***");
+	}
 	logerror("capture_track: cyl=%d head=%d density=%s  sectors=%d  first: r=%02x len=%d  last: r=%02x len=%d\n",
 		m_floppy[0] && m_floppy[0]->get_device() ? m_floppy[0]->get_device()->get_cyl() : -1,
 		m_sel_head, flux_density_fm() ? "FM" : "MFM", m_track_n,
