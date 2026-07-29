@@ -409,7 +409,25 @@ frontier_cmd95_18s:   # cont.430 - the named frontier, with its test already def
     so it survives even though the run it came from could not reproduce the 18.3s case.  Therefore an
     uncancelled watchdog on a failing read means THE CANCEL CONDITION WAS NEVER REACHED, not that the
     cancel path is broken.  One branch removed from the search before it starts.
-  conf: "V (the failure and its timing) / ? (the mechanism)"
+  RESULT: >
+    ANSWERED cont.430b, one run, per-command and within-run (docs/storager-lle/rtratio.lua):
+      failing read #1  elapsed  2.738s  arms=0  cancels=0  ->   0% accounted
+      failing read #2  elapsed 12.157s  arms=0  cancels=1  ->   0% accounted
+    ZERO watchdog arms during either failure, so $7B1C cannot be setting the pace and the ratio
+    question does not arise.  The retry-loop hypothesis is REFUTED for these instances; the ~18s
+    class of cmd 0x95 failure is a DISTINCT mechanism, which is what the (retracted, then re-opened)
+    original reading said.  [$79aa]/$1A6A remains a good lead for why $29 differs from $1C, but it is
+    not driving the elapsed time.
+    Instrument liveness proven INSIDE the measurement, not assumed: the same tap counted a cancel in
+    read #2's window, so it was live and would have counted an arm.
+    LIMIT: this seed produced 2.7s and 12.2s failures, not the 18.3s one - the mechanism answer is
+    consistent across both instances but the exact 18.3s case is not individually measured.
+    12.157 / 1.305 = 9.3 (non-integral), independent corroboration that the period is not the clock.
+  next: >
+    The elapsed time has some other source.  With the watchdog excluded and the cancel machinery known
+    live, look for what the failing read WAITS on - a second deferred-write period, a seek/settle
+    timeout, or a poll with its own counter - rather than anything in the $7986/$29F8 family.
+  conf: "V (the failure, its timing, and that the watchdog is not its clock) / ? (what is)"
 
 sram_byte_order:   # cont.426 - THE correction; read this before trusting any byte-level claim
   finding: >
