@@ -529,7 +529,38 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
     NOT SUFFICIENT: the boot still reports "no sys-floppy" at 8.3s.
     ALSO AVAILABLE FROM THIS FIELD MAP: UIB[2-3] is a commanded BYTES/SECTOR ($0080 FM / $0100 MFM) -
     a direct density source, cleaner than the bit1-vs-bit2 argument that consumed several exchanges.
-    OPEN - the COUNT UNIT: the HLE treats +$a/+$b as 512-BYTE BLOCKS (`sec_per_blk = 512 / ssz`, so
+    ★ COUNT UNIT CLOSED (cont.456) - the count is in SECTORS, statically:
+      $A42C move.b (A1)+,D0 / $A42E asl.w #8,D0 / $A430 or.b (A1)+,D0 / $A432 move.l D0,$7abe -
+      verbatim assemble-and-store, no shift or multiply; the 3-byte form at $A438 is the same.  With
+      op58 comparing [$7abe]+[$7954] against sectors-per-track, the unit is unambiguously SECTORS.
+      The LLE's 8 is faithful.  The HLE's 512/ssz OVER-delivered (32 where 8 were asked), which is
+      harmless into a large enough buffer - so it is NOT a second reason for rejection.
+    ★★★ THE ORACLE IS INVALIDATED, and prior art already answers this frontier (cont.456):
+      Proposal was to reproduce the HLE's read95_deliver output and diff it against the model's host
+      memory.  The hedge - confirm the HLE build actually booted - FAILED: the HLE carrying
+      m_unit_sec0 was added 84b36643c1b (2026-07-21) and removed e3ff07340a6 (2026-07-24), while the
+      floppy reached "Boot: sa(22,0)sinix" on 2026-07-02, three weeks earlier.
+      And [[pcmx2-disk-floppy]] records the experiment ALREADY RUN:
+        "the FULL 512B-block read (4096B) delivered correctly starting at VOL1.  STILL no sys-floppy.
+         BOTH CPUAP reads are addr=0 (VOL1) - it reads the label, RE-READS it (cnt8 then cnt4), and
+         gives up WITHOUT reading HDR1(R8)/the boot at addr>0.  So the CPUAP REJECTS the VOL1 label
+         it got and never advances."
+      That is today's cnt8-then-cnt4 sequence exactly.  The oracle's own output would NOT have
+      satisfied the host, so the diff would have returned "identical" and taught nothing.
+      CONSEQUENCE: every hypothesis downstream of "deliver the label correctly" was never going to
+      land - including sec0 as a BLOCKER.  sec0 remains correct on its own evidence (the IMD, the
+      $300 arithmetic, and the memory's "sec0=7 FM VOL1"), just not sufficient.
+    ★ THE FRONTIER IS CPUAP-SIDE, and has been for some time:
+      The CPUAP rejects a correct VOL1SINIX0 and re-reads addr=0 rather than advancing to HDR1.  The
+      recorded next step is tracing siemens/disasm/cpuap/ for what it checks in the label and why it
+      rejects.  The memory also names the LLE-vs-HLE delta (the HLE had UIB geometry from the CPUAP's
+      cmd 0x87 INIT) with a follow-up STEP 309 recording that the INIT does fire and was then used.
+    ★ CAUTION CROSSING TO THE CPUAP: it is an NS32016.  The PREFETCH-SHADOW rule that cost this
+      campaign five wrong readings is a property of the 68000's fetch pipelining and does NOT
+      transfer unexamined - carrying it over risks the mirror-image error, dismissing a REAL
+      execution as an artifact.  The blind-instrument, shared-method and derived-signal classes do
+      transfer.  See storager-measurement-discipline.
+    superseded_COUNT_UNIT: the HLE treats +$a/+$b as 512-BYTE BLOCKS (`sec_per_blk = 512 / ssz`, so
     count=8 with 128-byte sectors is 32 sectors).  The firmware has [$7abc]=8 and [$7956] draining
     8->0, so it counts 8 of something.  If blocks, the read delivers a QUARTER of what was asked for -
     an independent second reason the host would reject.  Settle the unit before changing anything.
