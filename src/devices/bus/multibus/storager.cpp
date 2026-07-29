@@ -295,7 +295,8 @@ private:
 	u8  m_desc_port[32] = {};    // the C800 descriptor stack, in push order (a port takes many pushes)
 	u16 m_desc_val[32] = {};
 	u8  m_desc_n = 0;
-	bool m_prog_loaded = false;  // the E000 block load has completed - the program may run
+	bool m_prog_loaded = false;  // the gate array holds a field program (PERSISTS across commands)
+	bool m_prog_loading = false; // an op18 block copy is in progress - word[0] is data, not a command
 	u16  m_dma_term = 0;         // transfer terminal, latched from a C800 write while DMA active
 	u8   m_term_bit0 = 0;
 	u32  m_last_bw = 0;          // last local-bus write address (transfer-pointer snoop -> F000 bit12)
@@ -956,9 +957,20 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 	if (offset < std::size(m_prog))
 	{
 		m_prog[offset] = m_ch[offset];
-		if (offset == std::size(m_prog) - 1 && !m_prog_loaded)
+		// m_prog_loaded means "the gate array HOLDS a program" and now persists across commands, so it
+		// can no longer double as "we are not mid-load".  Track the block copy separately: the record
+		// ISR's per-record cycle (022f -> 023f -> 0a6d) only ever writes offset 0, so a write to any
+		// offset >= 1 is the block copy and nothing else. (cont.429)
+		if (offset >= 1)
+			m_prog_loading = true;
+		// Trigger only when a real block copy just finished.  Without this, any repeat of the
+		// load-complete edge re-enters start_field_program() mid-read, which resets per-command state
+		// (model trap #1).  m_prog_loading is set only by a write to offset >= 1, which only the block
+		// copy does - so this is the block-copy completion edge and nothing else.
+		if (offset == std::size(m_prog) - 1 && m_prog_loading)
 		{
-			m_prog_loaded = true;
+			m_prog_loading = false;
+			m_prog_loaded = true;      // a fresh load REPLACES a retained one
 			start_field_program();
 		}
 	}
@@ -983,7 +995,7 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		// (the 022f -> 023f -> 0a6d cycle each record ISR issues, whose third word re-issues the
 		// program's first command).  Before the load completes the identical bit pattern is merely
 		// word[0] of the block being copied in - not a command - so it must not start anything.
-		bool const win = BIT(data, 11) && m_prog_loaded && (m_iopb_cmd == 0x94 || m_iopb_cmd == 0x95);
+		bool const win = BIT(data, 11) && m_prog_loaded && !m_prog_loading && (m_iopb_cmd == 0x94 || m_iopb_cmd == 0x95);
 		if (win && !m_e000b11_prev)
 			start_field_program();
 		m_e000b11_prev = win;
@@ -1198,11 +1210,32 @@ void multibus_storager_device::host_win_w(offs_t offset, u16 data, u16 mem_mask)
 		logerror("HOST GO: cmd=%02x iopb=%06x t=%.5f\n", m_iopb_cmd, dbi, machine().time().as_double());
 		m_iopb_addr = dbi;
 		m_window_seen = false; m_term_fired = false; m_idx_prev = false; m_read_active = false;   // per-command reset
-		m_prog_loaded = false; m_desc_n = 0;   // each command loads its own field program before it runs
+		// The gate array RETAINS its field program across command boundaries - the firmware says so
+		// explicitly.  $5FF6 cmpi.w #$1,$793e / beq $6028 makes the builder emit NEITHER op1A NOR op18
+		// when the program already in the gate array is the one this command needs; op18 publishes the
+		// identity itself at $3094 (move.w $793c,$793e), and [$793c] carries 1/2/3/4 from seven
+		// builders with a proper invalidate path ($0E48/$0EC2/$3142/$317C write #$ffff, $2756 clears).
+		// Clearing m_prog_loaded per command therefore threw away a program the firmware was relying on
+		// us to keep: the SECOND read emitted no op18, so no C800/E000 burst ever arrived, nothing was
+		// armed, and the read produced one record's worth of activity and then silence. (cont.429)
+		m_desc_n = 0;   // the descriptor capture buffer is per-load, but the LOADED program persists
 		// The firmware carries the STATUS/ERROR bytes back to the host IOPB itself, via its node->host
 		// bus-master DMA (run_channel_dma, E800 bit13); the model transcribes nothing here.
 		m_ser_active = false; m_ser_clk = true;   // the serial ack does not carry across a command boundary
-		m_read_window = false;   // new command: a read re-arms its own window (no stale arm across the boundary)
+		// Engagement must be decided HERE for a retained program.  With op18 skipped, nothing in the
+		// ladder (24 28 56 58 54 4A 42 36 00) writes E000, so the bit11 test below never evaluates and
+		// start_field_program() would never re-trigger.  Both inputs are the gate array's own: it knows
+		// whether it still holds a program, and it has the command byte it just fetched.
+		m_read_window = false;
+		if (m_prog_loaded && m_iopb_cmd == 0x95)
+		{
+			// Engage NOW.  E802 bit11 cannot be the trigger: it is issued by the read ISR, which only
+			// runs after a record has landed, so on a retained program nothing would ever arm the first
+			// one.  op18 armed it directly when it loaded; a retained program must arm it here.
+			logerror("GA retains field program across command boundary -> engaging for cmd=%02x t=%.5f\n",
+				m_iopb_cmd, machine().time().as_double());
+			start_field_program();
+		}
 		m_cmd = CMD_IDLE;
 		m_armed = false;
 		m_e000b11_prev = false;
