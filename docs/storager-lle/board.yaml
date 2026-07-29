@@ -481,6 +481,29 @@ ladder_ownership:   # cont.433 - who runs the read's builder.  READ THE RETRACTI
     that grep covered `70ff` and `303c00ff` only - a computed return, `103c00ff`, or D0 loaded from
     memory would not match, so this is "no immediate-form $FF return exists", not "no handler can
     return $FF".  If none can, $2342 is vestigial or belongs to a command class not exercised here.
+    NOT VESTIGIAL - it is the CONTINUATION dispatch (cont.435e): >
+      $2342 and $9412's install are two halves of ONE mechanism.  $9412 (install #$5fc0 into ($6,a0))
+      is reachable only from $93D6/$93EA, counter-mismatch branches meaning "more chunks to go";
+      $2342 is what then re-dispatches the installed builder, gated on the last op's verdict being
+      $FF.  A request that fits in ONE chunk clamps the remainder to zero at $738C, never enters
+      continuation, and every negative measured this session follows: op $46 never runs, $231A never
+      passes, $2342 never fires, ($6,A1) is neither written nor read.  Nothing here is dead code -
+      this workload is single-chunk throughout.
+      CANDIDATE $FF SOURCE: op $46 ($192+$46 -> $8AC8).  $8F62 move.w #$ffff,D0 / $8F66 clr $7978 /
+      $8F6A clr $79b2 / $8F6E move #$2000,SR / $8F72 rts, with no intervening store, and $8F74 is
+      op $3E's entry - so that tail belongs to the routine ending at $8F72.  D0=$FFFF -> $15C0 stores
+      $FFFF at $7228 -> low byte $FF -> $231A passes.
+      Six other $FF-into-D0 sites excluded: $07A6 register fill; $1DAC consumed by bsr $36E6; $1DC8
+      unused before bra $1E18; $3656 feeds node+$d0/$d2 and [$793e]; $55B0/$598E feed watch slots.
+      $6278's move.b #$ff,D0 is GAP-FILL DATA, not a verdict - $629A move.b D0,(A0)+ / dbra writes it
+      28 times, with $4E/$4F on the other arm, selected by node+$12 bit2 (density).  Both "$FF in the
+      ROM" hits are data.
+      MEASURED (prediction's testable half, all zero as predicted): op $46 body 0, $8F6E return 0,
+      $7228 writes with low byte $FF: 0.
+      BOUND: zero executions confirm the PREDICTION, not the MECHANISM.  That $8F62-$8F72 is op $46's
+      tail is still a routine-boundary inference; zero runs cannot separate "op $46 returns $FFFF"
+      from "that tail belongs to another routine".  Both halves light up together only on a
+      multi-chunk command, which this workload never issues.
     superseded_NEXT: who writes $00FE to $7228, and what would write $00FF.  One value, one cell, and the
     write is already known to be hot (25572/run) so it cannot hide.
   superseded_STILL_OPEN: what performs the INITIAL builder dispatch.  The descriptor +6 slot is never written
