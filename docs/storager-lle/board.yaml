@@ -391,7 +391,29 @@ frontier_read_ladder_not_built:   # cont.431 - the named corruption, with a two-
     of 1c/22/16 is in that set.  They are valid ops ($1C->$355C, $22->$9018, $16->$2BD6) properly
     terminated with 00, i.e. a DIFFERENT command's ladder, intact.  The tail (18 54 4a 42) is
     byte-identical to the working command's, so only the head differs.
-  most_likely_cause: >
+  REFUTED cont.432 - the builder does NOT bail: >
+    Measured at every command intake: node+$a/$b vs the host's own bytes.
+      cmd=87  node+a=01 node+b=00  host+a=01 host+b=00  guard PASSES
+      cmd=95  node+a=00 node+b=08  host+a=00 host+b=08  guard PASSES   (8-sector read)
+      cmd=95  node+a=00 node+b=04  host+a=00 host+b=04  guard PASSES   (4-sector)
+      cmd=95  node+a=00 node+b=02  host+a=00 host+b=02  guard PASSES   (2-sector)
+    $5FC0's both-zero guard never fires, so the builder RAN AND EMITTED.  The $6A-vs-0x80 tension was
+    correct evidence against the hypothesis, not a detail to explain away.  Dave's standing point is
+    what made it checkable: the CPUAP's IOCB is KNOWN GOOD from the HLE booting, so "a real guard
+    firing on malformed input" was never available as a reading - a zero there would have been ours.
+    The copy is also confirmed FAITHFUL: node+$a/$b match host+$a/$b byte-for-byte, and node+$b
+    carries the sector count (08/04/02) matching the reads traced.
+    So the zero at $7256 came from somewhere else and the frontier is open again.
+  FIFTH model<->SRAM byte boundary (found while testing the above): >
+    The IOPB->node copy at the GO doorbell is `cs.write_byte(dst+k, bs.read_byte(dbi+k))` with NO
+    swap - cs.write_byte goes through the swapped mapping, bs.read_byte does not.  Consequence: node
+    BYTE reads round-trip correctly (which is why the guard's inputs are faithful and why the command
+    byte works), but firmware WORD reads of node fields see SWAPPED HALVES.  run_channel_dma has an
+    explicit swap that was inverted under the flip; this path has none and was never audited.
+    THE_RULE in sram_byte_order enumerated three boundaries and later a fourth (the accept tap); this
+    is the fifth.  AUDIT any conclusion drawn from a node field read as a WORD - e.g. node+$12 bit1
+    (MFM), node+$20 bit14, node+$18.  Byte-read conclusions are unaffected.
+  superseded_cause: >
     The read's builder never emitted anything, leaving the PREVIOUS command's list in the buffer.
     $5FC0 has exactly that exit, two instructions in (verified from ROM):
       $5FC4 movea.w $71bc,a2 / $5FC8 move.b ($a,a2),d0 / $5FCC or.b ($b,a2),d0

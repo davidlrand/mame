@@ -1207,6 +1207,20 @@ void multibus_storager_device::host_win_w(offs_t offset, u16 data, u16 mem_mask)
 		// stamps.  Without it the accept/status stamps land on garbage (addr 0).
 		cs.write_word(0x7b20, dst);
 		m_iopb_cmd = cs.read_byte(dst);
+		// TEMP cont.432: the IOPB->node copy is a model<->SRAM byte boundary the rule never enumerated.
+		// cs.write_byte goes through the swapped mapping, bs.read_byte does not, so node WORD reads see
+		// swapped halves while node BYTE reads round-trip correctly.  Check the $5FC0 guard's inputs
+		// (node+$a/$b, both BYTE reads) against the host's own bytes - the IOCB is known good from the
+		// HLE, so a mismatch is ours.
+		logerror("IOPB->node cmd=%02x  node+a=%02x node+b=%02x  host+a=%02x host+b=%02x  guard=%s"
+			"  node+20 word=%04x (bit14=%d)\n",
+			m_iopb_cmd,
+			cs.read_byte((dst + 0x0a) & 0xffff), cs.read_byte((dst + 0x0b) & 0xffff),
+			bs.read_byte((dbi + 0x0a) & 0xffffff), bs.read_byte((dbi + 0x0b) & 0xffffff),
+			((cs.read_byte((dst + 0x0a) & 0xffff) | cs.read_byte((dst + 0x0b) & 0xffff)) == 0)
+				? "*** BOTH ZERO - $5FC0 WOULD BAIL ***" : "passes",
+			cs.read_word((dst + 0x20) & 0xffff),
+			BIT(cs.read_word((dst + 0x20) & 0xffff), 14));
 		logerror("HOST GO: cmd=%02x iopb=%06x t=%.5f\n", m_iopb_cmd, dbi, machine().time().as_double());
 		m_iopb_addr = dbi;
 		m_window_seen = false; m_term_fired = false; m_idx_prev = false; m_read_active = false;   // per-command reset
