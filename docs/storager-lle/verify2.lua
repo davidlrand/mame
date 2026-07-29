@@ -1,0 +1,64 @@
+-- verify2.lua - does the $89F2 verify BODY actually execute?
+--
+-- $8A14 has exactly one predecessor ($8A0C beq $8a14) and is reachable only when
+--   $89FE btst #$1,D0  (UIB+$12 bit1 SET)  -> $8A02 beq $8A38 not taken
+--   $8A08 btst #$e,D0  (UIB+$20 bit14 CLEAR) -> $8A0C beq $8A14 taken
+-- but UIB+$12 measures 40/44, bit1 CLEAR - so the body should be UNREACHABLE.
+-- The earlier "18 executions" tap sat ON $8A14, two bytes after $8A12 bra $8a38: executing $8A0E
+-- (4 bytes) prefetches $8A12 AND $8A14, so the tap fires on the bit14-set arm without the body
+-- running.  Prefetch shadow on a branch target, in its most deceptive position.
+--
+-- Re-take DEEP - $8A20 and $8A26, past the three or.b's - and read UIB+$12 in the SAME run.
+-- Also count the $2029 stamp at $8AB2, since the "$2029 closes the loop" result depends on the
+-- body executing.
+--
+-- USAGE: SDL_VIDEODRIVER=dummy CPUAP_RTCFIX=1 ./mame pcmx2 -video none -nothrottle -oslog \
+--   -autoboot_script docs/storager-lle/verify2.lua -flop siemens/set1/mx2-001.imd
+
+local SC, STOP = ":slot1:storager:cpu", 12.0
+local cpu, sp, osp, armed = nil, nil, nil, false
+local taps, ev, pend = {}, {}, {}
+local n14, n20, n26, n2029, ngate = 0, 0, 0, 0, 0
+
+local function now() local ok,t = pcall(function() return manager.machine.time:as_double() end); return ok and t or 0 end
+local function B(a) return sp:read_u8(a & 0xffff) end
+local function W(a) return sp:read_u16(a & 0xffff) end
+local function E(s) if #ev < 24 then ev[#ev+1] = s end end
+
+local function arm()
+  if armed then return true end
+  local ok, d = pcall(function() return manager.machine.devices[SC] end)
+  if not ok or not d then return false end
+  armed = true; cpu = d; sp = d.spaces["program"]
+  osp = d.spaces["decrypted_opcodes"] or d.spaces["opcodes"] or sp
+  taps[#taps+1] = osp:install_read_tap(0x89fa, 0x89fb, "gate", function()
+    ngate = ngate + 1
+    pend[#pend+1] = { t = now(), n = ngate }
+  end)
+  taps[#taps+1] = osp:install_read_tap(0x8a14, 0x8a15, "b14", function() n14 = n14 + 1 end)
+  taps[#taps+1] = osp:install_read_tap(0x8a20, 0x8a21, "b20", function() n20 = n20 + 1 end)
+  taps[#taps+1] = osp:install_read_tap(0x8a26, 0x8a27, "b26", function() n26 = n26 + 1 end)
+  taps[#taps+1] = osp:install_read_tap(0x8ab2, 0x8ab3, "e29", function() n2029 = n2029 + 1 end)
+  print("verify2 armed"); io.flush(); return true
+end
+
+emu.register_periodic(function()
+  if not arm() then return end
+  while #pend > 0 do
+    local p = table.remove(pend, 1)
+    local uib = W(0x799a)
+    if uib >= 0x4000 and uib < 0x8000 and #ev < 24 then
+      local d12, d20 = B(uib + 0x12), W(uib + 0x20)
+      E(string.format("%9.4f  gate#%-3d UIB+12=%02x bit1=%d | UIB+20=%04x bit14=%d -> body %s",
+        p.t, p.n, d12, (d12 >> 1) & 1, d20, (d20 >> 14) & 1,
+        (((d12 >> 1) & 1) == 1 and ((d20 >> 14) & 1) == 0) and "REACHABLE" or "unreachable"))
+    end
+  end
+  if now() >= STOP then
+    print("=== does the verify body execute? ===")
+    for _, l in ipairs(ev) do print(l) end
+    print(string.format("=== $89FA gate: %d | $8A14(shadowed): %d | $8A20 DEEP: %d | $8A26 DEEP: %d | $8AB2 2029-stamp: %d",
+      ngate, n14, n20, n26, n2029))
+    io.flush(); manager.machine:exit()
+  end
+end)

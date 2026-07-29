@@ -508,7 +508,31 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
       RESETS the selector, $298C's bchg yields the same fork on the next IRQ6, and the STAKE arm is
       never taken.  The never-entered $92B4, the frozen C800[0] at $2380, and the 12-of-16 dropped
       records are ONE consequence, not three separate defects.
-    ★★ FRONTIER RESTATED AGAIN (cont.451) - the model does NOT owe the pattern.  $8A9E's arms decide:
+  ★★★ THE MFM DROP MECHANISM, found (cont.452) - it is the bit1/bit2 divergence: >
+    Re-took the verify-body count with DEEP taps ($8A20 and $8A26, past the three or.b's) after the
+    $8A14 count was suspected of prefetch shadow ($8A14 sits two bytes after $8A12 bra $8a38):
+      $89FA gate: 58 | $8A14: 18 | $8A20 DEEP: 18 | $8A26 DEEP: 18 | $8AB2: 0
+    PREFETCH HYPOTHESIS REFUTED - the deep taps agree, the body does execute 18 times.
+    BUT NOT ON THE FAILING READ.  $8A14 is reachable only when $89FE btst #$1 (UIB+$12 bit1) is SET
+    and $8A08 btst #$e (UIB+$20 bit14) is CLEAR.  UIB+$12 is $40 at cyl 0 and $44 at cyl 1 - bit1
+    CLEAR in both - and $37/$2f at cyl 69/83, bit1 SET.  So the 18 executions are the cyl-69/83
+    operations; for the CYLINDER-1 MFM READ the verify is SKIPPED ENTIRELY at $8A02.
+    MECHANISM: every cyl-1 record falls straight to $8A38 clr.w $7950 -> the alternator is reset on
+    every record -> $298C's bchg yields the same fork forever -> the STAKE arm ($92B4) is never
+    taken -> C800[0] frozen, 12 of 16 records dropped.  One cause, and it is bit1.
+    THIS IS THE $7C5C DIVERGENCE, now with a second consumer and a countable consequence: bit1 gates
+    the VERIFY ($89FE) and the cylinder WIDTH ($7C5C), while bit2 is DENSITY (cont.443, measured
+    against the media).  Four ROM sites test bit1 ($356A, $7C5C, $89FE, $8AE4); the model keys on
+    bit2.  Whichever is right, the firmware and the model must agree, and $89FE is where the
+    disagreement is now countable.
+  ★ RETRACTED from cont.451 - "$2029 closes the loop": >
+    $8AB2 executes ZERO times.  The $2029 stamped there is NOT the 0x82/0x29 the host reports; that
+    comes from one of the other sites ($7E02, $979E, $99FE).  The claim was built on a site never
+    checked for execution - the ordering rule promoted to a star entry earlier the same day
+    ([[arm-downstream-trap]]).  The $8A9E arms are still correctly decoded; only the identification
+    of the host-visible error with $8AB2 is withdrawn.
+  superseded_FRONTIER_cont451: >
+    the model does NOT owe the pattern.  $8A9E's arms decide:
         $8A9E tst.w $7a0c / bne $8AAE
         $8AA4 movea.w $72de,A0 / clr.w (A0)      count EXHAUSTED -> clear a watch slot
         $8AAE movea.w $71be,A0 / move.w #$2029,(A0)   NOT exhausted -> stamp ERROR $2029
