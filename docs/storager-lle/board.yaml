@@ -435,7 +435,27 @@ ladder_ownership:   # cont.433 - who runs the read's builder.  READ THE RETRACTI
     and the model divergence, which never depended on which command $5E64 runs under.
     The `1c 22 16 00` in the buffer is now most simply 0x87's ladder, emitted by 0x87, still there
     when the read walks - the INHERITANCE reading, not the mid-walk rewrite.
-  DISPATCH PATH UNACCOUNTED FOR - the gap under the inheritance reading: >
+  DISPATCH PATH - what cont.435b settled and what is still open: >
+    D7 FOLLOWED PROPERLY (transfers and indirect calls, not just stores): $0DE4 `move.w (A1)+,D7`,
+    tested at $0DE6, and the ONLY later mentions in 200 instructions are `movem.l D1-D7/A0-A3` save/
+    restore at $0F46/$0F6E around calls to $651C and $6CE4 - preservation, not use.  No movea from
+    D7, no jsr through it.  D7 really does die at $0DE6.
+    THE $92 TABLE IS A PAIR {validity marker, UIB+$20 value}: word0 -> D7 (zero test only), word1 ->
+    D6 at $0DEA and thence $0E7E `move.w D6,($20,A6)`.  That is where the measured UIB+$20 = $8c27
+    comes from (entry $128).  The handler-looking words in that table are NEVER dispatched.
+    THE INSTALL EXISTS, and is gated on the same bit14: $93FC movea.w $71c2,a0 / $9400 move.w
+    ($20,a6),d0 / $9404 btst #$e,d0 / bit14 SET -> $940A #$6102, CLEAR -> $9412 #$5fc0 into ($6,a0).
+    $8c27 has bit14 clear, so it would install $5FC0, the read builder.
+    BUT IT NEVER RUNS.  $93F4 is reached ONLY from $93D6 and $93EA, both `bne` on counter mismatches
+    ($93CE addq #1,d1 vs UIB+0; $93DA addq #1,d2 vs the 16-bit UIB+$1a/$1b total) - a CONTINUATION
+    path, "more to go, install the builder for the next chunk".  Reads never enter it.
+    MEASURED: [$71c2] == [$721a] == $7224 (the same descriptor), slot+6 reads 0000 for the whole run,
+    and ZERO builder addresses are written anywhere in $7100-$72FF.  The cont.433b refutation watched
+    [$721a]+$6 believing it a different cell from [$71c2]+$6; it is the same address, so its
+    conclusion held for the wrong reason.
+    STILL OPEN: what performs the INITIAL builder dispatch.  The descriptor +6 slot is never written
+    by anything, so $2342 `jsr (a1)` through ($6,a1) cannot be it, and the $92 table is not it either.
+  superseded_DISPATCH_gap: >
     Something invokes the builder and neither candidate route is accounted for:
       - $2342 jsr (A1) with A1 from ($6,A1): that slot measured as NEVER written, reading 0000, which
         would fault rather than dispatch (cont.433b).
