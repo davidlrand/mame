@@ -464,7 +464,20 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
     So the arm is NOT absent on MFM - it UNDER-FIRES.  $8022 runs 4 times for 16 records against 12
     on FM, and only ~4 transfers reach the host.  Twelve of sixteen MFM records never reach the
     data-done handler at all.
-    FRONTIER: why 12 of 16 MFM records are dropped BEFORE data-done - which points at the record
+    TRANSFER LENGTH (cont.447) - a latent fragility, NOT the cause of the drop pattern:
+      The length came from `m_track[0].len` - sector INDEX 0 of the LAST capture, not the sector in
+      flight and not any commanded count, with a comment baking in "one FM sector".  Predicted
+      symptom was 128-byte transfers of 256-byte MFM sectors.  MEASURED AND REFUTED:
+        FM  read: len=128  track[0]=128  track[m_sec_index]=128  [$7996]=$0080
+        MFM read: len=256  track[0]=256  track[m_sec_index]=256  [$7996]=$0100
+      All agree, so transfers are full-length and this is NOT what drops the MFM records.  It was
+      right only by coincidence - a track is re-captured per operation and every sector on it shares
+      a size - and breaks on a mixed-size track or a stale capture.
+      FIXED on its own terms: length now taken from m_track[m_sec_index], the sector actually in
+      flight, which is the gate array's own decode.  ([$7996] carries the firmware's commanded size,
+      $0080 FM / $0100 MFM, but it is firmware RAM; [$7460] is a constant $0011 and is not a byte
+      count.)  Verified no regression: FM 128, MFM 256, label still readable at the host.
+    FRONTIER (unchanged): why 12 of 16 MFM records are dropped BEFORE data-done - which points at the record
     verify / MFM ID compare ($89F2, $9884), the code this campaign long recorded as unreachable.
     CAVEAT on the instrument: the FM/MFM labelling read UIB+$12 ($6E72) from inside a tap callback,
     within the model's own $4000-$7FFF snoop range - the hazard in storager-measurement-discipline.

@@ -863,11 +863,34 @@ void multibus_storager_device::run_channel_dma()
 	bool const to_local = BIT(e800, 14);
 	bool const to_host  = !BIT(e800, 14) && BIT(e800, 13);
 	// A read data transfer sources the captured SRAM chunk ($8018 sets C800[0]=[$741e] = the chunk word
-	// pointer), distinguishing it from the IOPB/UIB control blocks (which source the node work area).  For
-	// the data field the gate array moves exactly what op18 programmed - one FM sector - so honour the
-	// captured field length rather than the control-block size.
+	// pointer), distinguishing it from the IOPB/UIB control blocks (which source the node work area).
+	// Length comes from the sector ACTUALLY IN FLIGHT, not from index 0 of the last capture.  The old
+	// form (m_track[0].len) was right only by coincidence - a track is re-captured per operation and
+	// every sector on it shares a size - and its comment baked in "one FM sector".  It breaks on a
+	// mixed-size track, and on a stale capture it would move an FM-sized 128 bytes for a 256-byte MFM
+	// sector.  Measured cont.447: FM 128 / MFM 256 with track[0] and track[m_sec_index] agreeing, so
+	// this is a latent fragility rather than the cause of the MFM drop pattern - fixed on its own
+	// terms.  (The firmware's commanded size lives at [$7996] - $0080 FM / $0100 MFM - but that is
+	// firmware RAM; the gate array's own decode is the correct source.)
 	bool const is_data = to_host && m_sec_count > 0 && ld >= 0x4000 && ld < 0x7000;   // the linear data buffer
-	u32 const len = is_data ? m_track[0].len : (BIT(e800, 13) ? 0x18 : 0x20);   // node = 0x18, UIB = 0x20
+	u32 data_len = m_track[0].len;
+	if (m_sec_index >= 0 && m_sec_index < m_track_n)
+		data_len = m_track[m_sec_index].len;
+	u32 const len = is_data ? data_len : (BIT(e800, 13) ? 0x18 : 0x20);   // node = 0x18, UIB = 0x20
+	// TEMP cont.447: is the transfer length coming from the wrong object?  m_track[0].len is sector
+	// INDEX 0 of the LAST capture - not the sector being moved (m_sec_index), and not any count the
+	// firmware programmed.  Compare against the sector actually in flight and the firmware's own
+	// commanded sizes ([$7460] -> PIT0 counter 1 at $4504-$4518, and [$7996], the chunk-table stride
+	// at $0ADC).
+	if (is_data)
+	{
+		address_space &cs5 = m_cpu->space(AS_PROGRAM);
+		int const si = (m_sec_index >= 0 && m_sec_index < m_track_n) ? m_sec_index : -1;
+		logerror("XFERLEN len=%u | track[0].len=%u | track[%d].len=%s | [$7460]=%04x [$7996]=%04x\n",
+			len, m_track[0].len, m_sec_index,
+			(si >= 0) ? std::to_string(m_track[si].len).c_str() : "n/a",
+			cs5.read_word(0x7460), cs5.read_word(0x7996));
+	}
 	// D000 is the GENERIC local-DMA address latch - it carries the node for one control block and the
 	// UIB for the next (both loaded at $3D42).  The class is what distinguishes them, so latch the UIB
 	// base here: it is where the operation-complete bit (UIB+$12 bit7) has to be deposited.
