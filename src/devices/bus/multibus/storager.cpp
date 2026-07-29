@@ -239,6 +239,7 @@ private:
 	// (get_next_transition) and the gate array deserialises it, doing address-mark detect and filling the
 	// gate array's capture cells + raising IRQ5/IRQ6 per field boundary.
 	bool flux_density_fm() const;
+	u8   logical_r(u8 phys) const;   // physical sector ID -> the logical numbering the firmware uses
 	attotime sector_period() const; // one sector's rotation at 300 rpm
 	void start_field_program();     // the loaded op18 program begins running: open the read window
 	void advance_read();            // stage + deliver the next record while the window is armed (IRQ6 then IRQ5)
@@ -408,6 +409,29 @@ private:
 // $6536/$7C5C, all consistent) and would be a one-line fix: that is a firmware-RAM snoop, the shape
 // the LLE mandate rules out and that this campaign has spent months removing.  The program is what the
 // gate array is actually TOLD, so it is the correct source even while its semantics are undecoded.
+// UIB[4] is the STARTING SECTOR ID: the physical ID that logical sector 0 lives at.  Measured from
+// the host-supplied UIB (fetched per operation from $0FE948):
+//     FM  : 02 10 80 00 07 ...   heads=2 spt=16 size=$0080(128) sec0=$07
+//     MFM : 02 10 00 01 0d ...   heads=2 spt=16 size=$0100(256) sec0=$0D(13)
+// So logical 1 is physical 7 on FM - which is exactly where VOL1SINIX0 lives on this medium (the IMD
+// puts it at cyl0/head0/R=7).  Without the mapping, physical 7 lands at buffer position 6 and
+// 6 x 128 = $300 - precisely the measured displacement of the label, host $0FC0DD -> $0FC3DD.
+// The GA reports the recovered ID; the mapping to the logical numbering the firmware asks for comes
+// from the UIB, a host-supplied control block the gate array DMAs in itself - not a firmware snoop.
+// Corroboration for the field map: UIB[1] = sectors/track is read by the FIRMWARE at $7362
+// (move.b ($1,A6),D2) for exactly that purpose, so the ROM and the HLE agree on the layout.
+u8 multibus_storager_device::logical_r(u8 phys) const
+{
+	if (m_uib_base < 0x4000 || m_uib_base >= 0x8000)
+		return phys;
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	u8 const spt  = cs.read_byte((m_uib_base + 1) & 0xffff);
+	u8 const sec0 = cs.read_byte((m_uib_base + 4) & 0xffff);
+	if (spt == 0 || sec0 < 1 || sec0 > spt || phys < 1 || phys > spt)
+		return phys;
+	return u8(((phys - sec0 + spt) % spt) + 1);
+}
+
 bool multibus_storager_device::flux_density_fm() const
 {
 	// cont.443: density is UIB+$12 BIT 2, not the program's bit7 and not UIB+$12 bit1.
@@ -703,7 +727,7 @@ void multibus_storager_device::advance_read()
 			cs.write_byte((dst + k++) & 0xffff, 0xfe);       // +0  ID address mark (no A1 sync in FM)
 			cs.write_byte((dst + k++) & 0xffff, s.c);        // +1  C
 			cs.write_byte((dst + k++) & 0xffff, s.h);        // +2  H
-			cs.write_byte((dst + k++) & 0xffff, s.r);        // +3  R
+			cs.write_byte((dst + k++) & 0xffff, logical_r(s.r));   // +3  R (logical, via UIB sec0)
 			cs.write_byte((dst + k++) & 0xffff, s.nn);       // +4  N
 		}
 		else
@@ -738,7 +762,7 @@ void multibus_storager_device::advance_read()
 			// They genuinely conflict at +4 on one buffer, and the resolution is not in this routine.
 			cs.write_byte((dst + k++) & 0xffff, s.c);        // +4  C
 			cs.write_byte((dst + k++) & 0xffff, s.h);        // +5  H
-			cs.write_byte((dst + k++) & 0xffff, s.r);        // +6  R
+			cs.write_byte((dst + k++) & 0xffff, logical_r(s.r));   // +6  R (logical, via UIB sec0)
 			cs.write_byte((dst + k++) & 0xffff, s.nn);       // +7  N
 		}
 		m_mark_pending = 6;

@@ -508,7 +508,32 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
       RESETS the selector, $298C's bchg yields the same fork on the next IRQ6, and the STAKE arm is
       never taken.  The never-entered $92B4, the frozen C800[0] at $2380, and the 12-of-16 dropped
       records are ONE consequence, not three separate defects.
-  ★★★ THE DROP DOES NOT EXIST (cont.454) - the accounting closes exactly: >
+  ★★★ sec0 - THE UIB CARRIES A STARTING SECTOR ID THE LLE HAD NO EQUIVALENT OF (cont.455): >
+    The HLE has `u8 m_unit_sec0[4]` - UIB[4], the physical ID that LOGICAL sector 0 lives at - and
+    maps `secid = ((sec0 - 1 + sidx) % spt) + 1`.  The LLE had nothing corresponding.
+    The host-supplied UIB, decoded with the HLE's field map (fetched per operation from $0FE948):
+      FM  : 02 10 80 00 07 ...   heads=2  spt=16  size=$0080 (128)  sec0=$07
+      MFM : 02 10 00 01 0d ...   heads=2  spt=16  size=$0100 (256)  sec0=$0D (13)
+    matching the HLE's recorded FM=7 / MFM=13 exactly.  VOL1SINIX0 lives at cyl0/head0/R=7 on this
+    medium, so logical 1 IS physical 7 and the label belongs at buffer offset 0.  Without the mapping
+    physical 7 lands at position 6, and 6 x 128 = $300 - PRECISELY the measured displacement
+    $0FC0DD -> $0FC3DD.  The arithmetic closes to the byte.
+    RETRACTION OF A RETRACTION: cont.454 concluded the data was "correctly delivered" and the failure
+    was host-side.  Wrong.  The ordering base was off by sec0, and the host was correctly rejecting
+    mis-based data.  The original "placed by arrival" instinct was closer than the retraction.
+    IMPLEMENTED: the record's R is now the LOGICAL sector via ((phys - sec0 + spt) % spt) + 1, taken
+    from the UIB - a host-supplied control block the gate array DMAs itself, not a firmware snoop.
+    Corroboration for the field map: UIB[1] = sectors/track is read by the FIRMWARE at $7362
+    (move.b ($1,A6),D2) for that purpose, so ROM and HLE agree on the layout.
+    ACCEPTANCE TEST PASSED: VOL1SINIX0 now lands at host $0FC0DD and HDR1 NSC Boot at $0FC15D.
+    NOT SUFFICIENT: the boot still reports "no sys-floppy" at 8.3s.
+    ALSO AVAILABLE FROM THIS FIELD MAP: UIB[2-3] is a commanded BYTES/SECTOR ($0080 FM / $0100 MFM) -
+    a direct density source, cleaner than the bit1-vs-bit2 argument that consumed several exchanges.
+    OPEN - the COUNT UNIT: the HLE treats +$a/+$b as 512-BYTE BLOCKS (`sec_per_blk = 512 / ssz`, so
+    count=8 with 128-byte sectors is 32 sectors).  The firmware has [$7abc]=8 and [$7956] draining
+    8->0, so it counts 8 of something.  If blocks, the read delivers a QUARTER of what was asked for -
+    an independent second reason the host would reject.  Settle the unit before changing anything.
+  superseded_THE_DROP_DOES_NOT_EXIST (cont.454) - the accounting, still correct as accounting: >
     The working control handed over the accounting.  $8022 (the per-record data-done arm) fires 12
     times on FM, and the two FM reads commanded 8 and 4.  12 = 8 + 4: EVERY commanded record reaches
     data-done, none dropped.  The record path is 100% when it works.
