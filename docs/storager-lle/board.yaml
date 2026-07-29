@@ -426,7 +426,16 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
       $92B8 tst.w $742c / $92BC bne $92F6        <- gate: non-zero SKIPS the re-arm
       $92BE move.w $7434,$d800
       $92C4 move.w $741e,$c800                   <- the ONLY copy of [$741e] into the GA arm
-    [$742C] setters $7162 / $7BF6 / $7EA4 (note: $7EA4, not $7EB2), clearers $7CA8 / $7E42 / $7E90.
+    [$742C] - FULL enumeration, uncapped (an earlier `head -6` truncated this and lost two setters
+    and two testers; see guardrails - never cap a writer enumeration):
+      setters (5):  $7162  $7BF6  $7EA4  $7EB2  $95DA
+      clearers (3): $7CA8  $7E42  $7E90
+      testers (3):  $925E  $92AC  $92B8
+    $7EB2 is THE one that matters here: it is reached by $7E8E beq $7EB2, the [$7968]==0 leg - the
+    leg that runs on the MFM path - so it is the setter the latch depends on.  A truncated list that
+    omitted it described a gate with no path to latch on the failing case.
+    Note also that [$742C] gates THREE sites in this region ($925E, $92AC, $92B8), not just the
+    re-arm, so it blocks more than the C800 copy.
     HYPOTHESIS with a matching symptom: with [$7968]==0 and nothing being rejected, [$742C] latches
     at 1 after the first record and every subsequent $92B4 bails, freezing C800[0] while [$741e]
     walks on.  FM never showed this because the rotational start produces rejects, and each reject
