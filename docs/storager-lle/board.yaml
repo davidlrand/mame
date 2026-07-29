@@ -398,10 +398,26 @@ frontier_read_ladder_not_built:   # cont.431 - the named corruption, with a two-
       $5FD0 bne $5FDA        <- both zero FALLS THROUGH:
       $5FD2 move.w #$6a,d0 / $5FD6 bra $60F6   (error $6A, nothing emitted)
     If node+$a and node+$b are both zero the builder bails before writing a single word.
+  TENSION - the hypothesis makes a prediction the data may already contradict: >
+    $60F6 does NOT post anything.  It is `tst.w $796a / bne $6100 / bsr $1242 / $6100 rts`, so the
+    bail RETURNS D0 = $6A to the dispatcher's jsr (A1) at $2342 rather than stamping a status.  The
+    story therefore predicts D0 = $6A back from the builder, against an OBSERVED outcome of 0x80.
+    Either the dispatcher drops the builder's return value, or the bail is not what happened.
+    Do not open next session treating the bail as established.
   cheapest_test: >
-    ONE WORD: node+$a / node+$b at the read's builder entry, and whether $5FDA is reached at all.
-    If the builder bails, no write tap on $7250 is needed - nothing wrote the zero, it was always
-    there, and the "builder defect vs stray write" two-way test collapses to one answer.
+    ONE RUN, three values at the same tap point: node+$a and node+$b at the read's builder entry,
+    whether $5FDA is reached, AND D0 at $6100.  The last one is what discriminates "bailed and the
+    error was dropped" from "did not bail" - node+$a/$b alone cannot, if they turn out non-zero for
+    an unrelated reason.  If the builder bails, no write tap on $7250 is needed: nothing wrote the
+    zero, it was always there.
+  not_a_byte_order_question: >
+    Ruled out BY INSPECTION, not by measurement: `move.b ($a,A2),D0 / or.b ($b,A2),D0` reads both
+    halves and ORs them, so the zero/non-zero result is byte-order independent.  Byte order has been
+    the answer twice in this campaign (see sram_byte_order); it is not the answer here.
+  shared_idiom_not_exotic: >
+    The identical both-zero guard appears in the WRITE builder at $610A-$6118 (same test, same #$6a,
+    out via $6206).  A shared malformed-IOCB idiom, which makes it more likely to be a real guard
+    firing on bad input than a corruption artifact.
   ruled_out: >
     Wrong channel ([$721a] measured 7224 on EVERY op00 stamp, both commands, and both walk base
     $7250, so build and walk agree).  Allocator exhaustion (free-list healthy at exit on all reads).
