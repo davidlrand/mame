@@ -423,7 +423,27 @@ density_source:   # cont.439 - density comes from the field program, not E800 bi
     (the MFM header-compare enable, $3566/$3570).  Half-set: MFM comparison logic on, MFM density off.
     Compare cyl 0's $40 (bit6 only) and cyl 69's $37 / cyl 83's $2f (both bit1 set).
     There is NO retry path - the firmware does not discover the format - so this is not FM-first
-    probing.  Why the density bit is clear for a track the firmware knows to be MFM is the frontier.
+    probing.
+    TRACED cont.441b - the density flag is HOST-SUPPLIED, not firmware-computed:
+      NO ROM site can set UIB+$12 bit1.  The only +$12 writers are $2406 (move.w D0, and D0 is #$0
+      from $23F2), $3AC4 and $3D10 (both move.w #$1), and $3570 (ori.b #$4).
+      Measured writers of $6E72 during the reads: pc=$3D4A, the CONTROL-BLOCK DMA path -
+        6.4086  UIB+12 <= 40 / +13 <= 18   bit1=0
+        8.1218  UIB+12 <= 44 / +13 <= 20   bit1=0
+        8.1326  UIB+12 <= 40 / +13 <= 18   bit1=0
+      So the CPUAP supplies the density, and for these reads it supplies FM.
+    THE CONTRADICTION, unresolved: the firmware's own console reports the failing read as
+      "Cyld = 1 Head = 0 Sect = 1, Log. Blocknr = 33" - block 33 IS cylinder 1, MFM by construction -
+      while the host-supplied UIB for that operation says FM.  Both sides are known-good.
+    THREE READINGS, not distinguished by anything measured:
+      1. the model fetches the UIB from the wrong host address/offset, so bit1 is real but the wrong
+         byte is being read;
+      2. density is updated per-operation by a path that runs AFTER the DMA and the model breaks it;
+      3. the HEAD IS NOT WHERE THE OPERATION TARGETS - the model's seek leaves it at cylinder 1 while
+         the transfer is set up for another track, and the runaway to cylinder 69 is the same fault
+         at larger scale.  This one would explain everything with neither side being wrong, which is
+         why it is first to check - but it is a GUESS, and two guesses have already been overturned
+         in this stretch.
   CAVEAT 1 as originally recorded (superseded above) - UNDERDETERMINED: >
     0a6d ^ 02ad = $08C0, so bits 11, 7 and 6 ALL separate the two programs, and with only two samples
     each would test equally clean.  Bit 7 is PROVISIONAL; the data does not distinguish it from 11
