@@ -440,8 +440,18 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
     at 1 after the first record and every subsequent $92B4 bails, freezing C800[0] while [$741e]
     walks on.  FM never showed this because the rotational start produces rejects, and each reject
     clears [$742C] through $7CA8.
-    TAP WHEN PICKED UP: [$742C] and [$7968] at $92B8, plus a count of $92BC taken vs fallen through.
-    One site, two cells - confirms or eliminates the gate.
+    GATE HYPOTHESIS REFUTED cont.445 - $92B8 is NEVER REACHED:
+      $92B8 tests: 0 | skipped (742C non-zero): 0 | $92C4 re-arms: 0
+      setters fired:  $7EB2=16  $7EA4=1
+      clearers fired: $7E90=17  $7CA8=2
+    [$742C] is not latching - it toggles freely, set 17 times and cleared 19.  The reason C800[0]
+    stays frozen at $2380 is more fundamental: THE RE-ARM ROUTINE AT $92B4 IS NEVER ENTERED.  Nothing
+    gates it off; nothing calls it.
+    Confirmed in passing: $7EB2 fires exactly 16 times, so all 16 MFM records take the [$7968]==0 leg
+    as predicted.  ($7E90's count of 17 is prefetch-inflated - $7E8E beq $7EB2 makes $7E90 the
+    fall-through - so only $7EB2, a branch TARGET, is trustworthy here.)
+    NEW QUESTION: what calls $92B4, and why is it not called on the MFM path?  $92B4 opens with
+    movem.l D0-D1/A0,-(A7), so it is a called routine, not fallen into.
     NOT A LEAD - the failed allocations' "garbage indices": $3474/$347A write (-$6,A3) and (-$8,A3)
     TOGETHER on the success path only, so when the verdict is 0000 the index slot was never written
     and holds stale frame contents.  $74c4/$6ed6/$6b44/$71f0 being RAM addresses is exactly that.
