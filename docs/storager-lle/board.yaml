@@ -411,8 +411,23 @@ frontier_read_ladder_not_built:   # cont.431 - the named corruption, with a two-
     byte works), but firmware WORD reads of node fields see SWAPPED HALVES.  run_channel_dma has an
     explicit swap that was inverted under the flip; this path has none and was never audited.
     THE_RULE in sram_byte_order enumerated three boundaries and later a fourth (the accept tap); this
-    is the fifth.  AUDIT any conclusion drawn from a node field read as a WORD - e.g. node+$12 bit1
-    (MFM), node+$20 bit14, node+$18.  Byte-read conclusions are unaffected.
+    is the fifth.
+    AUDIT BY CRITERION, NOT BY LIST (the list first written here was assembled from memory and every
+    item on it was wrong):
+      AFFECTED = host-written (node+$00..$17, the copy's range) AND firmware-WORD-read.
+      Byte reads round-trip (both ends flipped).  Firmware-written fields round-trip within firmware.
+      Only a field the HOST supplies and the firmware then reads as a WORD sees swapped halves.
+    The three originally flagged all fall OUTSIDE it, verified against the disassembly:
+      UIB+$12 bit1  - byte reads throughout ($1018/$103E/$104E/$19F8 move.b ($12,A6)).  Unaffected.
+      UIB+$20 bit14 - word read at $A35E, but firmware-written at $0E7E move.w D6,($20,A6).  Outside.
+      node+$18      - word read at $17FE, but firmware-written at $15DA/$1A4C.  Never copied.  Outside.
+    SWEEP RESULT: zero word reads at displacement <$18 off any register loaded from $71bc, $7b20 or
+    $7a06 (39 load sites checked).  The affected set is EMPTY as far as this reaches, consistent with
+    a byte-oriented IOPB - the firmware reads host-supplied fields as bytes throughout ($5FC8/$5FCC,
+    $A650/$A656, $0DEE, $0E88).
+    BOUND: the sweep follows a register up to 20 lines from a DIRECT load of those three cells; it
+    does not follow node pointers passed across calls or held longer.  Empty-as-far-as-checked, not
+    proven empty.  The boundary is still real and the copy should still be made explicit.
   superseded_cause: >
     The read's builder never emitted anything, leaving the PREVIOUS command's list in the buffer.
     $5FC0 has exactly that exit, two instructions in (verified from ROM):
