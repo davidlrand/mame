@@ -1078,6 +1078,12 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 				for (int k = 0; k < 16; k++)
 					if (BIT(m_prog[k], 7)) b7set++;
 				floppy_image_device *const fdd0 = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
+				address_space &cs3 = m_cpu->space(AS_PROGRAM);
+				u32 const uib = m_uib_base, nd2 = m_node_base;
+				logerror("  at load: node+12=%02x(bit1=%d)  UIB+12=%02x(bit1=%d)  E800=%04x(bit10=%d)\n",
+					cs3.read_byte((nd2 + 0x12) & 0xffff), BIT(cs3.read_byte((nd2 + 0x12) & 0xffff), 1),
+					cs3.read_byte((uib + 0x12) & 0xffff), BIT(cs3.read_byte((uib + 0x12) & 0xffff), 1),
+					m_ch[(0xe800 - 0xe000) / 2], BIT(m_ch[(0xe800 - 0xe000) / 2], 10));
 				logerror("PROGRAM cyl=%d (media says %s)  bit7 set in %d/16 words  cmd=%02x: %s\n",
 					fdd0 ? fdd0->get_cyl() : -1,
 					(fdd0 && fdd0->get_cyl() == 0) ? "FM" : "MFM",

@@ -400,7 +400,31 @@ density_source:   # cont.439 - density comes from the field program, not E800 bi
       0a6d 0829 0033 0a6d 0a09 ... 023f    bit7 clear 16/16
       02ad 0aad 08a9 00b3 06ad ... 0cbb    bit7 set   16/16
     Density is now taken from BIT(m_prog[0], 7), falling back to E800 bit10 before any program loads.
-  CAVEAT 1 - UNDERDETERMINED: >
+  CONFIRMED cont.441 - program bit7 IS density, and it tracks the firmware's own flag: >
+    Five samples, program bit7 against UIB+$12 bit1, correlating exactly:
+      cyl  0  media FM   bit7 0/16   UIB+12=40  bit1=0
+      cyl  0  media FM   bit7 0/16   UIB+12=40  bit1=0
+      cyl  1  media MFM  bit7 0/16   UIB+12=44  bit1=0    <- firmware commands FM on an MFM track
+      cyl 69  media MFM  bit7 16/16  UIB+12=37  bit1=1
+      cyl 83  media MFM  bit7 16/16  UIB+12=2f  bit1=1
+    So the field program carries density, derived from the firmware's own density flag - and taking it
+    from the PROGRAM stays the correct source (it is what the gate array is told) while now having
+    evidence behind it, not only doctrine.
+  CAVEAT 1 RETIRED - the data DID distinguish the bit: >
+    The bit sweep at cont.439 already showed bit 6 at 2/16 vs 0/16 and bit 11 at 11/16 vs 13/16 -
+    NEITHER consistent.  Bit 7 is the ONLY bit clear in all sixteen words of one program and set in
+    all sixteen of the other.  The "underdetermined between 11/7/6" caveat was accepted despite the
+    measurement already contradicting it; recorded here so it is not reinstated.
+  CAVEAT 2 WEAKENED: $02ad is now also observed at cyl 83, and both its occurrences carry
+    UIB+$12 bit1=1, so it is no longer only a post-failure artefact.
+  ★ THE CYLINDER-1 ANOMALY, isolated: >
+    For the read at cylinder 1 - MFM by construction, and per Dave the firmware KNOWS track 1+ is MFM
+    from its format tables - the firmware commands UIB+$12 = $44: bit1 CLEAR (FM density) but bit2 SET
+    (the MFM header-compare enable, $3566/$3570).  Half-set: MFM comparison logic on, MFM density off.
+    Compare cyl 0's $40 (bit6 only) and cyl 69's $37 / cyl 83's $2f (both bit1 set).
+    There is NO retry path - the firmware does not discover the format - so this is not FM-first
+    probing.  Why the density bit is clear for a track the firmware knows to be MFM is the frontier.
+  CAVEAT 1 as originally recorded (superseded above) - UNDERDETERMINED: >
     0a6d ^ 02ad = $08C0, so bits 11, 7 and 6 ALL separate the two programs, and with only two samples
     each would test equally clean.  Bit 7 is PROVISIONAL; the data does not distinguish it from 11
     or 6.  Do not record it as decoded.
