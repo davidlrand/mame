@@ -490,7 +490,28 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
     wrote.  The $2DB4 hardcoded set (C=+5 H=+7 R=+8) that motivated the ten-byte reading is a
     DIFFERENT initialisation and is not the one in use on this path (both were observed at cont.440:
     $7DAF on one record, $7DB4 on others - two inits exist and only $2CF2's is live here).
-    ★ THE UNRESOLVED CONTRADICTION, which is now the frontier:
+    ★★ CONTRADICTION DISSOLVED (cont.450) - $89F2 is an AM-COUNT, not a per-record ID verify:
+      The campaign's own disassembly header says so:
+        "IRQ6 $298C : bchg [$7950]0 -> $89F2 (verify / [$7a0c] AM-count) | $92B4 (STAKE)"
+      [$7a0c] is armed with THREE at $6AB2 (move.w #$3,$7a0c, in op28's region - during the SEEK),
+      decremented at $8A32, cleared at $8A0E, and tested at $8A9E.  So $89F2 is a POST-SEEK FORMAT-
+      SIGNATURE SEARCH that must match its pattern three times, not a per-record ID compare.
+      THEREFORE $8A2C's "byte +4 == $FF" describes the SIGNATURE it hunts for, NOT the shape of the
+      ID field the POSPTRs address.  Same buffer, different purposes, both correct - there was never
+      a contradiction, and $8A2C was never evidence about the ID field's layout at all.  That retires
+      the ten-byte reading properly rather than merely by measurement.
+      $8A9E is not a bare three-in-a-row: zero -> $8AA4 clr.w ($72de); non-zero -> $8AAE via [$71be],
+      so exhaustion has its own consequence and "found three" is distinguished from "still searching".
+    ★★ AND IT COLLAPSES THREE SYMPTOMS INTO ONE CAUSE:
+      $298C alternates between the two arms on [$7950] bit0 (which is why $92B4's only predecessor is
+      $2996 bra $92b4).  The verify's failure path does $8A38 clr.w $7950 - so every failed verify
+      RESETS the selector, $298C's bchg yields the same fork on the next IRQ6, and the STAKE arm is
+      never taken.  The never-entered $92B4, the frozen C800[0] at $2380, and the 12-of-16 dropped
+      records are ONE consequence, not three separate defects.
+    ★ FRONTIER, restated: what must the model PRESENT so the three-mark count at [$7a0c] is satisfied?
+      The pattern is bytes 0-2 OR'd == $A1, byte +3 == $FE, byte +4 == $FF, three times over.  Read
+      $8A9E's two arms before assuming the count is all that is owed.
+    superseded_CONTRADICTION (cont.449), dissolved above:
       $8A2C cmpi.b #$ff,(A0) requires byte +4 of the record at $7DAC to be $FF.
       The live POSPTR puts the CYLINDER at +4.
       Both are in the ROM; they cannot both hold for a single buffer at $7DAC.
