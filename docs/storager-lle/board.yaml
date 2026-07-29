@@ -376,6 +376,41 @@ watch_pump:   # cont.421 - the read's completion architecture, traced end to end
   conf: V
 
 # ============================================================================================
+# ============================================================================================
+frontier_cmd95_18s:   # cont.430 - the named frontier, with its test already defined
+  state: >
+    Under program retention the boot reaches 13 commands / 10 clean 0x80 and then loops: a cmd 0x95
+    fails with host status 0x82/$29 after ~18.3s, the host re-runs the 87/89 preamble (both complete
+    cleanly) and reissues the same read.  The 87 and 89 around it passing means the seek and the ESDI
+    status command are fine; it is that specific read.
+  open_question: >
+    Is the 18.3s an OUTER RETRY LOOP over the 1.305s $7B1C watchdog, or a distinct mechanism?
+    18.3 / 1.305 = 14.02, and [$79aa] is a retry counter (incremented $9328, clamped to 15 at $1A6A
+    before being reported in the status byte), so fourteen periods with give-up on the fifteenth fits
+    to within measurement error.  That would also explain $29 vs $1C without a second mechanism: $1C
+    is what each ATTEMPT stamps, $29 what EXHAUSTION reports.  Note the four $2029 sites split
+    cleanly - $7E02/$8AB2 write into a structure ((A0)), $979E/$99FE load it into D0 as a RETURN
+    VALUE, and the latter pair (in the $9xxx region, not the record path) is the shape of a give-up.
+  RETRACTED: >
+    "18.3s is too long for the 1.305s watchdog, therefore not that mechanism" was an inference stated
+    as a fact.  It only follows if nothing retries.  Do not reuse it.
+  acceptance_test: >
+    Count watchdog arms ($7986 <- non-zero) between the failing read's OWN GO and its OWN error post,
+    WITHIN ONE RUN - never across runs, the arm time is RTC-seeded and moves seconds.
+    The test is a RATIO, not a tally: does count x 1.305s account for the elapsed ~18.3s?
+      accounts for it  -> outer retry loop; frontier restates to "why does each ATTEMPT fail",
+                          which the existing watchdog tooling already addresses
+      does not         -> distinct mechanism (this collapses the 0-arm and small-non-zero cases
+                          into one answer, which is what you actually want to know; a bare count
+                          threshold answers nothing at 2 or 3)
+  already_established: >
+    The CANCEL machinery is live: a real arm/cancel pair was measured at 3.3202/3.3203 - the cancel
+    fires within a tick of the arm.  This is a within-run structural observation and is seed-immune,
+    so it survives even though the run it came from could not reproduce the 18.3s case.  Therefore an
+    uncancelled watchdog on a failing read means THE CANCEL CONDITION WAS NEVER REACHED, not that the
+    cancel path is broken.  One branch removed from the search before it starts.
+  conf: "V (the failure and its timing) / ? (the mechanism)"
+
 sram_byte_order:   # cont.426 - THE correction; read this before trusting any byte-level claim
   finding: >
     Byte accesses to the local $4000-$7FFF SRAM resolve to the OPPOSITE half of the 16-bit word from
