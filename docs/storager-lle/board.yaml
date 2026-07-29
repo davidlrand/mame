@@ -486,7 +486,12 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
       $8A26 cmpi.b #$fe,(A0)+                          byte 3 == $FE
       $8A2C cmpi.b #$ff,(A0)                           byte 4 == $FF   <-- model writes C here
     and the hardcoded POSPTRs at $2DB4 (C=+5, H=+7, R=+8), which only fit a TEN-byte record:
-      +0..2 A1 A1 A1   +3 FE   +4 FF   +5..6 C (2 bytes)   +7 H   +8 R   +9 N
+      +0..2 A1 A1 A1   +3 FE   +4 FF   +5 C-HIGH  +6 C-LOW   +7 H   +8 R   +9 N
+    CYLINDER BYTE ORDER, pinned so it is not guessed at implementation time (this session produced
+    several byte-order incidents): HIGH byte at +5, LOW at +6.  From $7C52 movea.w ($ca,A1),A0 /
+    $7C56 move.b (A0)+,D0 / $7C62 asl.w #8,D0 / $7C64 or.b (A0),D0 - the FIRST byte read is shifted
+    UP, so it is the high half.  Cylinder 1 is therefore `00 01`, NOT `01 00`.
+    (Note $7C5C selects the width on bit1, not bit2 - the known bit1/bit2 divergence, still open.)
     The model writes the EIGHT-byte A1 A1 A1 FE C H R N, so byte 4 is the cylinder ($01 on cyl 1) and
     $8A2C fails on every MFM record.
     FIX, when picked up - SCOPE IT TO MFM: >
