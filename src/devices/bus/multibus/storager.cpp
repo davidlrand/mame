@@ -690,18 +690,50 @@ void multibus_storager_device::advance_read()
 		// expect precisely that: $9884 (the real sector-select compare) combines bytes 0-2 to $A1,
 		// requires $FE at byte 3 and takes the cylinder from byte 4(+5), gated on UIB+$12 bit2; the FM
 		// reader $7C7A instead expects $FE at byte 0, because FM HAS NO $A1 SYNC BYTES.
+		bool const fm = flux_density_fm();
 		u32 dst = u32(m_d800) << 1;
-		if (dst < 0x4000 || dst + 8 > 0x8000)
+		if (dst < 0x4000 || dst + (fm ? 5 : 8) > 0x8000)
 			dst = 0x7dac;                       // not yet latched (first record of a command)
 		int k = 0;
-		if (!flux_density_fm())
+		if (fm)
+		{
+			// FM record, five bytes.  The firmware's POSPTRs for this layout are C=+1 H=+2 R=+3
+			// (measured from $2CF2's density-driven init), and cylinder 0 reads correctly with it.
+			cs.write_byte((dst + k++) & 0xffff, 0xfe);       // +0  ID address mark (no A1 sync in FM)
+			cs.write_byte((dst + k++) & 0xffff, s.c);        // +1  C
+			cs.write_byte((dst + k++) & 0xffff, s.h);        // +2  H
+			cs.write_byte((dst + k++) & 0xffff, s.r);        // +3  R
+			cs.write_byte((dst + k++) & 0xffff, s.nn);       // +4  N
+		}
+		else
+		{
+			// MFM record, TEN bytes - specified by two independent ROM sites (cont.448):
+			//   the verify at $8A1A-$8A2C: bytes 0-2 OR'd == $A1, byte 3 == $FE, byte 4 == $FF
+			//   the hardcoded POSPTRs at $2DB4: C=+5, H=+7, R=+8 - which only fit this layout
+			// The model previously wrote the EIGHT-byte A1 A1 A1 FE C H R N, so byte 4 held the
+			// cylinder ($01 on cyl 1) and $8A2C rejected every MFM record.
+			// Cylinder is TWO bytes, HIGH at +5 and LOW at +6: $7C56 move.b (A0)+,D0 / $7C62
+			// asl.w #8,D0 / $7C64 or.b (A0),D0 shifts the FIRST byte up.  Cylinder 1 is 00 01.
+			// The media's ID field carries a single C byte, so the high half is always zero here.
+			// OPEN: what the $FF at +4 IS.  It is not a cylinder high byte (that is +5, and would be
+			// $00).  Most likely gate-array-supplied status - a validity/no-defect flag - in which
+			// case writing it unconditionally encodes "always good" and a bad record should carry
+			// something else.  Written as a constant only because its semantics are undecoded.
+			// REVERTED cont.449: the ten-byte layout is refuted by measurement.  It took the MFM
+			// C800 arms from 4 to 0, and the LIVE POSPTRs contradict it: at the MFM program load
+			// $2CF2 writes C=$7DB0 H=$7DB1 R=$7DB2, i.e. +4/+5/+6, which fits THIS eight-byte record.
+			// The $2DB4 hardcoded set (C=+5 H=+7 R=+8) that motivated the ten-byte reading is a
+			// DIFFERENT initialisation and is not the one in use.
+			// UNRESOLVED: $8A2C cmpi.b #$ff,(A0) requires byte +4 to be $FF, while the live POSPTR
+			// puts C at +4.  Both are in the ROM and they cannot both hold for one buffer at $7DAC.
 			for (int p = 0; p < 3; p++)
-				cs.write_byte((dst + k++) & 0xffff, 0xa1);   // MFM sync preamble
-		cs.write_byte((dst + k++) & 0xffff, 0xfe);           // ID address mark
-		cs.write_byte((dst + k++) & 0xffff, s.c);            // C
-		cs.write_byte((dst + k++) & 0xffff, s.h);            // H
-		cs.write_byte((dst + k++) & 0xffff, s.r);            // R (sector)
-		cs.write_byte((dst + k++) & 0xffff, s.nn);           // N
+				cs.write_byte((dst + k++) & 0xffff, 0xa1);   // +0..2  sync preamble
+			cs.write_byte((dst + k++) & 0xffff, 0xfe);       // +3  ID address mark
+			cs.write_byte((dst + k++) & 0xffff, s.c);        // +4  C
+			cs.write_byte((dst + k++) & 0xffff, s.h);        // +5  H
+			cs.write_byte((dst + k++) & 0xffff, s.r);        // +6  R
+			cs.write_byte((dst + k++) & 0xffff, s.nn);       // +7  N
+		}
 		m_mark_pending = 6;
 		m_sec_phase = 1;
 		m_next_rec = machine().time() + sector_period() * 15 / 100;   // ID -> gap -> data field

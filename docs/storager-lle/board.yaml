@@ -477,7 +477,30 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
       flight, which is the gate array's own decode.  ([$7996] carries the firmware's commanded size,
       $0080 FM / $0100 MFM, but it is firmware RAM; [$7460] is a constant $0011 and is not a byte
       count.)  Verified no regression: FM 128, MFM 256, label still readable at the host.
-  ★ THE MFM REJECT, located (cont.448) - the record layout, NOT a verify failure or a divider: >
+  ★★ TEN-BYTE LAYOUT IMPLEMENTED AND REFUTED (cont.449): >
+    DO NOT RETRY without resolving the contradiction at the end of this entry.
+    Implemented density-conditionally (FM untouched) and measured against the stated acceptance test.
+    IT MADE THINGS WORSE: MFM C800 arms went 4 -> 0 ($8022 MFM 4 -> 0, $9284 1 -> 0).  Regression was
+    clean - cyl 0 still FM 16x128 with the label readable - so the density conditioning worked and the
+    layout itself is what is wrong.  Reverted; the revert restores 4/1 exactly.
+    WHY, from a measurement already in hand and not applied at the time: the LIVE POSPTRs contradict
+    the ten-byte layout.  At the MFM program load $2CF2 writes
+        UIBC(+ca) <= $7DB0   UIBH(+cc) <= $7DB1   UIBS(+ce) <= $7DB2
+    i.e. C=+4 H=+5 R=+6 from $7DAC - which fits the EIGHT-byte A1 A1 A1 FE C H R N the model already
+    wrote.  The $2DB4 hardcoded set (C=+5 H=+7 R=+8) that motivated the ten-byte reading is a
+    DIFFERENT initialisation and is not the one in use on this path (both were observed at cont.440:
+    $7DAF on one record, $7DB4 on others - two inits exist and only $2CF2's is live here).
+    ★ THE UNRESOLVED CONTRADICTION, which is now the frontier:
+      $8A2C cmpi.b #$ff,(A0) requires byte +4 of the record at $7DAC to be $FF.
+      The live POSPTR puts the CYLINDER at +4.
+      Both are in the ROM; they cannot both hold for a single buffer at $7DAC.
+      So either the verify at $89FA-$8A38 reads a DIFFERENT buffer than the POSPTRs address, or the
+      two are used by paths that never run on the same record.  That question must be answered before
+      any layout change is retried - the byte-layout evidence from $8A2C and from $2DB4 agreed with
+      each other and BOTH disagree with the live pointers, which is the derived-signals failure class
+      again ([[derived-signals-agreeing]]): two ROM sites corroborating each other while neither was
+      checked against what the firmware actually programs at run time.
+  superseded_MFM_REJECT (cont.448) - the record layout reading, refuted above: >
     Measured: $8A14 (the verify body) executes 18 times, so $8A02 FALLS THROUGH - the verify DOES
     run.  [$79a2] = $0100 (256, the sector size), not 4 - there is no divider.  Both halves of the
     "skipped verify / [$79a2]=4" prediction are refuted.
