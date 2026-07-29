@@ -414,7 +414,32 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
   RESULT: >
     Every capture is now correct - FM 16x128 at cyl 0, MFM 16x256 at cyl 1 and beyond - and the
     cylinder-1 read no longer errors (the "READ -compl-stat: 42 sensb: 12" line is gone).
-  NEW FRONTIER - the MFM RECORD path: >
+  MFM FRONTIER, corrected and localised (cont.444): >
+    CORRECTION to "the chunk pointer never advances": it DOES.  Measured [$741e] walking
+    2000 -> 2080 -> 20c0 -> 2100 -> 2180 -> 21c0 -> 2200 with the free list [$74ac] following
+    74cc -> 74dc -> 74e4 -> 74ec, and $7EE0 IS reached per record while $32AC returns varying
+    indices.  Both of the two candidate causes are eliminated.
+    The failure is one step later: [$741e] is the FIRMWARE's pointer; the gate array's arm is
+    C800[0], and that stays at $2380 (chunk $4700) while [$741e] moves.  The firmware advances
+    internally and does not re-arm the gate array.
+    THE RE-ARM AND ITS GATE (verified from the disassembly):
+      $92B8 tst.w $742c / $92BC bne $92F6        <- gate: non-zero SKIPS the re-arm
+      $92BE move.w $7434,$d800
+      $92C4 move.w $741e,$c800                   <- the ONLY copy of [$741e] into the GA arm
+    [$742C] setters $7162 / $7BF6 / $7EA4 (note: $7EA4, not $7EB2), clearers $7CA8 / $7E42 / $7E90.
+    HYPOTHESIS with a matching symptom: with [$7968]==0 and nothing being rejected, [$742C] latches
+    at 1 after the first record and every subsequent $92B4 bails, freezing C800[0] while [$741e]
+    walks on.  FM never showed this because the rotational start produces rejects, and each reject
+    clears [$742C] through $7CA8.
+    TAP WHEN PICKED UP: [$742C] and [$7968] at $92B8, plus a count of $92BC taken vs fallen through.
+    One site, two cells - confirms or eliminates the gate.
+    NOT A LEAD - the failed allocations' "garbage indices": $3474/$347A write (-$6,A3) and (-$8,A3)
+    TOGETHER on the success path only, so when the verdict is 0000 the index slot was never written
+    and holds stale frame contents.  $74c4/$6ed6/$6b44/$71f0 being RAM addresses is exactly that.
+    Not a defect; recorded so it is not chased.
+    So the MFM frontier is back on [$7968] - the cell that dominated the earlier campaign, now
+    reached by a different route.
+  superseded_NEW_FRONTIER - the MFM RECORD path: >
     The verdict is still "no sys-floppy", now for a different reason: on the MFM read the firmware
     never advances the chunk pointer.  All 16 fields land in chunk $4700 and only ~4 transfers reach
     the host.  The capture is right (c=01 h=00, r=01..10, 256 bytes); the per-record handling stalls.
