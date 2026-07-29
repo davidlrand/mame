@@ -1,0 +1,2407 @@
+// license:BSD-3-Clause
+// copyright-holders:Patrick Mackinlay, Dave Rand
+
+/*
+// Interphase Storager III S26361-F415
+// D8253C-2 * 2  programmable interval timer
+// MC3486P       quad EIA receiver
+// MC3487P       quad EIA driver
+// 10MHz
+// VLSI 8842AV R2932  VGC7219-0419  II-SER--24M
+// MCM6164C45 * 2   8kx8 SRAM
+// AM2147-55PC   4kx1 SRAM
+// 50MHz
+// AM27S19APC * 2 32x8 bipolar PROM
+// MC68000P12
+// 74LS1801F     Signetics fm/mfm/differential manchester encoder/decoder
+// 74LS1802A     Signetics serializer/deserialzer (CRC-16, CRC-CCITT, full duplex, CRC/ECC on receive, 8/16 bit bus)
+// AM2147-55DC   4096x1 static RAM
+
+4.2.1.2    Interphase 3030 Storager ESDI/ST-506/QIC-02
+	-------------------------------------------
+
+The Storager will support both ESDI and ST-506 drives, but in these systems
+is used only for ESDI and cartridge tape.  It too supports floppies
+(3, 5, and 8 inch), but, again, I have no knowledge of their being used.
+
+There have been reports of difficulty in using large ESDI drives with
+the Interphase Storager, the suggestion being that there is a size
+limit on the drive that may be used.  In fact, the problem is not in the
+size of the drive, but rather the higher data transfer rate that generally
+accompanies larger drives.  Different versions of the Storager exist,
+capable of sustaining different data rates.  According to Interphase:
+
+Storager		CC00047-**,Rev    10MHz
+Storager II		CC00058-**,Rev    12.5MHz
+Storager III    CC00105-**,Rev    24MHz
+Storager IIID   CC00119-**,Rev    24MHz
+
+For example, if you're running a Storager II with a Hitachi DK512-17 disk
+(134 Meg, 10Mbit/sec xfer) and want to replace it with, or add, a larger
+drive, you may run into trouble with a Micropolis 1516 (678 Meg, 20Mbit/sec).
+You'd likely have better results with a CDC 94186-383 (383 Meg, 10Mbit/sec).
+This is largely anecdotal, and not based on personal experience.
+If you know otherwise, please supply details.
+
+NOTE:  All references to the Storager in SGI documentation explicitly
+	   state "Storager II", so I believe that to be the only version
+	   they shipped.  Either that, or they were sloppy in their field
+	   service docs and actually shipped the Storager III with the
+	   Hitachi DK514-38 (330meg, 15Mbit/sec).  Perhaps someone who has
+	   one of these drives will confirm the identity of the controller.
+
+[/usr/include/multibus/si*.h]
+
+product may be Interphase 3030?
+Siemens likely is Storager II (because 12.5MHz CPU)
+mapped at multibus pio 7200-73ff (512 bytes) in CPUAP space, int 2
+
+*/
+
+#include "emu.h"
+#include "storager.h"
+
+#include "cpu/m68000/m68000.h"
+#include "machine/pit8253.h"
+#include "imagedev/floppy.h"
+#include "imagedev/harddriv.h"
+#include "formats/imd_dsk.h"
+
+#include <algorithm>
+#include <cstring>
+#include <fstream>
+#include <map>
+#include <vector>
+
+#define VERBOSE (LOG_GENERAL)
+#include "logmacro.h"
+
+// The ESDI rigid disks as raw sector images OR CHDs.  Derives from the standard harddisk image
+// device, so a flat .img (hard_disk_file wraps it at 512-byte LBAs) and a .chd both load and are
+// accessed identically.  The Storager firmware model addresses the medium as a flat byte array,
+// so img_read/img_write translate byte offsets onto the LBA sector interface (every caller uses
+// 1KB-aligned offsets/lengths).
+//
+// SINIX disktab `micropolis1325`: the PHYSICAL drive is 5 heads x 9 sectors (1KB physical
+// sectors: pl#1024/ps#9/ls#9), but SINIX ADDRESSES it via the logical block geometry se#512,
+// nc#1024, nt#8, ns#18 = 1024*8*18*512 = 75'497'472 bytes (73728 KB) -- that is the LBA layout
+// on the medium.  Access here is flat by LBA, so only se#512 granularity + total size matter;
+// the head/sector split is cosmetic.  A faithful CHD therefore uses the logical geometry
+// (chdman createhd -chs 1024,8,18 -ss 512), NOT the physical 5x9 (which does not tile the image).
+class storager_hd_image_device : public harddisk_image_device
+{
+public:
+	storager_hd_image_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock);
+
+	// accept raw .img in addition to the standard CHD/raw hard-disk container extensions
+	virtual char const *file_extensions() const noexcept override { return "img,chd,hd,hdv,2mg,hdi"; }
+
+	// flat byte-array view over the sector interface (works for raw .img and .chd alike)
+	u64 img_length() const { auto const &i = get_info(); return u64(i.cylinders) * i.heads * i.sectors * i.sectorbytes; }
+	void img_read(u64 off, void *dst, u32 len);
+	void img_write(u64 off, void const *src, u32 len);
+};
+
+DECLARE_DEVICE_TYPE(STORAGER_HD_IMAGE, storager_hd_image_device)
+DEFINE_DEVICE_TYPE(STORAGER_HD_IMAGE, storager_hd_image_device, "storager_hd", "Storager rigid disk (raw image or CHD)")
+
+storager_hd_image_device::storager_hd_image_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
+	: harddisk_image_device(mconfig, STORAGER_HD_IMAGE, tag, owner, clock)
+{
+}
+
+// Byte offsets/lengths are 1KB-aligned in every caller, so they are always sector-aligned for the
+// 512B (raw) or CHD sector size; the loops read/write whole sectors with no read-modify-write.
+void storager_hd_image_device::img_read(u64 off, void *dst, u32 len)
+{
+	auto const &info = get_info();
+	u32 const sb = info.sectorbytes ? info.sectorbytes : 512;
+	u8 *const d = static_cast<u8 *>(dst);
+	std::vector<u8> sec(sb);
+	for (u32 done = 0; done < len; done += sb)
+	{
+		u32 const chunk = std::min<u32>(sb, len - done);
+		if (read(u32((off + done) / sb), sec.data()))
+			std::memcpy(d + done, sec.data(), chunk);
+		else
+			std::memset(d + done, 0, chunk);
+	}
+}
+
+void storager_hd_image_device::img_write(u64 off, void const *src, u32 len)
+{
+	auto const &info = get_info();
+	u32 const sb = info.sectorbytes ? info.sectorbytes : 512;
+	u8 const *const s = static_cast<u8 const *>(src);
+	std::vector<u8> sec(sb);
+	for (u32 done = 0; done < len; done += sb)
+	{
+		u32 const chunk = std::min<u32>(sb, len - done);
+		if (chunk < sb)   // partial tail (never hit with 1KB-aligned callers): preserve the rest
+		{
+			std::memset(sec.data(), 0, sb);
+			read(u32((off + done) / sb), sec.data());
+		}
+		std::memcpy(sec.data(), s + done, chunk);
+		write(u32((off + done) / sb), sec.data());
+	}
+}
+
+namespace {
+
+class multibus_storager_device
+	: public device_t
+	, public device_multibus_interface
+{
+public:
+	multibus_storager_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
+		: device_t(mconfig, MULTIBUS_STORAGER, tag, owner, clock)
+		, device_multibus_interface(mconfig, *this)
+		, m_cpu(*this, "cpu")
+		, m_pit(*this, "pit%u", 0U)
+		, m_floppy(*this, "floppy%u", 0U)
+		, m_hd(*this, "hd%u", 0U)
+		, m_installed(false)
+		, m_trace(false)
+		, m_ch{}
+		, m_dma_active(false)
+		, m_c800{}
+		, m_dma_term(0)
+		, m_term_bit0(0)
+		, m_last_bw(0)
+		, m_d000(0)
+		, m_d800(0)
+		, m_timer_out(false)
+		, m_tick_prev(false)
+		, m_gate0(false)
+		, m_shadow_loaded(false)
+		, m_iopb_fetched(false)
+		, m_iopb_cmd(0)
+		, m_iopb_buffer(0)
+		, m_iopb_addr(0)
+		, m_host_int_prev(false)
+		, m_e800_bit12_prev(false)
+		, m_e802_step(false)
+		, m_seek_deadline(attotime::zero)
+		, m_rdptr(0)
+		, m_unit_heads{}
+		, m_unit_spt{}
+		, m_unit_secsize{}
+		, m_unit_sec0{}
+		, m_unit_trk{}
+		, m_unit_sidx{}
+		, m_unit_btrk{}
+		, m_unit_bsidx{}
+		, m_ioreg{}
+		, m_ioreg_done(false)
+		, m_floppy_loaded(false)
+	{
+	}
+
+protected:
+	// device_t overrides
+	virtual const tiny_rom_entry *device_rom_region() const override;
+	virtual void device_add_mconfig(machine_config &config) override;
+	virtual ioport_constructor device_input_ports() const override;
+	virtual void device_start() override;
+	virtual void device_reset() override;
+
+private:
+	void mem_map(address_map &map);
+	void opcodes_map(address_map &map);
+	static void floppy_formats(format_registration &fr);
+	void d000_w(offs_t offset, u16 data, u16 mem_mask);
+	void d800_w(offs_t offset, u16 data, u16 mem_mask);
+	u16 bus_mem_r(offs_t offset, u16 mem_mask);
+	void bus_mem_w(offs_t offset, u16 data, u16 mem_mask);
+
+	// LLE host interface: the Multibus PIO window 0x7200-0x73FF maps byte-for-byte to the Storager's
+	// on-board dual-port RAM at 0x7E00-0x7FFF (+0xC00).  The CPUAP writes the command/IOPB-pointer
+	// mailbox there; writing GO (0x13) to the command register (PIO 0x73F8 = fw 0x7FF8) is the
+	// doorbell that raises 68000 IRQ2 (handler @0x24AA).  The firmware then runs the command itself.
+	u16 host_win_r(offs_t offset);
+	void host_win_w(offs_t offset, u16 data, u16 mem_mask);
+	u16 bus_data_r(offs_t offset);   // Multibus I/O 0x0000 aperture (host reads kernel data via @0xF00000)
+
+	// disk read/write channel (74LS1801/1802 + drives) at 0xE000-0xFFFF.  Logged for RE; backed by
+	// RAM for now so the firmware runs.  E802 = IRQ ack (clears the doorbell IRQ2).
+	u16 ch_r(offs_t offset, u16 mem_mask);
+	void ch_w(offs_t offset, u16 data, u16 mem_mask);
+	void read95_deliver(u32 dst);
+	u16 ioreg_r(offs_t offset);
+	void ioreg_w(offs_t offset, u16 data, u16 mem_mask);
+	u16 c800_r(offs_t offset);
+	void c800_w(offs_t offset, u16 data, u16 mem_mask);
+	void timer0_out(int state);
+	void timer2_out(int state);
+	void load_floppy();
+	void floppy_swap_cb(floppy_image_device *fdd);   // UI media swap -> invalidate the cached sector map
+
+	required_device<m68000_device> m_cpu;
+	required_device_array<pit8253_device, 2> m_pit;
+	required_device_array<floppy_connector, 2> m_floppy;
+	required_device_array<storager_hd_image_device, 2> m_hd;   // ESDI unit 0 (-hard1) + unit 1 (-hard2); the second LUN is a second physical drive
+
+	bool m_installed;
+	bool m_trace;            // enable disk-channel logging once a host command arrives
+	u16 m_ch[0x1000];        // 0xE000-0xFFFF backing store
+
+	// --- gate-array DMA state machine (VGC7219, reverse-engineered) ---
+	bool m_dma_active;       // DMA running (E800 bit6: 0xcd3 start / 0xc12 stop)
+	u16  m_c800[0x80];       // C800 scatter/gather translation register file
+	u16  m_dma_term;         // latched transfer terminal (low bits) for the address comparator
+	u8   m_term_bit0;        // terminal LSB, latched from the helper's buffer read in DMA mode
+	u32  m_last_bw;          // last local-bus buffer write address (snooped transfer pointer)
+	u16  m_d000;             // D000 write-only DMA address latch (word address; reads = ROM)
+	u16  m_d800;             // D800 write-only DMA HOST high-address latch (paired w/ C800 low; Dave's RE)
+	bool m_timer_out;        // 8253 pit[1] counter-0 OUT -> F000 bit 11 (timer self-test)
+	bool m_settle_out = true;   // 8253 pit[0] counter-1 OUT (mode-5 one-shot, STEP-triggered) = the
+	                            // seek-settle timer; F000 bit1 (dumb-drive path) = !OUT (busy while low)
+	bool m_tick_prev;        // previous pit[1] OUT2 level (system tick edge -> IRQ1)
+	bool m_gate0;            // pit[1] ctr0 gate (E800 bit9): suppress IRQ1 on the handler's gate-toggle
+	bool m_shadow_loaded;    // gate-array test has hard-copied the EPROM worker code into RAM
+	bool m_iopb_fetched;     // gate array has autonomously bus-mastered the IOPB for this command
+	u8   m_iopb_cmd;         // V/SMD 3200 command byte from the fetched IOPB (0x87 INIT, 0x95 READ-SEQ...)
+	u32  m_iopb_buffer;      // host buffer addr = IOPB words 6-7 (BE32, low 24 bits): UIB or data target
+	u32  m_iopb_addr;        // host IOPB base addr in CPUAP RAM (for the status write-back)
+	bool m_host_int_prev;    // previous E802 bit7 (host completion interrupt level)
+	bool m_e800_bit12_prev;  // previous E800 bit12 (kickoff is the rising edge, not the level)
+	bool m_e802_step;        // last E802 bit6 (STEP); rising edge = one step pulse. VERIFIED: fw step
+	                         // loop @0x24ae does andi #$ffbf/ori #$40 on the $79f8 E802 shadow (bit6),
+	                         // writing each to ($6802,A5)=E802. (Was mis-documented as bit0.) DIR = a
+	                         // $79f8 bit set once before the loop (candidates bit2/bit3, still to verify).
+	attotime m_seek_deadline;  // F000 bit1 = seek/settle BUSY (time-windowed, per the drive datasheet: 75ms head
+	                           // load, 40ms track-to-track + 10ms settle). Armed at SEEK/RESTORE and re-armed on
+	                           // each STEP edge; bit1 stays 1 until this deadline, then 0 = settled.
+	u32  m_rdptr;            // controller position latch from the SEEK/RESTORE doorbell fields (RESTORE->0, SEEK->target[6-7])
+	std::vector<u8> m_serdes_stream;  // current track's raw ENDEC byte stream (ID+data fields), built from
+	size_t m_serdes_ptr = 0;          // decode_track_ids; E000 reads consume it w/ wrap (74LS1802 SERDES)
+	u32 m_serdes_track = 0xffffffff;  // (cyl<<1|side) the stream was built for; rebuild when the head moves
+	bool m_serdes_active = false;     // E000 is MULTIPLEXED: only stream disk bytes while the ENDEC is armed
+	                                  // for a read (else E000 returns channel status/echo). Set on the read
+	                                  // arm, cleared on any other E000 write. (Ungated streaming corrupts
+	                                  // the fw's scattered non-data E000 reads - verified false positive.)
+	void build_serdes_stream(int cyl, int side);
+	u8   m_unit_heads[4];    // per-unit geometry from the host's INIT/UIB: UIB[0] = heads
+	u8   m_unit_spt[4];      // UIB[1] = sectors/track
+	u16  m_unit_secsize[4];  // UIB[2-3] (LE) = bytes/sector (the host re-INITs to switch FM 128 <-> MFM 256)
+	u8   m_unit_sec0[4];     // UIB[4] = STARTING SECTOR ID (logical sector 0's physical ID: FM=7 -> VOL1 first, MFM=13)
+	u32  m_unit_trk[4];      // per-unit PHYSICAL track index (cyl*heads+head; RESTORE -> 0; advances as reads cross tracks)
+	u32  m_unit_sidx[4];     // per-unit sector index within the current track (in current-config sectors)
+	u32  m_unit_btrk[4];     // position at the last INIT = the base for ADDRESSED reads (IOPB opts bit0=1: the
+	u32  m_unit_bsidx[4];    // addr field is in current-size sectors relative to this; the ANSI flow re-INITs at the file start)
+	// ---- Phase B: the ENDEC/gate-array ID capture (firmware-driven read path) ----
+	// Dev toggle (STRIP with the diagnostics): STORAGER_FWDRIVEN=1 disables the delivery/status
+	// shims so the firmware must drive the disk channel itself (the Phase-B iteration loop).
+	bool m_fw_driven = false;
+	emu_timer *m_idcap = nullptr;      // rotational delay to the next ID field
+	u32  m_idcap_dst = 0;              // latched local DMA destination (D800<<1) at capture start
+	// the sector currently passing under the head, from true angular position (300 RPM)
+	unsigned angular_sector(unsigned nsecs) const
+	{
+		u64 const rev_ticks = attotime::from_msec(200).as_ticks(1'000'000);
+		u64 const now = machine().time().as_ticks(1'000'000) % rev_ticks;
+		return unsigned(now * nsecs / rev_ticks) % nsecs;
+	}
+	// per-(cyl,side) sector cache decoded from the MOUNTED image's bitstream (behind the disk-
+	// channel model only - never visible to the host path)
+	struct dc_sector { u8 c, h, r, n; std::vector<u8> data; };
+	struct dc_track { bool fm = false; std::vector<dc_sector> secs; };
+	std::map<u32, dc_track> m_dc_ids;
+	dc_track const &decode_track_ids(floppy_image_device *fdd, int cyl, int side);
+	emu_timer *m_dataop = nullptr;     // the armed read-channel operation (rotational delay)
+	emu_timer *m_pump = nullptr;       // VGC7219 gate-array pump: raises IRQ6 to run the queued read
+	TIMER_CALLBACK_MEMBER(pump_tick) { m_cpu->set_input_line(M68K_IRQ_6, HOLD_LINE); }  // sequence (0x9884 parser)
+	// Deferred gate-array CHANNEL completion (Dave #2): the completion belongs to the queued channel
+	// descriptor node the fw armed, NOT the transient m_iopb_cmd host shadow. Latched at the DISKOP kick,
+	// asserted asynchronously a few us later - but only if the armed descriptor still looks like a
+	// pending channel op at fire time ($743a == latched node, node+0x12/$749c still 1, node+0x1a -> 0x7208).
+	emu_timer *m_hd_chan = nullptr;
+	bool m_hd_chan_pending = false;   // a latched HD verify node is awaiting its channel completion
+	bool m_hd_chan_irq4 = false;      // the level-held IRQ4 source is currently asserted
+	u16  m_hd_chan_node = 0;
+	unsigned m_hd_chan_tries = 0;
+	TIMER_CALLBACK_MEMBER(hd_chan_tick)
+	{
+		if (!m_hd_chan_pending || m_hd_chan_irq4) return;
+		address_space &xs = m_cpu->space(AS_PROGRAM);
+		u16 const node = m_hd_chan_node;
+		bool const pending = node != 0 && xs.read_word((node + 0x12) & 0xffff) == 1;
+		bool const valid = pending && xs.read_word(0x743a) == node
+			&& xs.read_word((node + 0x1a) & 0xffff) == 0x7208;
+		if (valid)
+		{
+			// gate-array channel completion: assert IRQ4 as a HELD LEVEL. It stays asserted (taken the
+			// instant the fw's interrupt level drops) until the ISR acks the source by clearing E800
+			// bit12 (0x3c02: andi #efff,$79f6 ; write $79f6->E800), handled in ch_w.
+			m_hd_chan_irq4 = true;
+			m_ch_op_ok = true;
+			u16 const sr = u16(m_cpu->state_int(M68K_SR));
+			logerror("HDCHAN assert node=%04x IRQ4 level SR=%04x iplmask=%u pc=%06x @%.4f\n", node, sr, (sr >> 8) & 7, m_cpu->pc(), machine().time().as_double());
+			m_cpu->set_input_line(M68K_IRQ_4, ASSERT_LINE);
+		}
+		else if (pending && ++m_hd_chan_tries < 200)
+			m_hd_chan->adjust(attotime::from_usec(20));   // re-poll until the descriptor is armed
+		else
+			m_hd_chan_pending = false;   // node resolved elsewhere or gave up
+	}
+	bool m_bare_irq4 = false;          // TEMP probe (STRIP): dataop fires IRQ4 only, no data/E01E
+	u16 m_e802_prev = 0;               // for the transfer-arm (bit15) edge
+	bool m_ch_op_ok = false;           // fw-driven: the last channel op succeeded (E01E bit4 level)
+	bool m_read_pending = false;       // fw-driven READ: hold BUSY (suppress the 0x7fe8 DONE tap) until the kickoff delivers the data (STEP 324: deliver-THEN-done)
+	unsigned m_dc_seq = 0;             // rotation: successive captures see successive marks
+	TIMER_CALLBACK_MEMBER(idcap_tick);
+	TIMER_CALLBACK_MEMBER(dataop_tick);
+
+	u8   m_ioreg[8];         // Multibus I/O 0x0800-0x0807 register file: the OS driver's command channel
+	bool m_ioreg_done;       // controller DONE: reads of the cmd byte return bit7 set
+	emu_timer *m_ioreg_int = nullptr;  // deferred completion interrupt (a real controller takes ms; an
+	                                   // instant int races the driver setting its "command outstanding"
+	                                   // state -> handler early-out -> unquenched level int -> stack overflow)
+	// TEMP (STRIP): read-delivery overlap detector - catch a read depositing disk data into a host
+	// range a DIFFERENT device recently read (buffer-cache clobber = the false-full hypothesis)
+	struct rd_deliv { u32 req = 0, len = 0, pos = 0; u8 unit = 0xff; };
+	rd_deliv m_rd_ring[24];
+	unsigned m_rd_ridx = 0;
+	void rd_check(u8 unit, u32 pos, u32 req, u32 len)
+	{
+		for (auto const &e : m_rd_ring)
+			if (e.len && e.unit != unit && req < e.req + e.len && e.req < req + len)
+			{
+				static int n = 0;
+				if (n++ < 40)
+					logerror("RDOVERLAP: unit%u pos=%u req=%06x len=%u OVERLAPS prior unit%u pos=%u req=%06x len=%u @%.4f\n",
+							unit, pos, req, len, e.unit, e.pos, e.req, e.len, machine().time().as_double());
+				break;
+			}
+		m_rd_ring[m_rd_ridx++ % 24] = { req, len, pos, unit };
+	}
+
+	int m_ioreg_pending = 0;           // outstanding interrupt-driven completions - the shared timer +
+	                                   // single level line lost stacked completions => guest livelock
+	                                   // (the "beachball"); the counter holds INT2 asserted until every
+	                                   // completion is acknowledged by a status read
+	u32 m_temp_cid = 0;   // TEMPORAL PROBE (STRIP): per-command instance id (Dave STEP 367b-d)
+	TIMER_CALLBACK_MEMBER(ioreg_int) { if (m_ioreg_pending > 0) { logerror("TEMPO INT2 cid=%u t=%.6f\n", m_temp_cid, machine().time().as_double()); int_w<2>(0); } }   // Multibus INT ACTIVE-LOW; ICU IR3 level
+
+	// fallback (decoded-sector feed): IMD parsed into (cyl<<16 | head<<8 | sector) -> bytes.
+	std::map<u32, std::vector<u8>> m_sectors;
+	bool m_floppy_loaded;
+};
+
+void multibus_storager_device::device_start()
+{
+	std::fill(std::begin(m_ch), std::end(m_ch), 0);
+	save_item(NAME(m_ch));
+	save_item(NAME(m_trace));
+	m_ioreg_int = timer_alloc(FUNC(multibus_storager_device::ioreg_int), this);
+	m_idcap = timer_alloc(FUNC(multibus_storager_device::idcap_tick), this);
+	m_dataop = timer_alloc(FUNC(multibus_storager_device::dataop_tick), this);
+	m_pump = timer_alloc(FUNC(multibus_storager_device::pump_tick), this);
+	m_hd_chan = timer_alloc(FUNC(multibus_storager_device::hd_chan_tick), this);
+	// firmware-driven mode is the faithful (and now only) mode: the 68000 firmware serves the
+	// ROM's command channel itself (HD identify 0x87 + HD reads 0x95), which the hard-disk boot
+	// requires; the older delivery/status shims remain compiled but disabled
+	m_fw_driven = true;
+	// Live floppy swap for the multi-disk install: when the user mounts/unmounts an image via the UI
+	// (Tab -> File Manager), invalidate the cached sector map so the next disk access reloads it.
+	for (auto &conn : m_floppy)
+		if (floppy_image_device *const fdd = conn->get_device())
+		{
+			fdd->setup_load_cb(floppy_image_device::load_cb(&multibus_storager_device::floppy_swap_cb, this));
+			fdd->setup_unload_cb(floppy_image_device::unload_cb(&multibus_storager_device::floppy_swap_cb, this));
+		}
+	if (getenv("STORAGER_TRACE")) m_trace = true;   // TEMP (STRIP): channel trace without fw-driven mode
+	// TEMP (STRIP): who rewrites the super-buffer page's PTE2 @0x57360 (DMA side)
+	m_bus->space(AS_PROGRAM).install_write_tap(0x57360, 0x57363, "ptewatch_bus",
+		[this](offs_t offset, u16 &data, u16 mem_mask)
+		{
+			static int n = 0;
+			if (n++ < 30) logerror("PTEWR-BUS @%06x = %04x/%04x [%s] @%.4f\n", offset, data, mem_mask, machine().describe_context(), machine().time().as_double());
+		});
+	// TEMP (STRIP): who clobbers the root super's magic word @0x3B15C (DMA side)
+	m_bus->space(AS_PROGRAM).install_write_tap(0x3b158, 0x3b163, "magicwatch",
+		[this](offs_t offset, u16 &data, u16 mem_mask)
+		{
+			static int n = 0;
+			if (n++ < 20) logerror("MAGICWR-BUS @%06x = %04x/%04x [%s] @%.4f\n", offset, data, mem_mask, machine().describe_context(), machine().time().as_double());
+		});
+	// TEMP (STRIP): capture the fw's 0x87 status reply (the ROM's HD-boot decision input)
+	m_bus->space(AS_PROGRAM).install_write_tap(0xfe948, 0xfe95f, "reply87",
+		[this](offs_t offset, u16 &data, u16 mem_mask)
+		{
+			static int n = 0;
+			if (n++ < 24) logerror("REPLY87 [%02x] = %04x/%04x @%.4f\n", unsigned(offset - 0xfe948), data, mem_mask, machine().time().as_double());
+		});
+	// TEMP (STRIP): the ID parser @0x9884 reads its buffer pointer from $7a66 - does it point at my
+	// 0x4000 fill? + what are the targets ($7438 cyl / $7436 head) vs my buffer's bytes?
+	// VGC7219 gate-array PUMP: the firmware arms the pump by writing its soft-vector $7304 with the
+	// per-command handler (0x9884 the read parser); the gate array then raises IRQ6 to run it. Model
+	// that - on a NON-ZERO $7304 write, arm the pump timer to fire IRQ6 shortly after (the real gate
+	// array paces it once there is queued work). ($7304 has no init value, so gate strictly on the
+	// arm write - never fire IRQ6 through a stale/zero vector.)
+	// TEMP (STRIP): does the boot read reach the command-block builder? tap $72d6 (the watch-record
+	// setup ptr written @0x37ae) - if it fires, the builder/read-setup ran; log the UIB gate byte too.
+	if (m_fw_driven)
+		m_cpu->space(AS_PROGRAM).install_write_tap(0x72d6, 0x72d7, "cmdblk",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{
+				static int n = 0;
+				if (n++ < 8)
+				{
+					address_space &cs = m_cpu->space(AS_PROGRAM);
+					u16 const uib = cs.read_word(0x799a);
+					logerror("CMDBLK watch-rec $72d6=%04x (builder ran) UIB=%04x UIB+12=%02x pc=%06x @%.4f\n",
+							data, uib, cs.read_byte((uib + 0x12) & 0xffff), m_cpu->pc(), machine().time().as_double());
+				}
+			});
+	// TEMP (STRIP): does the verify chain READ $7dac (0x9618) during the failing op? + the value it sees
+	if (m_fw_driven)
+		m_cpu->space(AS_PROGRAM).install_read_tap(0x7dac, 0x7db3, "idrd",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{ static int _n = 0; double t = machine().time().as_double(); if (t > 5.7 && _n++ < 30) logerror("IDrd @%04x=%04x pc=%06x @%.4f\n", offset, data, m_cpu->pc(), t); });
+	// TEMP (STRIP): $7a18 cleared at 0x3c0e = the IRQ4 queue-walker ISR (0x3bfe) actually ran; capture the
+	// descriptor state Dave asked for at entry ($743a active node, $7a14/$7a6c/$7928/$7a76, node+0x20, $749c)
+	if (m_fw_driven)
+		m_cpu->space(AS_PROGRAM).install_write_tap(0x7a18, 0x7a19, "isrran",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{ static int _n = 0; double t = machine().time().as_double(); if (t > 5.7 && _n++ < 40) { address_space &xs = m_cpu->space(AS_PROGRAM);
+				logerror("ISR3bfe ran 743a=%04x 749c=%04x 7a14=%04x 7a6c=%04x 7928=%04x 7a76=%04x node+20=%04x pc=%06x @%.4f\n",
+					xs.read_word(0x743a), xs.read_word(0x749c), xs.read_word(0x7a14), xs.read_word(0x7a6c),
+					xs.read_word(0x7928), xs.read_word(0x7a76), xs.read_word(0x74aa), m_cpu->pc(), t); } });
+	// TEMP (STRIP): outcome probe - $749c writes (0x3c76 clear = op completed via queue-walker)
+	if (m_fw_driven)
+		m_cpu->space(AS_PROGRAM).install_write_tap(0x749c, 0x749d, "o749c",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{ double t = machine().time().as_double(); static int _n = 0; if (t > 6.5 && _n++ < 60) logerror("O749c=%04x pc=%06x @%.4f\n", data, m_cpu->pc(), t); });
+	// TEMP LOG (STRIP): $7A74 = the controller-status word (per-unit fault flags from the drive scanner)
+	if (m_fw_driven)
+		m_cpu->space(AS_PROGRAM).install_write_tap(0x7a74, 0x7a75, "fwfault",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{
+				static u16 prev = 0xffff;
+				static int n = 0;
+				if (data != prev && n++ < 25)
+				{
+					logerror("FW7A74 = %04x (pc=%06x) @%.4f\n", data, m_cpu->pc(), machine().time().as_double());
+					prev = data;
+				}
+			});
+	// TEMP LOG (STRIP): $7950 = the pump's phase toggle - fires iff the pump handler actually runs
+	if (m_fw_driven)
+		m_cpu->space(AS_PROGRAM).install_write_tap(0x7950, 0x7951, "fwpumprun",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{
+				static int n = 0;
+				if (n++ < 20) logerror("FWPUMPRUN $7950 = %04x (pc=%06x) @%.4f\n", data, m_cpu->pc(), machine().time().as_double());
+			});
+	// TEMP LOG (STRIP): the pump-handler pointer $7940 - who installs the DMA-phase pump, and which
+	if (m_fw_driven)
+		m_cpu->space(AS_PROGRAM).install_write_tap(0x7940, 0x7941, "fwpump",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{
+				static int n = 0;
+				if (n++ < 30)
+				{
+					logerror("FWPUMP $7940 = %04x (pc=%06x) @%.4f\n", data, m_cpu->pc(), machine().time().as_double());
+					if (data == 0x298c || data == 0x29c0)
+					{
+						address_space &cs = m_cpu->space(AS_PROGRAM);
+						for (u16 a = 0x72d6; a < 0x72ec; a += 2)
+						{
+							u16 const rec = cs.read_word(a);
+							if (!rec) continue;
+							logerror("FWPUMP rec@%04x -> %04x: flag=%04x watch=%04x(*=%04x) cmp=%04x hdlr=%04x\n",
+									a, rec, cs.read_word(rec), cs.read_word(rec + 2),
+									cs.read_word(cs.read_word(rec + 2)), cs.read_word(rec + 4), cs.read_word(rec + 6));
+						}
+					}
+				}
+			});
+	// TEMP LOG (STRIP): fw error/completion codes - the result word lands at local IOPB+0x18 ($7208)
+	if (m_fw_driven)
+		m_cpu->space(AS_PROGRAM).install_write_tap(0x7208, 0x7209, "fwresult",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{
+				static int n = 0;
+				if (machine().time().as_double() > 6.5 && n++ < 40) logerror("O7208 = %04x pc=%06x @%.4f  (0x98e7=success  0x18@0x2b8a=timeout)\n", data, m_cpu->pc(), machine().time().as_double());
+			});
+}
+
+// fallback: parse the SINIX0 floppy IMD into a (cyl,head,sector) -> bytes map (unused in the LLE path).
+void multibus_storager_device::load_floppy()
+{
+	m_floppy_loaded = true;
+	m_sectors.clear();
+	// Read the floppy sector image from the mounted MAME image device (floppy0).  That device is
+	// swappable live from the UI (Tab -> File Manager -> mount a new .imd), which is how the multi-disk
+	// SINIX installation changes disks: floppy_swap_cb() drops this cache on swap and the next disk
+	// access reloads from the newly-inserted image.  No media mounted = drive empty (the
+	// hard-disk boot case: the ROM reports "no sys-floppy" and boots the rigid disk).
+	floppy_image_device *const fdd0 = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
+	if (!fdd0 || !fdd0->exists())
+	{
+		LOG("STORAGER: no floppy media\n");
+		return;
+	}
+	std::string const fpath = fdd0->filename();
+	std::ifstream f(fpath, std::ios::binary);
+	if (!f) { LOG("STORAGER: cannot open floppy image\n"); return; }
+	std::vector<u8> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+	size_t p = 0;
+	while (p < d.size() && d[p] != 0x1a) p++;
+	p++;
+	while (p + 5 <= d.size())
+	{
+		u8 const cyl = d[p+1], head = d[p+2], nsec = d[p+3], ssz = d[p+4];
+		p += 5;
+		if (ssz > 6) break;
+		u32 const size = 128u << ssz;
+		std::vector<u8> smap(d.begin()+p, d.begin()+p+nsec); p += nsec;
+		if (head & 0x80) p += nsec; // cylinder map
+		if (head & 0x40) p += nsec; // head map
+		u8 const h = head & 0x3f;
+		for (int i = 0; i < nsec && p < d.size(); i++)
+		{
+			u8 const t = d[p++];
+			std::vector<u8> sec(size, 0);
+			if (t==1 || t==3 || t==5 || t==7) { for (u32 j=0;j<size && p<d.size();j++) sec[j]=d[p++]; }
+			else if (t==2 || t==4 || t==6 || t==8) { u8 const fill=d[p++]; std::fill(sec.begin(),sec.end(),fill); }
+			m_sectors[(u32(cyl)<<16) | (u32(h)<<8) | smap[i]] = std::move(sec);
+		}
+	}
+	LOG("STORAGER: floppy loaded, %u sectors\n", (unsigned)m_sectors.size());
+	if (getenv("STORAGER_UNITLOG"))   // TEMP (STRIP): confirm WHICH image + its VOL1 label (cyl0 h0 sec7)
+	{
+		auto const it = m_sectors.find((0u << 16) | (0u << 8) | 7u);
+		char lbl[24] = {0};
+		if (it != m_sectors.end())
+			for (int k = 0; k < 20 && k < int(it->second.size()); k++)
+				lbl[k] = (it->second[k] >= 0x20 && it->second[k] < 0x7f) ? char(it->second[k]) : '.';
+		logerror("FLOPLOAD file=%s sectors=%u VOL1(c0h0s7)=[%s] @%.4f\n", fpath.c_str(), unsigned(m_sectors.size()), lbl, machine().time().as_double());
+	}
+	// spin the drive so INDEX pulses - done HERE (first access, after all device_reset) so mon_w(0) sticks
+	// (the floppy's own device_reset runs after the storager's and would re-raise m_mon).
+	for (int i = 0; i < 2; i++)
+		if (floppy_image_device *const fdd = m_floppy[i]->get_device())
+			fdd->mon_w(0);
+}
+
+void multibus_storager_device::floppy_swap_cb(floppy_image_device *)
+{
+	// The UI mounted or unmounted a disk image - drop the cached sector map so the next disk access
+	// reloads it from the newly-inserted image (the SINIX install's disk-change step).
+	m_floppy_loaded = false;
+	m_sectors.clear();
+	LOG("STORAGER: floppy media changed - sector map invalidated, will reload\n");
+}
+
+void multibus_storager_device::device_reset()
+{
+	if (!m_installed)
+	{
+		// Multibus PIO window 0x7200-0x73FF -> on-board dual-port RAM 0x7E00-0x7FFF (+0xC00).
+		m_bus->space(AS_IO).install_readwrite_handler(0x7200, 0x73ff,
+			read16sm_delegate(*this, FUNC(multibus_storager_device::host_win_r)),
+			write16s_delegate(*this, FUNC(multibus_storager_device::host_win_w)));
+		// data aperture the host reads kernel blocks through (@0xF00000 = bus I/O 0x0000).
+		m_bus->space(AS_IO).install_read_handler(0x0000, 0x00ff,
+			read16sm_delegate(*this, FUNC(multibus_storager_device::bus_data_r)));
+		// STEP 138 (Dave: NSC-driver handshake): the loaded OS driver's command channel is a register
+		// file at Multibus I/O 0x0800-0x0807: {cmd byte (written LAST; bit7 = controller DONE flag the
+		// driver polls), bytes 4-7 = host IOPB pointer (LE)}. Previously unmapped - its writes vanished
+		// and the poll read garbage forever (the post-"Boot:" stall).
+		m_bus->space(AS_IO).install_readwrite_handler(0x0800, 0x0807,
+			read16sm_delegate(*this, FUNC(multibus_storager_device::ioreg_r)),
+			write16s_delegate(*this, FUNC(multibus_storager_device::ioreg_w)));
+		// snoop the local-bus buffer (0x4000-0x7FFF): the gate array's address comparator watches
+		// writes to advance the transfer pointer, and latches the terminal LSB from the helper's
+		// read performed while DMA is active.
+		address_space &cs = m_cpu->space(AS_PROGRAM);
+		cs.install_read_tap(0x4000, 0x7fff, "dma_snoop_r",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{ if (m_dma_active) m_term_bit0 = (mem_mask == 0x00ff) ? 1 : 0; });
+		cs.install_write_tap(0x4000, 0x7fff, "dma_snoop_w",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{ if (m_dma_active) m_last_bw = offset + ((mem_mask == 0x00ff) ? 1 : 0); });
+		// TEMP: trace what the firmware writes back into the dual-port mailbox (the host result/status).
+		cs.install_write_tap(0x7e00, 0x7fff, "mbox_w",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
+			{
+				if (m_trace) LOG("  MBOX fw wr %04x = %04x (mask %04x) [%06x]\n", offset, data, mem_mask, m_cpu->pc());
+				// TEMP: on command-done (firmware clears the command word 0x7ff8), pulse a Multibus
+				// INT to the CPUAP's ICU to test the completion-interrupt hypothesis.
+				// command done (firmware posts to mailbox 0x7fe8 @pc 0x2604) -> post DONE (0x80) to the
+				// host IOPB status in CPUAP RAM, which the monitor polls (IOPB+2: 0x81 busy -> 0x80 done).
+				if (offset == 0x7fe8 && m_iopb_addr && !m_read_pending)   // STEP 324: don't flip DONE while a fw-driven READ is still pending its data delivery
+				{
+					address_space &bs = m_bus->space(AS_PROGRAM);
+					bs.write_byte((m_iopb_addr + 2) & 0xffffff, 0x80);
+					bs.write_byte((m_iopb_addr + 3) & 0xffffff, 0x80);
+					LOG("CMDDONE 7fe8=%04x -> iopb %06x +2/+3 <- 0x80 (done) pc=%06x @%.4f\n", data, m_iopb_addr, m_cpu->pc(), machine().time().as_double());
+				}
+				else if (offset == 0x7fe8)
+					LOG("CMDDONE 7fe8=%04x but m_iopb_addr=0 (NO host status posted!) pc=%06x @%.4f\n", data, m_cpu->pc(), machine().time().as_double());
+			});
+		m_installed = true;
+	}
+	m_cpu->set_input_line(M68K_IRQ_2, CLEAR_LINE);
+	m_dma_active = false;
+	m_shadow_loaded = false;
+	m_iopb_fetched = false;
+	m_host_int_prev = false;
+	m_e800_bit12_prev = false;
+	// completion machinery: a soft reset must not carry outstanding completions or a held
+	// INT2 into the next boot (stale state wedged the kernel's first disk wait after a
+	// mid-session MAME reset)
+	m_ioreg_done = false;
+	if (m_ioreg_pending > 0)
+		int_w<2>(1);
+	m_ioreg_pending = 0;
+	m_ioreg_int->adjust(attotime::never);
+	// Spin the drive so INDEX pulses (5.25"): path (A) - the firmware runs its full "real floppy" logic
+	// and polls F000 for INDEX/READY/TRACK0, so the media must present as a real spinning floppy.
+	for (int i = 0; i < 2; i++)
+		if (floppy_image_device *const fdd = m_floppy[i]->get_device())
+			fdd->mon_w(0);
+}
+
+// C800 scatter/gather translation register file.  A write while DMA is active latches the transfer
+// terminal: index = byte offset (offset*2) = address bits 7-11, value = address bits 1-6.
+u16 multibus_storager_device::c800_r(offs_t offset)
+{
+	return m_c800[offset & 0x7f];
+}
+
+void multibus_storager_device::c800_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	COMBINE_DATA(&m_c800[offset & 0x7f]);
+	if (m_trace) LOG("  C800[%02x] = %04x dma=%d [%06x]\n", offset & 0x7f, data, m_dma_active, m_cpu->pc());
+	if (m_dma_active)
+		m_dma_term = (u16((offset & 0x7f) * 2) << 6) | ((data & 0x3f) << 1);   // address bits 1-11
+}
+
+// D000 = write-only DMA address latch (word address; reads of 0xD000 fall through to ROM).
+void multibus_storager_device::d000_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	COMBINE_DATA(&m_d000);
+	if (m_trace) LOG("  D000 wr = %04x (byte addr %06x) [%s]\n", m_d000, u32(m_d000) << 1, machine().describe_context());
+}
+
+// D800 = write-only DMA HOST high-address latch (paired with C800 low).  The firmware programs $d800:$c800
+// as the Multibus (host) transfer address (Dave's RE: $7434->$d800, $741e->$c800); was unmapped -> lost.
+void multibus_storager_device::d800_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	COMBINE_DATA(&m_d800);
+	if (m_trace) LOG("  D800 wr = %04x  (host addr d800:c800 = %04x%04x) [%s]\n", m_d800, m_d800, m_c800[0], machine().describe_context());
+}
+
+// Multibus I/O 0x0000 data aperture: the host reads loaded kernel blocks here (@0xF00000 = bus I/O 0x0000).
+// STEP 1 (Dave): LOG the access pattern (offset/count) before serving data; returns 0 for now.
+u16 multibus_storager_device::bus_data_r(offs_t offset)
+{
+	LOG("F00000-aperture rd off=%04x [%s]\n", offset, machine().describe_context());
+	return 0;
+}
+
+// Multibus memory window: the storager (a bus master) dereferences CPUAP RAM pointers (IOPB at
+// 0x0fe780, data buffers) directly as 68000 addresses.  68000 is big-endian: high byte at the lower
+// Multibus byte address.  Local ROM/RAM/registers (<0x10000) and the ROM mirror (0xff0000+) win.
+u16 multibus_storager_device::bus_mem_r(offs_t offset, u16 mem_mask)
+{
+	u32 const addr = 0x010000 + offset * 2;
+	address_space &bs = m_bus->space(AS_PROGRAM);
+	u16 v = 0;
+	if (ACCESSING_BITS_8_15) v |= u16(bs.read_byte(addr)) << 8;
+	if (ACCESSING_BITS_0_7)  v |= bs.read_byte(addr + 1);
+	if (m_trace) LOG("  BUSMEM rd %06x -> %04x (mask %04x) [%06x]\n", addr, v, mem_mask, m_cpu->pc());
+	return v;
+}
+
+void multibus_storager_device::bus_mem_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	u32 const addr = 0x010000 + offset * 2;
+	address_space &bs = m_bus->space(AS_PROGRAM);
+	if (ACCESSING_BITS_8_15) bs.write_byte(addr,     data >> 8);
+	if (ACCESSING_BITS_0_7)  bs.write_byte(addr + 1, data & 0xff);
+	if (m_trace) LOG("  BUSMEM wr %06x = %04x (mask %04x) [%06x]\n", addr, data, mem_mask, m_cpu->pc());
+}
+
+// CPUAP reads/writes the dual-port mailbox; map byte-for-byte into the 68000's RAM at +0xC00.
+u16 multibus_storager_device::host_win_r(offs_t offset)
+{
+	u32 const fa = 0x7e00 + offset * 2;
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	u16 const v = cs.read_byte(fa) | (u16(cs.read_byte(fa + 1)) << 8);
+	if (m_trace) LOG("  HOSTWIN rd pio=%04x fw=%04x -> %04x\n", 0x7200 + offset * 2, fa, v);
+	// STEP 138 (Dave: decode the NSC-driver handshake): log window READS after the boot line, deduped
+	// on (addr,value) change so a poll loop logs once per state change.  STRIP.
+	{
+		double const t = machine().time().as_double();
+		if (t > 3.8 && !machine().side_effects_disabled())
+		{
+			static u32 lastfa = ~0u; static u16 lastv = 0; static int n = 0;
+			if ((fa != lastfa || v != lastv) && n < 150)
+			{
+				n++;
+				LOG("HOSTRD fw=%04x -> %04x @%.4f\n", fa, v, t);
+				lastfa = fa; lastv = v;
+			}
+		}
+	}
+	return v;
+}
+
+void multibus_storager_device::host_win_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	u32 const pio = 0x7200 + offset * 2;
+	u32 const fa  = 0x7e00 + offset * 2;
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	if (ACCESSING_BITS_0_7)  cs.write_byte(fa,     data & 0xff);
+	if (ACCESSING_BITS_8_15) cs.write_byte(fa + 1, data >> 8);
+
+	// doorbell: the CPUAP writes GO (0x13) to the command register (PIO 0x73F8) last -> raise IRQ2.
+	if (pio == 0x73f8 && ACCESSING_BITS_0_7 && (data & 0xff) == 0x13)
+	{
+		// The gate array auto-fetches the IOPB (14 words = 0x1c bytes) from the mailbox pointer into the
+		// firmware's IOPB buffer ($7a06) on EVERY doorbell - the firmware reads it without a kickoff
+		// (e.g. RESTORE).  Copy ONLY 0x1c bytes so the work area at +0x1c is preserved.
+		{
+			u32 const dbi = (u32(cs.read_byte(0x7ff9)) << 16) | (u32(cs.read_byte(0x7ffa)) << 8) | cs.read_byte(0x7ffb);
+			u32 dst = cs.read_word(0x7a06);
+			if (dst < 0x4000 || dst >= 0x7e00) dst = 0x71f0;
+			address_space &bs = m_bus->space(AS_PROGRAM);
+			for (u32 k = 0; k < 0x1c; k++)
+				cs.write_byte((dst + k) & 0xffff, bs.read_byte((dbi + k) & 0xffffff));
+			m_iopb_cmd = cs.read_byte(dst);
+			m_iopb_buffer = ((u32(cs.read_byte(dst + 0xc)) << 24) | (u32(cs.read_byte(dst + 0xd)) << 16)
+				| (u32(cs.read_byte(dst + 0xe)) << 8) | cs.read_byte(dst + 0xf)) & 0xffffff;
+			m_iopb_addr = dbi;
+			if (m_iopb_cmd == 0x80 || (dbi & 0xff0000) == 0)
+			{
+				std::string ib; for (u32 k = 0; k < 0x1c; k++) ib += util::string_format(" %02x", cs.read_byte((dst + k) & 0xffff));
+				std::string mb; for (u32 k = 0x7ff8; k <= 0x7fff; k++) mb += util::string_format(" %02x", cs.read_byte(k));
+				LOG("CMD-%02x IOPB@%06x:%s  mailbox7ff8:%s buf=%06x\n", m_iopb_cmd, dbi, ib.c_str(), mb.c_str(), m_iopb_buffer);
+			}
+			if (m_iopb_cmd == 0x95 || m_iopb_cmd == 0x98)
+			{
+				// DIAG (Dave): decode the READ-SEQ / SEEK(0x98) fields.  Dump raw + BE-word/long candidates so
+				// we can find the block-address / target-cylinder field.
+				std::string ib, w, l;
+				for (u32 k = 0; k < 0x1c; k++) ib += util::string_format(" %02x", cs.read_byte((dst + k) & 0xffff));
+				for (u32 k = 0; k < 0x1c; k += 2) w += util::string_format(" [%x]%04x", k, (u32(cs.read_byte((dst+k)&0xffff))<<8)|cs.read_byte((dst+k+1)&0xffff));
+				for (u32 k = 0; k <= 0x18; k += 4) l += util::string_format(" [%x]%08x", k, (u32(cs.read_byte((dst+k)&0xffff))<<24)|(u32(cs.read_byte((dst+k+1)&0xffff))<<16)|(u32(cs.read_byte((dst+k+2)&0xffff))<<8)|cs.read_byte((dst+k+3)&0xffff));
+				LOG("CMD%02x IOPB:%s\n      BEw:%s\n      BEl:%s buf=%06x\n", m_iopb_cmd, ib.c_str(), w.c_str(), l.c_str(), m_iopb_buffer);
+			}
+			m_iopb_fetched = true;            // already fetched; the kickoff does the data/UIB transfer
+			if (m_iopb_cmd == 0x89) { m_rdptr = 0; u32 const ru = cs.read_byte((dst + 4) & 0xffff) & 3; m_unit_trk[ru] = 0; m_unit_sidx[ru] = 0; m_seek_deadline = machine().time() + attotime::from_msec(75); }   // RESTORE: unit position to track0/sec0 + head-load busy 75ms (datasheet)
+			else if (m_iopb_cmd == 0x98) { m_rdptr = (u32(cs.read_byte((dst + 6) & 0xffff)) << 8) | cs.read_byte((dst + 7) & 0xffff); m_seek_deadline = machine().time() + attotime::from_msec(75); }   // SEEK: latch target[6-7] + ARM seek-active (F000 bit1) so the seek loop entry sees busy (75ms head-load, datasheet)
+			else if (m_iopb_cmd == 0x95 && !m_fw_driven) read95_deliver(dst);   // STEP 133 shim: deliver at the doorbell (fw-driven mode: the fw reads through the real channel)
+			if (m_iopb_cmd == 0xa1)
+			{
+				// warm-reboot re-init: the firmware's handler ($4A66) restores its power-on
+				// channel configuration, and the ROM then SKIPS the INIT before its label read
+				// (observed: the reboot flow has no cmd-0x80 INIT). Mirror it in the model's
+				// per-unit UIB latches or the label read decodes track 0 with the kernel-era
+				// geometry (256B MFM instead of 128B FM) and returns zeros -> "no sys-floppy".
+				// The 68000 itself is NOT reset (the fw runs its own handler).
+				for (unsigned u = 0; u < 4; u++)
+				{
+					m_unit_heads[u] = 2;
+					m_unit_spt[u] = 16;
+					m_unit_secsize[u] = 128;
+					m_unit_sec0[u] = (u == 1) ? 6 : 7;
+					m_unit_btrk[u] = 0;
+					m_unit_bsidx[u] = 0;
+					m_unit_trk[u] = 0;
+					m_unit_sidx[u] = 0;
+				}
+				LOG("CMD A1 REINIT: unit UIB latches -> power-on defaults @%.4f\n", machine().time().as_double());
+			}
+			// (the firmware also runs its own 0xA1 handler - a model-side 68000 reset here
+			// makes the ROM race the firmware's power-on self-test and hang)
+			// cmd 0x87 (HD identify): deliberately UNANSWERED - the ROM tolerates the probe
+			// timeout at power-on and falls back to the floppy; a completed reply (any status)
+			// diverts it into the HD-boot path, which needs the fw-driven HD read (Phase C)
+			bs.write_byte((dbi + 2) & 0xffffff, 0x81);   // BUSY (per-IOPB)
+			bs.write_byte((dbi + 3) & 0xffffff, 0x81);
+			bs.write_byte(0x0fe782, 0x81);   // TEST (Dave): also the FIXED host status slot (EXT(6)+0x22)
+			bs.write_byte(0x0fe783, 0x81);
+			m_read_pending = (m_fw_driven && (m_iopb_cmd == 0x95 || m_iopb_cmd == 0x94));   // STEP 324/326: fw-driven READ (0x95) + extrapolated WRITE (0x94) hold BUSY until the kickoff op completes
+			LOG("DOORBELL fetch: IOPB %06x -> %04x cmd=%02x buffer=%06x\n", dbi, dst, m_iopb_cmd, m_iopb_buffer);
+			// TEMP (STRIP): the UIB status shadow around the 0x87 interrogation
+			{
+				static int un = 0;
+				if (un++ < 12)
+				{
+					u16 const uib = cs.read_word(0x799a);
+					std::string ub;
+					for (u32 k = 0x10; k < 0x18; k++) ub += util::string_format(" %02x", cs.read_byte((uib + k) & 0xffff));
+					logerror("UIB@%04x [+10..+17]:%s  7a74=%04x 7a36=%04x @%.4f\n", uib, ub.c_str(), cs.read_word(0x7a74), cs.read_word(0x7a36), machine().time().as_double());
+				}
+			}
+		}
+		// command word @0x7ff8 = cmd byte + 24-bit big-endian IOPB pointer into CPUAP RAM.
+		u32 const iopb = (u32(cs.read_byte(0x7ff9)) << 16) | (u32(cs.read_byte(0x7ffa)) << 8) | cs.read_byte(0x7ffb);
+		LOG("CMD %02x IOPB-ptr=%06x\n", cs.read_byte(0x7ff8), iopb);
+		m_cpu->set_input_line(M68K_IRQ_2, ASSERT_LINE);
+	}
+	else if (pio >= 0x73e0 && pio <= 0x73f1)   // ch0 CCB + ch0 GO byte ONLY - 0x73f2+ is ch1's IOPB pointer/GO area (waking on those half-written mailbox writes breaks the ROM path)
+	{
+		// STEP 135 (experimental): the fw dispatcher @0x24c6 services TWO command channels (ch0: mailbox
+		// byte $7ff0/CCB $7fe0/work $71c6; ch1: $7ff8/$7fe8/$71f0 = the ROM's GO path). The loaded NSC
+		// Boot driver talks via the ch0/CCB area (writes $7fe2/$7fe8/$7fea then polls its cmd byte bit7).
+		// Wake the firmware (IRQ2) on any host write to the mailbox-control tail so its own dispatcher
+		// can examine the channels - the real gate array likely raises the host-command interrupt for
+		// these writes too, not just the 0x13 GO.
+		LOG("CH0/CCB wr pio=%04x fw=%04x = %04x (mask %04x) -> IRQ2 @%.4f\n", pio, fa, data, mem_mask, machine().time().as_double());
+		m_cpu->set_input_line(M68K_IRQ_2, ASSERT_LINE);
+	}
+	else if (pio == 0x73f8 && ACCESSING_BITS_0_7)
+	{
+		// STEP 138 (Dave: handshake decode): a NON-0x13 write to the ch1 GO byte (low lane; the ROM's
+		// IOPB-pointer bytes ride the HIGH lane so this can't fire mid-setup).  The gate array cannot
+		// inspect values - on real hardware any GO-byte write raises the host-command interrupt and the
+		// fw dispatcher @0x24c6 edge-detects the byte itself.  The NSC driver's last visible act is a
+		// 16-bit clear of GO+ptr-hi (0x13 -> 0x00): wake the fw and let ITS dispatcher decide.  No
+		// gate-array IOPB auto-fetch here (that is modeled only for the 0x13 protocol).
+		LOG("GO-EDGE wr pio=73f8 GO=%02x (was-nonstd) -> IRQ2 @%.4f\n", data & 0xff, machine().time().as_double());
+		m_cpu->set_input_line(M68K_IRQ_2, ASSERT_LINE);
+	}
+	else if (m_trace)
+		LOG("HOSTWIN wr pio=%04x fw=%04x = %04x (mask %04x)\n", pio, fa, data, mem_mask);
+}
+
+// Multibus I/O 0x0800-0x0807: the OS-driver command channel (layout confirmed against the kernel's
+// sacmd @0x9504, sasi.c 5.54):
+//   [0]   = command byte, written LAST (bit0=1 -> interrupt-driven, else the driver polls bit7 = DONE)
+//   [1]   = channel status, read back as (status & 3), 0 = OK
+//   [2-3] = request/REPLY buffer pointer (low 16 bits; [6] = bits 16-23) - data commands read/write
+//           through it, status commands (c0 sub-7) get their result structure WRITTEN here
+//   [4-7] = device block pointer (LE): dev[0]=op, dev[1]=unit<<5|pos-hi, dev[2-3]=position (BE),
+//           dev[4-7]=count (LE), dev[5]=subcode for c0/c2
+u16 multibus_storager_device::ioreg_r(offs_t offset)
+{
+	u16 v = u16(m_ioreg[offset * 2]) | (u16(m_ioreg[offset * 2 + 1]) << 8);
+	if (offset == 0 && m_ioreg_done)
+	{
+		v |= 0x80;   // cmd byte bit7 = DONE
+		if (!machine().side_effects_disabled() && m_ioreg_pending > 0)
+		{
+			// acknowledge ONE completion; keep INT2 asserted while others remain outstanding
+			// so the level-triggered ICU re-triggers the handler until the count reaches zero
+			int_w<2>(1);
+			if (--m_ioreg_pending > 0)
+				m_ioreg_int->adjust(attotime::from_usec(20));   // re-edge for the next outstanding completion
+		}
+	}
+	{
+		double const t = machine().time().as_double();
+		static int n = 0;
+		if (t > 6.9 && t < 7.1 && n++ < 40 && !machine().side_effects_disabled())
+			LOG("IOREG rd 0x80%x -> %04x (%s) @%.5f\n", offset * 2, v, machine().describe_context(), t);
+	}
+	return v;
+}
+
+void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	if (ACCESSING_BITS_0_7)  m_ioreg[offset * 2]     = data & 0xff;
+	if (ACCESSING_BITS_8_15) m_ioreg[offset * 2 + 1] = data >> 8;
+	LOG("IOREG wr 0x80%x = %04x (mask %04x) [%s] @%.4f\n", offset * 2, data, mem_mask, machine().describe_context(), machine().time().as_double());
+	if (offset == 0 && ACCESSING_BITS_0_7)
+	{
+		m_ioreg_done = false;   // new command accepted: DONE drops until this command completes
+		m_temp_cid++;   // TEMPORAL PROBE (STRIP)
+		logerror("TEMPO SUBMIT cid=%u cmd=%02x t=%.6f\n", m_temp_cid, data & 0xff, machine().time().as_double());
+		// command-byte write: decode + dump the host block at the pointer, then ACK (bit7) so the driver
+		// proceeds and reveals its next command - STEP 138 probe: observed cmd 0x00 (presence/reset?) and
+		// 0x02 (retry) with ptr=0xbd74; reg[1] is read back as a status byte (&3, 0=OK) after DONE.
+		// pointer lane assembly per the kernel's sacmd @0x9504: dev-blk = regs [4],[5],[7] (24-bit),
+		// request/reply buffer = regs [2],[3],[6] (24-bit). Reg [6] is NOT the dev-blk's third byte.
+		u32 const ptr = u32(m_ioreg[4]) | (u32(m_ioreg[5]) << 8) | (u32(m_ioreg[7]) << 16);
+		u32 const req = u32(m_ioreg[2]) | (u32(m_ioreg[3]) << 8) | (u32(m_ioreg[6]) << 16);
+		address_space &bs = m_bus->space(AS_PROGRAM);
+		std::string ib, rb;
+		for (u32 k = 0; k < 0x20; k++) ib += util::string_format(" %02x", bs.read_byte((ptr + k) & 0xffffff));
+		if (req) for (u32 k = 0; k < 0x20; k++) rb += util::string_format(" %02x", bs.read_byte((req + k) & 0xffffff));
+		LOG("IOREG CMD=%02x dev-blk@%06x:%s  req-blk@%06x:%s @%.4f\n",
+			data & 0xff, ptr & 0xffffff, ib.c_str(), req, req ? rb.c_str() : " (none)", machine().time().as_double());
+		{
+			// STEP 142: if dev-ptr = the standalone-lib iob, the deep fields are (NS32k sys.c 4.9):
+			// +0x9A i_boff, +0xA6 i_bn, +0xAA i_ma (BUFFER!), +0xAE i_cc, +0xC2 i_buf (sblock heap buf)
+			std::string dp;
+			for (u32 k = 0x98; k < 0xc8; k++) dp += util::string_format(" %02x", bs.read_byte((ptr + k) & 0xffffff));
+			LOG("IOREG iob+98..c7:%s\n", dp.c_str());
+		}
+		// cmd 0x02 with device-block op 0x08 = READ: deliver from the media. Fields (STEP 138 decode):
+		// dev[2-3] LE = host buffer, dev[4-7] LE = position in 1KB BLOCKS absolute on the media (0x20 =
+		// byte 0x8000 = cyl4/hd0 = the SINIX filesystem volume start - the fs region begins after the
+		// ANSI boot area at cyl4; units match the loader's DIVD 0x400). 1KB per request (superblock size).
+		// dispatch the device-block op for ANY command submission: the kernel uses cmd byte 0x00
+		// (plain), 0x02, and 0x03 (bit0 = interrupt-driven) - the op lives in the device block
+		if (ptr)
+		{
+			u8 const op = bs.read_byte(ptr & 0xffffff);
+			u8 const chunit = bs.read_byte((ptr + 1) & 0xffffff) >> 5;   // dev-blk[1] bits 5-7 = unit (2/3 = floppy, 0/1 = ESDI HD)
+			if ((op == 0x08 || op == 0x0a) && chunit < 2)
+			{
+				// HD unit: serve from the MC1325 image (working copy; Dave's original stays read-only).
+				// Position and count are in 1KB sectors (the kernel's c2 SET-CONFIG for the HD entries
+				// carries 1024 bytes/sector; sasiopen reads the 1KB label at position 0).
+				u32 const buf = req;
+				// position = 21 bits: dev-blk [1] bits 0-4 = the HIGH bits (the builder ORs
+				// EXTSD(pos,16,5) into the unit byte), [2-3] BE = the low 16 - without the
+				// high bits every track past 64MB wraps and the format's verify pass marks
+				// all upper tracks (7281+) defective in an endless spare-assignment loop
+				u32 const psec = (u32(bs.read_byte((ptr + 1) & 0xffffff) & 0x1f) << 16)
+							   | (u32(bs.read_byte((ptr + 2) & 0xffffff)) << 8) | bs.read_byte((ptr + 3) & 0xffffff);
+				// TEMP (STRIP): 64MB-wrap probe. Log HD ops near/past the 64MB boundary with the raw
+				// dev-blk position bytes so a dropped high bit (driver-side wrap) shows as pos_hi==0
+				// for a track that should be >7281. Also flag any op that lands in the boot/label
+				// area (psec < 256) after the format has begun writing high tracks (= a wrap victim).
+				{
+					static bool hi_seen = false; static int hn = 0, ln = 0;
+					u32 const rawtrk = psec / 9;
+					if (psec >= 0xff00 && hn++ < 40)
+						logerror("HIPOS op=%02x psec=%u trk=%u devblk[1]=%02x pos_hi=%u @%.3f\n",
+								op, psec, rawtrk, bs.read_byte((ptr + 1) & 0xffffff), bs.read_byte((ptr + 1) & 0xffffff) & 0x1f, machine().time().as_double());
+					if (rawtrk >= 7000) hi_seen = true;
+					if (hi_seen && op == 0x0a && psec < 256 && ln++ < 40)
+						logerror("WRAP-VICTIM! op=%02x psec=%u (low sector written during high-track format) @%.3f\n",
+								op, psec, machine().time().as_double());
+				}
+				u32 nsec = u32(bs.read_byte((ptr + 4) & 0xffffff)) | (u32(bs.read_byte((ptr + 5) & 0xffffff)) << 8)
+						 | (u32(bs.read_byte((ptr + 6) & 0xffffff)) << 16) | (u32(bs.read_byte((ptr + 7) & 0xffffff)) << 24);
+				// Interphase 2180 doctrine (the SINIX builder @0x9504 disassembled, STEP 251):
+				// dev-blk [4] = the 8-bit SECTOR COUNT with "0 implies 256"; [5] = the BYTES/
+				// TRANSACTION Multibus burst-size parameter (0xC0 = 192-byte bursts - a DMA
+				// tuning knob, NOT part of the transfer length; the C0-status op carries its
+				// subcode 7 there instead). Sectors are 1KB for the HD units (the c2 SET-CONFIG
+				// declares 1024 bytes/sector). The transfer is a single contiguous DMA from the
+				// request pointer.
+				nsec = bs.read_byte((ptr + 4) & 0xffffff);
+				// count 0: NOT the 2180's "256" here - the SINIX driver posts count-0 writes
+				// whose data arrives in immediately-following per-buffer 4KB commands at the
+				// same and successive sectors (observed throughout the mkfs phase); the count-0
+				// command itself carries only its first 4KB buffer. A 256-sector reading
+				// sprays 256KB of raw kernel memory across the disk (scattered superblock
+				// images on the platter proved it).
+				if (nsec == 0) nsec = 4;
+				if (getenv("STORAGER_UNITLOG2"))   // TEMP (STRIP): verbose per-op sector-unit trace (format-phase 512-vs-1024 analysis)
+				{
+					u8 db[8]; for (int i = 0; i < 8; i++) db[i] = bs.read_byte((ptr + i) & 0xffffff);
+					logerror("UNIT op=%02x u=%u psec=%u nsec=%u byteoff=%llx devblk=%02x%02x%02x%02x%02x%02x%02x%02x @%.4f\n",
+							op, chunit, psec, nsec, (unsigned long long)(u64(psec) * 1024),
+							db[0], db[1], db[2], db[3], db[4], db[5], db[6], db[7], machine().time().as_double());
+				}
+				if (m_hd[chunit]->exists())
+				{
+					if (op == 0x08)
+					{
+						std::vector<u8> sec(nsec * 1024, 0);
+						m_hd[chunit]->img_read(u64(psec) * 1024, sec.data(), u32(sec.size()));
+						// Op 0x08 always DMAs to the host buffer. The STEP 368h "verify-flagged reads are
+						// controller-local, no host DMA" suppression proved WRONG for the format's per-track
+						// check (2026-07-08): those reads carry the same iob+0xb0=0x04/iob+0xb4=0x01 signature
+						// yet the installer byte-compares the delivered data against its 0x1A pattern
+						// ("Byte number 0 = 0 should be 1a" on every Spur with the suppression on). A real
+						// controller transfers on every READ; the old 0x3470f4 corruption must have had a
+						// different root (mis-timed/duplicated delivery, since fixed) - TEMPO/HDWR-OVERLAP
+						// instrumentation stays armed below to catch it if it ever returns.
+						bool const verify_op = (bs.read_byte((ptr + 0xb0) & 0xffffff) == 0x04)
+										 && (bs.read_byte((ptr + 0xb4) & 0xffffff) == 0x01);
+						if (verify_op)
+							logerror("TEMPO VERIFY-OP cid=%u psec=%u req=%06x (verify-flagged; DMA delivered) t=%.6f\n",
+									m_temp_cid, psec, buf, machine().time().as_double());
+						for (u32 k = 0; k < u32(sec.size()); k++)
+							bs.write_byte((buf + k) & 0xffffff, sec[k]);
+						rd_check(chunit, psec, buf, nsec * 1024);   // TEMP (STRIP): read-delivery overlap
+						// TEMPORAL PROBE (STRIP): DMA-complete event + cmd_id + source tag (Dave STEP 367d)
+						{
+							char const *src = "first-run";
+							static u32 ls = ~0u, lb = ~0u; static double lt = 0;
+							double const nt = machine().time().as_double();
+							if (m_ioreg_done) src = "delayed-completion";   // DMA after the command already completed
+							else if (psec == ls && buf == lb && (nt - lt) < 0.05) src = "retry";
+							ls = psec; lb = buf; lt = nt;
+							logerror("TEMPO DMA cid=%u op=%02x psec=%u nsec=%u req=%06x len=%u src=%s t=%.6f\n",
+									m_temp_cid, op, psec, nsec, buf, nsec * 1024, src, nt);
+						}
+						// TEMP (STRIP): Dave's IOREG verify re-issue probe. A verify read the kernel re-issues
+						// (same sector+buffer, back-to-back, short dt) = it never saw completion -> the retry
+						// loop.  Log pending depth so a stacked/dropped INT2 shows as growing depth.
+						{
+							static u32 lastsec = ~0u, lastbuf = ~0u; static double lastt = 0; static int rn = 0;
+							double const nt = machine().time().as_double();
+							if (psec == lastsec && buf == lastbuf && (nt - lastt) < 0.05 && rn++ < 80)
+								logerror("IOREG-REISSUE op08 sec=%u buf=%06x pending=%d dt=%.5f @%.4f\n",
+										psec, buf, m_ioreg_pending, nt - lastt, nt);
+							lastsec = psec; lastbuf = buf; lastt = nt;
+						}
+						LOG("IOREG HD READ sec=%u x%u -> host %06x  first16: %.16s @%.4f\n", psec, nsec, buf,
+								reinterpret_cast<char *>(sec.data()), machine().time().as_double());
+					}
+					else   // op 0x0a = SASI WRITE, 0x0b = write-with-verify (the installer's label/mkfs path)
+					{
+						std::vector<u8> sec(nsec * 1024);
+						for (u32 k = 0; k < u32(sec.size()); k++)
+							sec[k] = bs.read_byte((buf + k) & 0xffffff);
+						// TEMP EXPERIMENT (STRIP): skip the format phase's pattern writes (all-0x1a) so
+						// only the verify READS run against a pre-filled disk - isolates format-write vs
+						// verify-read as the corruption source. STORAGER_SKIPFMT=N skips format writes
+						// for track >= N (N=0/empty skips all); sweep N to bisect the corrupting region.
+						bool all1a = true;
+						for (u8 b : sec) if (b != 0x1a) { all1a = false; break; }
+						char const *const sf = getenv("STORAGER_SKIPFMT");
+						if (sf && all1a && (psec / 9) >= u32(atoi(sf)))
+						{
+							LOG("SKIPFMT: dropped format write sec=%u trk=%u x%u @%.4f\n", psec, psec / 9, nsec, machine().time().as_double());
+							goto wr_done;
+						}
+						m_hd[chunit]->img_write(u64(psec) * 1024, sec.data(), u32(sec.size()));
+						// TEMP (STRIP): 64MB boundary (psec 65536 / byteoff 0x4000000): position needs dev-blk[1]
+						// bits 0-4.  Runs on EVERY write incl. the format 0x1a fill, never capped -- a dropped
+						// high bit shows as poshi==0 for a byteoff that should be PAST-64M (or vice versa).
+						if (getenv("STORAGER_UNITLOG"))
+						{
+							u8 const db1x = bs.read_byte((ptr + 1) & 0xffffff);
+							if (psec >= 0xf800 || (db1x & 0x1f) != 0)
+								logerror("CROSS64 psec=%u (0x%x) poshi=%u db1=%02x byteoff=%llx %s nsec=%u all1a=%d buf=%06x @%.4f\n",
+										psec, psec, db1x & 0x1f, db1x, (unsigned long long)(u64(psec) * 1024),
+										(u64(psec) * 1024 >= 0x4000000ULL) ? "PAST-64M" : "under-64M", nsec, all1a ? 1 : 0, buf, machine().time().as_double());
+						}
+						// TEMP (STRIP): makeboot/mkfs corruption trace.  Skip the uniform 0x1a format fill;
+						// for REAL data writes log (psec/nsec/rawcnt/buf/first bytes) and flag any sector
+						// rewritten with DIFFERENT real data = the "fs full" clobber signature.  rawcnt==0
+						// = the count-0 writes (the emulation expanded to nsec via the ==0->4 heuristic).
+						if (getenv("STORAGER_UNITLOG") && !all1a)
+						{
+							static std::map<u32,u64> rseen; static int nlog = 0, nclob = 0;
+							u8 const raw4 = bs.read_byte((ptr + 4) & 0xffffff);
+							for (u32 s = 0; s < nsec; s++)
+							{
+								u64 h = 1469598103934665603ULL;
+								for (u32 j = 0; j < 1024; j++) { h ^= sec[s*1024+j]; h *= 1099511628211ULL; }
+								auto it = rseen.find(psec + s);
+								if (it != rseen.end() && it->second != h && nclob++ < 80)
+									logerror("HDCLOBBER sec=%u oldh=%016llx newh=%016llx rawcnt=%u nsec=%u buf=%06x @%.4f\n",
+											psec + s, (unsigned long long)it->second, (unsigned long long)h, raw4, nsec, buf, machine().time().as_double());
+								rseen[psec + s] = h;
+							}
+							u8 const db1 = bs.read_byte((ptr + 1) & 0xffffff);   // bits 5-7 = unit, bits 0-4 = position HIGH (>64MB)
+							if (nlog++ < 600)
+								logerror("HDREAL psec=%u nsec=%u rawcnt=%u db1=%02x poshi=%u byteoff=%llx buf=%06x first8=%02x%02x%02x%02x%02x%02x%02x%02x @%.4f\n",
+										psec, nsec, raw4, db1, db1 & 0x1f, (unsigned long long)(u64(psec) * 1024), buf,
+										sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7], machine().time().as_double());
+						}
+						LOG("IOREG HD WRITE sec=%u x%u <- host %06x @%.4f\n", psec, nsec, buf, machine().time().as_double());
+						wr_done:;
+					}
+				}
+				else
+					LOG("IOREG HD: no rigid-disk image mounted\n");
+			}
+			else if (op == 0xc0)
+			{
+				// c0 sub-7 = read device/drive status (the kernel's sacmd hardcodes subcode 7 for op
+				// 0xc0). A real controller returns a status structure in the reply buffer; attach
+				// marks the unit dead without it. Conservative reply: unit present + ready, no
+				// fault/seek error (Panther drive-status semantics: Unit Ready|Present|Drive Ready).
+				u8 const sub = bs.read_byte((ptr + 5) & 0xffffff);
+				std::string db;
+				for (u32 k = 0; k < 8; k++) db += util::string_format(" %02x", bs.read_byte((ptr + k) & 0xffffff));
+				if (req)
+				{
+					for (u32 k = 1; k < 16; k++) bs.write_byte((req + k) & 0xffffff, 0x00);
+					bs.write_byte(req & 0xffffff, 0xc1);   // Unit Ready | Present | Drive Ready
+				}
+				LOG("IOREG C0 STATUS unit %u sub %02x dev-blk:%s reply->%06x @%.4f\n", chunit, sub, db.c_str(), req, machine().time().as_double());
+			}
+			else if (op == 0xc2)
+			{
+				// c2 = SET configuration: the kernel downloads its geometry block (built @0x88a0 from
+				// the compiled table). Log it for the per-unit geometry latch (bytes/sector etc.).
+				std::string pb;
+				if (req) for (u32 k = 0; k < 12; k++) pb += util::string_format(" %02x", bs.read_byte((req + k) & 0xffffff));
+				LOG("IOREG C2 SETCONF unit %u params@%06x:%s @%.4f\n", chunit, req, pb.c_str(), machine().time().as_double());
+			}
+			else if (op == 0x03)
+			{
+				// SASI REQUEST SENSE: 4-byte reply, all zero = no error
+				if (req) for (u32 k = 0; k < 4; k++) bs.write_byte((req + k) & 0xffffff, 0x00);
+				LOG("IOREG SENSE unit %u reply->%06x @%.4f\n", chunit, req, machine().time().as_double());
+			}
+			else if (op == 0x00 || op == 0x01 || op == 0x0b)
+			{
+				// SASI TEST UNIT READY / REZERO / SEEK: no data, status-only (ACK below).
+				// SEEK (0x0B) applies to the HD units too - the mkfs-era count-0 SEEKs were
+				// long misread as "write-with-verify" data ops; the real data always arrives
+				// in the accompanying per-buffer 0x0A writes (a phantom transfer here
+				// overwrites freshly-written sectors with stale request-buffer bytes).
+				LOG("IOREG %s unit %u @%.4f\n", op == 0 ? "TUR" : op == 1 ? "REZERO" : "SEEK", chunit, machine().time().as_double());
+			}
+			else if (op == 0x04 && chunit < 2)
+			{
+				// SASI FORMAT UNIT (the installer's full format, one op for the whole drive):
+				// lay down the controller's fill pattern across the medium. 0x1A is the fill
+				// byte the SINIX format's own per-track check expects to read back.
+				if (m_hd[chunit]->exists())
+				{
+					u64 const size = m_hd[chunit]->img_length();
+					std::vector<u8> const fill(64 * 1024, 0x1a);
+					for (u64 off = 0; off < size; off += fill.size())
+						m_hd[chunit]->img_write(off, fill.data(), u32(std::min<u64>(fill.size(), size - off)));
+					LOG("IOREG FORMAT unit %u: filled %llu bytes with 1a @%.4f\n", chunit,
+							(unsigned long long)size, machine().time().as_double());
+				}
+				else
+					LOG("IOREG FORMAT: no rigid-disk image mounted\n");
+			}
+			else if (op == 0x87)
+			{
+				// extended status/identify (the ROM's hard-disk boot probes with this before
+				// reading the label): reply like c0 sub-7 - unit present and ready
+				if (req)
+				{
+					for (u32 k = 1; k < 16; k++) bs.write_byte((req + k) & 0xffffff, 0x00);
+					bs.write_byte(req & 0xffffff, 0xc1);
+				}
+				LOG("IOREG 87 IDENT unit %u reply->%06x @%.4f\n", chunit, req, machine().time().as_double());
+			}
+			else if (op != 0x08)
+				LOG("IOREG UNKNOWN OP %02x unit %u @%.4f\n", op, chunit, machine().time().as_double());
+			if ((op == 0x08 || op == 0x0a) && chunit >= 2)
+			{
+				// READ (STEP 143 final decode, proven by the runtime iob scan: i_bn=16/i_ma=0xBD8C/i_cc=0x2000
+				// at iob~0xB1D0): DATA BUFFER = I/O reg [2-3] (= iob->i_ma, the heap sblock/iob buffer);
+				// device block: [1] = flags (0x40 const), [2-3] LE = ABSOLUTE position in current-size
+				// sectors (0xa0 = 160 x 256B = blk 40 = partition base 24 + i_bn 16 - where the fs magic
+				// 0x00090545 lives), [4-7] LE = count in sectors (0x20 = 8KB = i_cc). Uniform 8KB cylinders.
+				if (!m_floppy_loaded) load_floppy();
+				u32 const buf = req;   // I/O reg [2-3] = iob->i_ma
+				u32 const psec = (u32(bs.read_byte((ptr + 2) & 0xffffff)) << 8) | bs.read_byte((ptr + 3) & 0xffffff);   // BE (68000-heritage field): 00 a0 = 160
+				// dev-blk[4] = 8-bit SECTOR COUNT; [5] = the Multibus BYTES/TRANSACTION burst-size
+				// parameter (0xC0), NOT part of the count -- same as the HD channel path (~line 924).
+				// Bug: reading [4-7] as a 32-bit count pulled [5]=0xC0 in, so an 8-sector label read
+				// (dev-blk[4]=0x08) became 0xC008 -> capped to 64 = a 16KB over-read that trampled the
+				// adjacent host buffers (the root-fs read buffer).  The SINIX install then saw corrupted
+				// data and rejected the data floppies during stage-2 ("Falsche Diskette eingelegt").
+				u32 nsec;
+				if (op == 0x0b)   // write-with-verify: [4-7] LE = count in BYTES -> 1KB sectors
+				{
+					nsec = u32(bs.read_byte((ptr + 4) & 0xffffff)) | (u32(bs.read_byte((ptr + 5) & 0xffffff)) << 8)
+						 | (u32(bs.read_byte((ptr + 6) & 0xffffff)) << 16) | (u32(bs.read_byte((ptr + 7) & 0xffffff)) << 24);
+					nsec = (nsec + 1023) / 1024;
+				}
+				else   // op 0x08 read / 0x0a write: count = dev-blk[4] sectors ([5]=0xC0 is the burst param)
+					nsec = bs.read_byte((ptr + 4) & 0xffffff);
+				if (nsec > 64) nsec = 64;   // sanity cap (16KB)
+				for (u32 k = 0; k < nsec * 256; k++)
+				{
+					u32 const off = psec * 256 + k;
+					u32 const cylno = off / 0x2000;
+					u32 const rest = off % 0x2000;
+					u32 const head = rest / 0x1000;
+					u32 const loc = rest % 0x1000;
+					u32 secid, bib;
+					if (cylno == 0)
+					{
+						// cylinder 0 is FM: 16 x 128-byte sectors per head, logical order starting
+						// at R7 (the VOL1 label sector); the kernel's uniform 256B-sector view maps
+						// each of its sectors onto two consecutive FM sectors. Offsets past the FM
+						// capacity (2KB per head) have no medium behind them.
+						if (loc >= 0x800)
+						{
+							if (op != 0x0a)
+								bs.write_byte((buf + k) & 0xffffff, 0);
+							continue;
+						}
+						secid = ((6 + loc / 128) % 16) + 1;
+						bib = loc % 128;
+					}
+					else
+					{
+						secid = loc / 256 + 1;
+						bib = loc % 256;
+					}
+					auto const it = m_sectors.find((cylno << 16) | (head << 8) | secid);
+					if (op == 0x0a)
+					{
+						// WRITE: host -> the in-memory floppy sector (the miniroot's writable root).
+						if (it != m_sectors.end() && bib < it->second.size())
+							it->second[bib] = bs.read_byte((buf + k) & 0xffffff);
+						else
+						{
+							// TEMP (STRIP): DROPPED write byte = an INCOMPLETE write (Dave's free-list
+							// corruption hypothesis: the fs's free-bitmap/metadata write loses bytes)
+							static int drop = 0;
+							if (drop++ < 30)
+								logerror("FWDROP: byte @sec-off %u (cyl%u h%u s%u bib%u) NO SECTOR/size=%zu @%.4f\n",
+										psec * 256 + k, cylno, head, secid, bib,
+										it != m_sectors.end() ? it->second.size() : 0, machine().time().as_double());
+						}
+					}
+					else
+						bs.write_byte((buf + k) & 0xffffff, (it != m_sectors.end() && bib < it->second.size()) ? it->second[bib] : 0);
+				}
+				if (op != 0x0a)
+					rd_check(chunit, psec, buf, nsec * 256);   // TEMP (STRIP): floppy read-delivery overlap
+				if (op == 0x0a)
+				{
+					// TEMP (STRIP): SELF-VERIFY the write landed correctly (Dave's "wrong data" hypothesis)
+					u32 bad = 0, badoff = 0;
+					for (u32 k = 0; k < nsec * 256; k++)
+					{
+						u32 const off = psec * 256 + k, cylno = off / 0x2000, rest = off % 0x2000;
+						u32 const head = rest / 0x1000, loc = rest % 0x1000, secid = loc / 256 + 1, bib = loc % 256;
+						auto const it = m_sectors.find((cylno << 16) | (head << 8) | secid);
+						u8 const want = bs.read_byte((buf + k) & 0xffffff);
+						u8 const got = (it != m_sectors.end() && bib < it->second.size()) ? it->second[bib] : 0xAA;
+						if (got != want) { if (!bad) badoff = k; bad++; }
+					}
+					if (bad)
+					{
+						static int vf = 0;
+						if (vf++ < 30)
+							logerror("FWVERIFY-FAIL: sec=%u x%u  %u/%u bytes WRONG (first @+%u) = INCOMPLETE/WRONG WRITE @%.4f\n",
+									psec, nsec, bad, nsec * 256, badoff, machine().time().as_double());
+					}
+				}
+				std::string dd;
+				for (u32 k = 0; k < 12; k++) dd += util::string_format("%02x ", bs.read_byte((buf + k) & 0xffffff));
+				LOG("IOREG %s sec=%u (byte %06x) x%usec %s host %06x  first12: %s@%.4f\n", op == 0x0a ? "FWRITE" : "READ",
+						psec, psec * 256, nsec, op == 0x0a ? "<-" : "->", buf, dd.c_str(), machine().time().as_double());
+			}
+		}
+		m_ioreg[1] = 0;        // status = OK
+		m_ioreg_done = true;   // ACK
+		logerror("TEMPO DONE cid=%u t=%.6f\n", m_temp_cid, machine().time().as_double());   // TEMPORAL PROBE (STRIP)
+		if (data & 1)          // cmd bit0 = interrupt-driven: count the outstanding completion and arm
+		{                      // the deferred INT2 (MULTIBUS INT2 -> CPUAP ICU IR3 = the kernel sa handler)
+			if (m_ioreg_pending > 0)
+				LOG("IOREG INT-STACK: completion while %d already pending @%.4f\n",
+						m_ioreg_pending, machine().time().as_double());
+			m_ioreg_pending++;
+			m_ioreg_int->adjust(attotime::from_usec(500));   // deferred so it can't beat the driver into its wait
+		}
+	}
+}
+
+// Disk read/write channel (74LS1801/1802 ENDEC + drives), logged for RE.
+// cmd 0x95 READ delivery (STEP 131-133 request-honoring probe; diagnostic, not the final firmware-driven
+// model): serve EXACTLY what the IOPB asks, from what the media contains.  Evidence-based model:
+//  - geometry = the unit's last INIT/UIB (UIB[0]=heads, [1]=spt, [2-3]=bytes/sector LE, [4]=FM start sector);
+//  - the IOPB count is in 512-BYTE LOGICAL BLOCKS (HDR1 extent=blk 8 = cyl1; fe44a9 byte count 0x400;
+//    drive struct stores 8 blks/trk + 512): one block = 4x128 (FM) or 2x256 (MFM) physical sectors;
+//  - POSITION IS PHYSICAL (track, sector-index): the label read (8 blks = 32 FM sectors = exactly 2 tracks)
+//    leaves the head at track 2 = cyl1/hd0; the re-INIT switches density in place; the boot-image read
+//    continues there with NO seek - which is why the command stream has none;
+//  - within an FM track the sector order starts at UIB[4] (=7 -> the ANSI VOL1 sector delivered first);
+//    MFM tracks deliver in plain ID order (UIB[4]=13's MFM meaning UNRESOLVED - not modeled);
+//  - called at the DOORBELL (synchronous with the CPUAP's GO write) so the data is in the host buffer
+//    before any completion status the CPUAP might see.
+void multibus_storager_device::read95_deliver(u32 dst)
+{
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	address_space &bs = m_bus->space(AS_PROGRAM);
+	if (!m_floppy_loaded) load_floppy();
+	u32 const unit = cs.read_byte((dst + 4) & 0xffff) & 3;
+	u32 const count = (u32(cs.read_byte((dst + 0xa) & 0xffff)) << 8) | cs.read_byte((dst + 0xb) & 0xffff);
+	if (unit == 2 && count && count <= 64 && m_unit_secsize[2])
+	{
+		u32 const heads = m_unit_heads[2], spt = m_unit_spt[2], ssz = m_unit_secsize[2];
+		u32 const sec_per_blk = 512 / ssz;
+		u32 trk = m_unit_trk[2], sidx = m_unit_sidx[2];
+		// IOPB options bit0: 0 = SEQUENTIAL from the current position ("Seq/Disable-Address-Bump");
+		// 1 = ADDRESSED: bytes[6-9] (BE) = sector address in current-size sectors, relative to the
+		// position at the last INIT (the ANSI flow re-INITs with the head at the file base, so file-
+		// relative addressing lands correctly; evidence: the 53-blk read addr=4 = file byte 0x400 =
+		// the ZMAGIC text offset).  PROVISIONAL: the base rule needs firmware confirmation.
+		if (cs.read_byte((dst + 1) & 0xffff) & 1)
+		{
+			u32 const addr = (u32(cs.read_byte((dst + 6) & 0xffff)) << 24) | (u32(cs.read_byte((dst + 7) & 0xffff)) << 16)
+						   | (u32(cs.read_byte((dst + 8) & 0xffff)) << 8)  |  u32(cs.read_byte((dst + 9) & 0xffff));
+			u32 const abs_s = m_unit_btrk[2] * spt + m_unit_bsidx[2] + addr;
+			trk = abs_s / spt;
+			sidx = abs_s % spt;
+		}
+		u32 const otrk = trk, osidx = sidx;
+		u32 const dstb = m_iopb_buffer & 0xffffff;
+		u32 off = 0;
+		for (u32 n = 0; n < count * sec_per_blk; n++)
+		{
+			u32 const cylno = trk / heads, head = trk % heads;
+			u32 const sec0 = (ssz == 128 && m_unit_sec0[2] >= 1 && m_unit_sec0[2] <= spt) ? m_unit_sec0[2] : 1;
+			u32 const secid = ((sec0 - 1 + sidx) % spt) + 1;
+			auto const it = m_sectors.find((cylno << 16) | (head << 8) | secid);
+			for (u32 k = 0; k < ssz; k++)
+				bs.write_byte((dstb + off + k) & 0xffffff, (it != m_sectors.end() && k < it->second.size()) ? it->second[k] : 0);
+			off += ssz;
+			if (++sidx >= spt) { sidx = 0; trk++; }
+		}
+		std::string dd;
+		for (u32 k = 0; k < 12; k++) dd += util::string_format("%02x ", bs.read_byte((dstb + k) & 0xffffff));
+		LOG("READ95 unit2: trk%u.%u -> trk%u.%u (%u blk x512, %uB sectors) -> %06x  first12: %s@%.4f\n",
+			otrk, osidx, trk, sidx, count, ssz, dstb, dd.c_str(), machine().time().as_double());
+		m_unit_trk[2] = trk; m_unit_sidx[2] = sidx;
+	}
+	else if (unit < 2)
+	{
+		// hard-disk unit: serve from the MC1325 image (the same source as the kernel-era ioreg
+		// path). The IOPB count is in 512-byte blocks; the position (addressed mode, options
+		// bit0) is a sector address in the unit's current sector size (the ROM boot flow INITs
+		// the HD at 1KB/sector; default to 1KB when no INIT has been seen).
+		u32 const ssz = m_unit_secsize[unit] ? m_unit_secsize[unit] : 1024;
+		u64 pos = 0;
+		if (cs.read_byte((dst + 1) & 0xffff) & 1)
+		{
+			u32 const addr = (u32(cs.read_byte((dst + 6) & 0xffff)) << 24) | (u32(cs.read_byte((dst + 7) & 0xffff)) << 16)
+						   | (u32(cs.read_byte((dst + 8) & 0xffff)) << 8)  |  u32(cs.read_byte((dst + 9) & 0xffff));
+			pos = u64(addr) * ssz;
+		}
+		if (m_hd[unit]->exists() && count && count <= 64)
+		{
+			std::vector<u8> buf(size_t(count) * 512, 0);
+			m_hd[unit]->img_read(pos, buf.data(), u32(buf.size()));
+			u32 const dstb = m_iopb_buffer & 0xffffff;
+			for (u32 k = 0; k < u32(buf.size()); k++)
+				bs.write_byte((dstb + k) & 0xffffff, buf[k]);
+			std::string dd;
+			for (u32 k = 0; k < 12; k++) dd += util::string_format("%02x ", buf[k]);
+			LOG("READ95 unit%u HD: pos=%llx (%u blk x512, ssz=%u) -> %06x  first12: %s@%.4f\n",
+					unit, (unsigned long long)pos, count, ssz, dstb, dd.c_str(), machine().time().as_double());
+		}
+		else
+			LOG("READ95 unit%u HD: cannot serve (img=%d count=%u) @%.4f\n", unit, m_hd[unit]->exists() ? 1 : 0, count, machine().time().as_double());
+	}
+	else
+		LOG("READ95 unit%u: no media modeled (tape) - not delivered @%.4f\n", unit, machine().time().as_double());
+}
+
+// Adapter scope to reach floppy_image_format_t's protected static bitstream helper (never instantiated).
+struct storager_trkdec : floppy_image_format_t
+{
+	using floppy_image_format_t::generate_bitstream_from_track;
+};
+
+// Decode the ID fields of the mounted image's track at (cyl, side), in track order, from the real
+// cell data (Phase B: the gate-array/ENDEC model's view of the media; sector-granular per the fw's
+// consumption - the fw itself verifies C/H and reads its angular position from the returned R).
+multibus_storager_device::dc_track const &multibus_storager_device::decode_track_ids(floppy_image_device *fdd, int cyl, int side)
+{
+	u32 const key = (cyl << 4) | side;
+	auto it = m_dc_ids.find(key);
+	if (it != m_dc_ids.end())
+		return it->second;
+
+	dc_track result;
+	floppy_image const *const img = fdd->get_image();
+	auto decode_bytes = [](std::vector<bool> const &bits, size_t pos, unsigned count)
+	{
+		std::vector<u8> out;
+		for (unsigned k = 0; k < count && pos + 16 <= bits.size(); k++, pos += 16)
+		{
+			u8 b = 0;
+			for (unsigned j = 0; j < 8; j++)
+				b = (b << 1) | (bits[pos + j * 2 + 1] ? 1 : 0);
+			out.push_back(b);
+		}
+		return out;
+	};
+	if (img)
+	{
+		// MFM (0x4489 sync runs): collect ID (FE) and DATA (FB/F8) fields in track order
+		for (int cell : { 1667, 2000 })
+		{
+			auto const bits = storager_trkdec::generate_bitstream_from_track(cyl, side, cell, *img);
+			u32 sr = 0;
+			unsigned sync = 0;
+			dc_sector pend{}; bool have_id = false;
+			for (size_t i = 0; i < bits.size(); i++)
+			{
+				sr = ((sr << 1) | (bits[i] ? 1 : 0)) & 0xffff;
+				if (sr == 0x4489) { sync++; sr = 0; continue; }
+				if (sync >= 3)
+				{
+					auto const b = decode_bytes(bits, i - 15, 5);
+					if (b.size() >= 5 && b[0] == 0xfe)
+					{
+						pend = dc_sector{ b[1], b[2], b[3], b[4], {} };
+						have_id = true;
+					}
+					else if (!b.empty() && (b[0] == 0xfb || b[0] == 0xf8) && have_id)
+					{
+						unsigned const len = 128u << (pend.n & 3);
+						pend.data = decode_bytes(bits, i - 15 + 16, len);
+						result.secs.push_back(std::move(pend));
+						have_id = false;
+					}
+					sync = 0;
+				}
+				else if (sync)
+					sync = 0;
+			}
+			if (!result.secs.empty()) break;
+		}
+		if (result.secs.empty())
+		{
+			// FM: IDAM = 0xF57E, DAM = 0xF56F (FB) / 0xF56A (F8)
+			for (int cell : { 3333, 4000 })
+			{
+				auto const bits = storager_trkdec::generate_bitstream_from_track(cyl, side, cell, *img);
+				u32 sr = 0;
+				dc_sector pend{}; bool have_id = false;
+				for (size_t i = 0; i < bits.size(); i++)
+				{
+					sr = ((sr << 1) | (bits[i] ? 1 : 0)) & 0xffff;
+					if (sr == 0xf57e)
+					{
+						auto const b = decode_bytes(bits, i + 1, 4);
+						if (b.size() >= 4) { pend = dc_sector{ b[0], b[1], b[2], b[3], {} }; have_id = true; }
+					}
+					else if ((sr == 0xf56f || sr == 0xf56a) && have_id)
+					{
+						unsigned const len = 128u << (pend.n & 3);
+						pend.data = decode_bytes(bits, i + 1, len);
+						result.secs.push_back(std::move(pend));
+						have_id = false;
+					}
+				}
+				if (!result.secs.empty()) { result.fm = true; break; }
+			}
+		}
+	}
+	LOG("TRKDEC cyl %d side %d: %s, %u sectors\n", cyl, side, result.fm ? "FM" : "MFM", unsigned(result.secs.size()));
+	return m_dc_ids.emplace(key, std::move(result)).first->second;
+}
+
+// Build the current track's raw ENDEC byte stream (what the 74LS1802 SERDES clocks out under the head),
+// from the mounted image's decoded fields. Per sector: [A1 A1 A1] FE C H R N crc crc  [A1 A1 A1] FB
+// <data...> crc crc. The firmware reads E000 to pull these bytes, syncs on the A1 runs, matches the
+// target sector's ID, and takes its data. No protocol here - just the bytes the head would see.
+void multibus_storager_device::build_serdes_stream(int cyl, int side)
+{
+	m_serdes_stream.clear();
+	m_serdes_ptr = 0;
+	m_serdes_track = (u32(cyl) << 1) | unsigned(side);
+	floppy_image_device *const fdd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
+	if (!fdd) return;
+	auto const &trk = decode_track_ids(fdd, cyl, side);
+	// The ENDEC presents a UNIFORM decoded format to the firmware regardless of FM/MFM: the parser
+	// @0x9884 checks buf[1]==0xa1 (sync) then 0xfe (IDAM), so A1 A1 A1 precedes FE/FB even for FM.
+	for (auto const &s : trk.secs)
+	{
+		m_serdes_stream.insert(m_serdes_stream.end(), { 0xa1, 0xa1, 0xa1, 0xfe, s.c, s.h, s.r, s.n, 0x00, 0x00 });
+		m_serdes_stream.insert(m_serdes_stream.end(), { 0xa1, 0xa1, 0xa1, 0xfb });
+		m_serdes_stream.insert(m_serdes_stream.end(), s.data.begin(), s.data.end());
+		m_serdes_stream.insert(m_serdes_stream.end(), { 0x00, 0x00 });
+	}
+	LOG("SERDES stream built cyl%d side%d: %u bytes, %u secs (%s)\n", cyl, side,
+			unsigned(m_serdes_stream.size()), unsigned(trk.secs.size()), trk.fm ? "FM" : "MFM");
+}
+
+// ID-capture completion: deposit the next ID field (in the format the fw's parser @0x9884 consumes:
+// MFM = A1 A1 A1 FE C H R N + 2 crc filler, FM = FE C H R N + crc) at the D800-programmed local
+// destination, then raise the channel-completion IRQ4 - the firmware's own ISR/continuation posts
+// the result; the model never writes status words.
+TIMER_CALLBACK_MEMBER(multibus_storager_device::idcap_tick)
+{
+	floppy_image_device *const fdd = m_floppy[0]->get_device();
+	if (!fdd) return;
+	int const cyl = fdd->get_cyl();
+	int const side = 0;   // B0 open item: the dumb-path side-select line (the fw's 0x202A error will name it)
+	auto const &trk = decode_track_ids(fdd, cyl, side);
+	if (trk.secs.empty())
+		return;   // no marks: let the fw's 80k poll hit its own 0x201C timeout - faithful
+	auto const &sec = trk.secs[angular_sector(trk.secs.size())];
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	u32 a = m_idcap_dst;
+	if (!trk.fm)
+		for (u8 v : { 0xa1, 0xa1, 0xa1 }) cs.write_byte(a++, v);
+	cs.write_byte(a++, 0xfe);
+	for (u8 v : { sec.c, sec.h, sec.r, sec.n }) cs.write_byte(a++, v);
+	cs.write_byte(a++, 0x00); cs.write_byte(a++, 0x00);   // CRC filler (the gate array checked it)
+	LOG("IDCAP deliver cyl%d/s%d id={%02x %02x %02x %02x} -> %04x, IRQ4\n", cyl, side, sec.c, sec.h, sec.r, sec.n, m_idcap_dst);
+	{ if (m_fw_driven && machine().time().as_double() > 6.5) logerror("IRQ4fire pc=%06x @%.4f\n", m_cpu->pc(), machine().time().as_double()); m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE); }
+}
+
+// The armed read-channel data operation: deliver the next sector under the head into the D000
+// local staging destination, post channel status, raise the completion IRQ4. (The fw's IRQ4 ISR
+// armed the channel by writing the $79CA/CC mode pair into the E000 file - see ch_w.)
+TIMER_CALLBACK_MEMBER(multibus_storager_device::dataop_tick)
+{
+	if (m_bare_irq4)
+	{
+		m_bare_irq4 = false;
+		LOG("DATAOP bare IRQ4 @%.4f\n", machine().time().as_double());
+		{ if (m_fw_driven && machine().time().as_double() > 6.5) logerror("IRQ4fire pc=%06x @%.4f\n", m_cpu->pc(), machine().time().as_double()); m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE); }
+		return;
+	}
+	floppy_image_device *const fdd = m_floppy[0]->get_device();
+	if (!fdd) return;
+	int const cyl = fdd->get_cyl();
+	address_space &cs0 = m_cpu->space(AS_PROGRAM);
+	// side-select correlation (B0's last unknown): candidates = E802 bits 4/5 vs the fw's target
+	// head cell $7436. Until the hardware line is pinned, follow the fw's target (logged for the
+	// correlation; the E802-bit hypothesis gets confirmed or refuted by the log).
+	u16 const e802v = m_ch[(0xe802 - 0xe000) / 2];
+	u16 const want_h = cs0.read_word(0x7436);
+	u16 const want_c = cs0.read_word(0x7438);
+	int const side = (want_h & 1);
+	logerror("DATAOP tgt C=%u H=%u | e802 b4=%d b5=%d | cyl=%d side=%d @%.4f\n",
+			want_c, want_h, BIT(e802v, 4), BIT(e802v, 5), cyl, side, machine().time().as_double());
+	auto const &trk = decode_track_ids(fdd, cyl, side);
+	if (trk.secs.empty())
+		return;   // no data: the fw's own op timeout judges it
+	// each capture waits for the NEXT address mark - successive attempts see successive sectors
+	// in physical track order (the rotation; the fw's verify hunts across them)
+	auto const &sec = trk.secs[m_dc_seq++ % trk.secs.size()];
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	u32 const dst = u32(m_d000) << 1;
+	// TEMP LOG (STRIP): the request block's expected-buffer pointer + surroundings before delivery
+	{
+		u16 const wrk = cs.read_word(0x71c0);
+		std::string ctx;
+		for (int k = 0x18; k <= 0x28; k += 2) ctx += util::string_format(" +%02x=%04x", k, cs.read_word((wrk + k) & 0xffff));
+		logerror("DATAOP pre: workblk=%04x%s  D000<<1=%04x D800=%04x @%.4f\n", wrk, ctx.c_str(), dst, m_d800, machine().time().as_double());
+	}
+	// the op's transfer length comes from the fw ($79D4, in words; @0x1CE0: 0x18 or 0xC minus 3) -
+	// this phase is header/verify-sized, NOT a full sector; a full-sector write here would clobber
+	// the live request block (D000 dest == the local IOPB at $71F0!)
+	u16 const opwords = cs.read_word(0x79d4);
+	size_t oplen = size_t(opwords) * 2;
+	// dispatch the delivered content by the channel op (E800 bits 5-7, from the $63E table):
+	//   0x40/0x20 families = ID capture/verify -> the decoded mark stream (A1 A1 A1 FE C H R N / FM)
+	//   0x00 family        = DATA transfer     -> the target sector's data (fw's accepted R @ $7428)
+	u16 const e800 = m_ch[(0xe800 - 0xe000) / 2];
+	unsigned const opfam = (e800 >> 5) & 7;
+	// OBSERVE (STRIP): what is the fw searching for vs what the gate array supplies this pass?
+	logerror("GAPASS seq=%u opfam=%u supply{C%02x H%02x R%02x N%02x} target{C=%u H=%u R=%02x} e800=%04x @%.4f\n",
+			m_dc_seq, opfam, sec.c, sec.h, sec.r, sec.n, cs.read_word(0x7438), cs.read_word(0x7436), cs.read_word(0x7428)&0xff, e800, machine().time().as_double());
+	std::vector<u8> payload;
+	if (opfam == 0)
+	{
+		u16 const want_r = cs.read_word(0x7428) & 0xff;
+		dc_sector const *pick = &sec;
+		for (auto const &c : trk.secs)
+			if (c.r == want_r) { pick = &c; break; }
+		payload = pick->data;
+		oplen = payload.size();   // the data op moves the full sector
+		LOG("DATAOP data-phase R=%02x (want %02x)\n", pick->r, want_r);
+		// THE HOST DMA LEG: the gate array bus-masters the requested transfer into the CPUAP buffer.
+		// Same contract as the retired read95_deliver (count = local IOPB [0xA..B] in 512-byte blocks;
+		// [1] bit0 = addressed mode, address [6..9] relative to the INIT-latched base), but the sector
+		// bytes come from the mounted image's decoded bitstream and the delivery runs at the firmware's
+		// own data phase.
+		if (m_unit_secsize[2])
+		{
+			address_space &bs = m_bus->space(AS_PROGRAM);
+			u32 const heads = m_unit_heads[2], spt = m_unit_spt[2], ssz = m_unit_secsize[2];
+			u32 const count = (u32(cs.read_byte(0x71fa)) << 8) | cs.read_byte(0x71fb);
+			u32 const sec_per_blk = 512 / ssz;
+			u32 htrk = m_unit_trk[2], hsidx = m_unit_sidx[2];
+			if (cs.read_byte(0x71f1) & 1)
+			{
+				u32 const addr = (u32(cs.read_byte(0x71f6)) << 24) | (u32(cs.read_byte(0x71f7)) << 16)
+							   | (u32(cs.read_byte(0x71f8)) << 8)  |  cs.read_byte(0x71f9);
+				u32 const abs_s = m_unit_btrk[2] * spt + m_unit_bsidx[2] + addr;
+				htrk = abs_s / spt;
+				hsidx = abs_s % spt;
+			}
+			u32 const dstb = m_iopb_buffer & 0xffffff;
+			u32 off = 0;
+			for (u32 n = 0; n < count * sec_per_blk && count <= 64; n++)
+			{
+				u32 const cylno = htrk / heads, head = htrk % heads;
+				u32 const sec0 = (ssz == 128 && m_unit_sec0[2] >= 1 && m_unit_sec0[2] <= spt) ? m_unit_sec0[2] : 1;
+				u32 const secid = ((sec0 - 1 + hsidx) % spt) + 1;
+				auto const &htrkdec = decode_track_ids(fdd, cylno, head);
+				dc_sector const *hs = nullptr;
+				for (auto const &c : htrkdec.secs)
+					if (c.r == secid) { hs = &c; break; }
+				for (u32 k = 0; k < ssz; k++)
+					bs.write_byte((dstb + off + k) & 0xffffff, (hs && k < hs->data.size()) ? hs->data[k] : 0);
+				off += ssz;
+				if (++hsidx >= spt) { hsidx = 0; htrk++; }
+			}
+			std::string dd;
+			for (u32 k = 0; k < 12; k++) dd += util::string_format("%02x ", bs.read_byte((dstb + k) & 0xffffff));
+			LOG("DATAOP host-DMA: trk%u.%u -> trk%u.%u (%u blk, %uB sec) -> host %06x first12: %s@%.4f\n",
+					m_unit_trk[2], m_unit_sidx[2], htrk, hsidx, count, ssz, dstb, dd.c_str(), machine().time().as_double());
+			m_unit_trk[2] = htrk; m_unit_sidx[2] = hsidx;
+		}
+	}
+	else
+	{
+		if (!trk.fm)
+			for (u8 v : { 0xa1, 0xa1, 0xa1 }) payload.push_back(v);
+		payload.push_back(0xfe);
+		for (u8 v : { sec.c, sec.h, sec.r, sec.n }) payload.push_back(v);
+		payload.push_back(0x00); payload.push_back(0x00);   // CRC
+		payload.resize(oplen, 0x00);
+	}
+	for (size_t k = 0; k < oplen; k++)
+		cs.write_byte((dst + k) & 0xffff, payload[k]);
+	// post the channel status into the CCB low nibble (the verdict @0x1D86 reads ($7FE8) & 0xF)
+	cs.write_byte(0x7fe9, cs.read_byte(0x7fe9) & 0xf0);   // low nibble 0 = no error (word LE/BE? post both clean)
+	logerror("DATAOP opwords=%u oplen=%u ccb=%04x @%.4f\n", opwords, unsigned(oplen), cs.read_word(0x7fe8), machine().time().as_double());
+	// TEMP LOG (STRIP): the live watch records at delivery time - which cell must the gate array update?
+	{
+		static int n = 0;
+		if (n++ < 6)
+			for (u16 a = 0x72d6; a < 0x72ec; a += 2)
+			{
+				u16 const rec = cs.read_word(a);
+				if (!rec) continue;
+				u16 const wptr = cs.read_word(rec + 2);
+				logerror("WATCHREC @%04x -> %04x: f=%04x watch=%04x(*=%04x) cmp=%04x h=%04x\n",
+						a, rec, cs.read_word(rec), wptr, wptr ? cs.read_word(wptr) : 0, cs.read_word(rec + 4), cs.read_word(rec + 6));
+			}
+	}
+	// post the read-channel status: E01E bit4 = read-OK/no-error, as a held LEVEL (see ch_r)
+	m_ch_op_ok = true;
+	// the disk-channel op completion is LEVEL 6 (autovector trampoline @0x26AE jumps *($7304) =
+	// soft-vector slot 0x18 = the per-command pump the fw registers via $328E) - NOT the level-4
+	// descriptor-engine interrupt
+	LOG("DATAOP deliver cyl%d/s%d C%02x H%02x R%02x N%02x len=%u -> %04x, E01E|=10, IRQ4 @%.4f\n",
+			cyl, side, sec.c, sec.h, sec.r, sec.n, unsigned(sec.data.size()), dst, machine().time().as_double());
+	{ if (m_fw_driven && machine().time().as_double() > 6.5) logerror("IRQ4fire pc=%06x @%.4f\n", m_cpu->pc(), machine().time().as_double()); m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE); }
+}
+
+u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
+{
+	u32 const a = 0xe000 + offset * 2;
+	u16 d = m_ch[offset];
+	if (a == 0xf000)   // status: bit12 (0x1000) = DMA transfer address reached the terminal
+	{
+		u32 const term = 0x4000 | m_dma_term | m_term_bit0;
+		bool const reached = m_dma_active && (m_last_bw == term);
+		// TEMP (STRIP): Dave's DMA-boundary probe - does bit12 (DMA terminal) ever latch for the init read?
+		if (m_fw_driven && machine().time().as_double() > 6.0)
+		{ static int _n = 0; if (_n++ < 30) logerror("F000TERM dma=%d last_bw=%06x term=%06x reached=%d dterm=%04x tb0=%d pc=%06x @%.4f\n",
+			m_dma_active, m_last_bw, term, reached, m_dma_term, m_term_bit0, m_cpu->pc(), machine().time().as_double()); }
+		d = (d & ~0x1000) | (reached ? 0x1000 : 0);        // bit12 = DMA address-match
+		d = (d & ~0x0800) | (m_timer_out ? 0x0800 : 0);    // bit11 = 8253 timer OUT
+		// drive status (floppy 0) - EMPIRICAL bit map (iterating): bit7 = ready/door-closed (5.25" has
+		// no 8" READY -> media present), bit13 = track0, bit10 = write-protect.
+		if (!m_floppy_loaded) load_floppy();   // ensure the motor is spinning early so INDEX pulses
+		floppy_image_device *const fdd = m_floppy[0]->get_device();
+		bool const present = fdd && fdd->exists();
+		bool const trk0 = present && !fdd->trk00_r();   // trk00_r active-low (0 at track 0)
+		bool const wprot = present && !fdd->wpt_r();     // wpt_r active-low (0 = protected)
+		// F000 bit map — VERIFIED against the v260 firmware (NOT the PCMX2-INTEGRATION.md guess, which
+		// mis-placed drive-ready at b8/b9): the drive-scanner @fw 0x767c does btst #5 (ready, must be
+		// SET) with bits 3/0/4 clear; the READ handler @fw 0x5de4 does btst #$d (bit13 = position/track0).
+		// So drive-ready = bit5 (empirical, firmware-confirmed), track0 = bit13, NOT the doc's b8/b9.
+		d = (d & ~0x0080) | (present ? 0x0080 : 0);   // bit7  = drive ready / door-closed
+		d = (d & ~0x0020) | (present ? 0x0020 : 0);   // bit5  = drive READY (VERIFIED: fw 0x767c btst #5)
+		d = (d & ~0x2000) | (trk0 ? 0 : 0x2000);      // bit13 = track 0, ACTIVE-LOW (VERIFIED: fw 0x5de4 btst #$d)
+		d = (d & ~0x0400) | (wprot ? 0x0400 : 0);     // bit10 = write-protect
+		if (m_fw_driven)
+			d = (d & ~0x0002) | (m_settle_out ? 0 : 0x0002);   // bit1 = settle busy (empirical; seek-done polarity UNVERIFIED - keep known-good)
+		else
+			d = (d & ~0x0002) | ((machine().time() < m_seek_deadline) ? 0x0002 : 0);  // bit1 = seek-active (time-windowed shim)
+		d = (d & ~0x0010) | (present && fdd->idx_r() ? 0x0010 : 0);  // bit4 = INDEX pulse (motor spinning)
+		if (m_trace) LOG("  F000 rd pc=%06x bw=%06x term=%06x A0=%04x -> %04x\n", m_cpu->pc(), m_last_bw, term, u16(m_cpu->state_int(M68K_A0)), d);
+	}
+	if ((a == 0xe01e || a == 0xe000) && m_fw_driven && machine().time().as_double() > 5.7)
+	{ static int _n = 0; if (_n++ < 50) logerror("CHrd %04x op_ok=%d serdes=%d pc=%06x @%.4f\n", a, m_ch_op_ok, m_serdes_active, m_cpu->pc(), machine().time().as_double()); }
+	if (a == 0xe01e && (!m_fw_driven || m_ch_op_ok))   // disk-channel error-status register; bit4 = read-OK/
+		d |= 0x0010;   // no-error (result handler 0x1814: btst #4,D1 posts 0x82 ERROR when clear). Non-fw-driven:
+		               // always forced (shim). fw-driven: a LEVEL, held while the last channel op succeeded -
+		               // the fw parameterizes E01E by writing it, so a store-only bit gets clobbered.
+	// E000 = the 74LS1801/1802 ENDEC/SERDES data register: on a read op the firmware pulls each disk
+	// byte in sequence. Serve the current track's raw byte stream (built lazily from the mounted image's
+	// decoded ID+data fields, consumed with wraparound = continuous rotation) - the real hardware path.
+	if (m_fw_driven && a == 0xe000 && m_serdes_active)
+	{
+		floppy_image_device *const fdd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
+		if (fdd)
+		{
+			int const cyl = fdd->get_cyl();
+			int const side = m_cpu->space(AS_PROGRAM).read_word(0x7436) & 1;   // snoop the fw's target head
+			u32 const tkey = (u32(cyl) << 1) | unsigned(side);
+			if (tkey != m_serdes_track) build_serdes_stream(cyl, side);
+			if (!m_serdes_stream.empty())
+			{
+				d = m_serdes_stream[m_serdes_ptr % m_serdes_stream.size()];
+				if (m_trace && m_serdes_ptr < 48) LOG("  SERDES E000[%u] = %02x\n", unsigned(m_serdes_ptr), d);
+				m_serdes_ptr++;
+				m_ch_op_ok = true;   // the ENDEC clocks a good byte -> E01E bit4 = read-OK (the fw checks it
+				                     // after the ID before proceeding to the data; without it the fw rejects)
+			}
+		}
+	}
+	if (m_trace && a != 0xf000) LOG("  CH rd %04x = %04x [%s]\n", a, d, machine().describe_context());
+	return d;
+}
+
+void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	u32 const a = 0xe000 + offset * 2;
+	COMBINE_DATA(&m_ch[offset]);
+	if (m_trace) LOG("  CH wr %04x = %04x [%s]\n", a, data, machine().describe_context());
+	// ACK the level-held HD channel completion IRQ4: the ISR clears the source at 0x3c02-0x3c08 by writing
+	// E800 with bit12 cleared. Level semantics = hold asserted until the fw acknowledges the cause.
+	if (m_hd_chan_irq4 && a == 0xe800 && !BIT(data, 12) && m_cpu->pc() >= 0x3c00 && m_cpu->pc() <= 0x3c10)
+	{
+		m_hd_chan_irq4 = false;
+		m_hd_chan_pending = false;
+		logerror("HDCHAN ack (E800 bit12 clr pc=%06x) -> IRQ4 CLEAR @%.4f\n", m_cpu->pc(), machine().time().as_double());
+		m_cpu->set_input_line(M68K_IRQ_4, CLEAR_LINE);
+	}
+	// SERDES read-arm gating: E000 is multiplexed. The read command (0x2ff) / data-phase mode (0x?fff)
+	// opens the data-read window; the idle/config value (0x23f) closes it. Only while armed does an
+	// E000 READ clock out disk bytes; otherwise the fw is reading channel status/echo (must NOT stream).
+	if (m_fw_driven && a == 0xe000)
+	{
+		if (data == 0x02ff || (data & 0x0fff) == 0x0fff) m_serdes_active = true;
+		else if (data == 0x023f) m_serdes_active = false;
+	}
+	// The gate-array READ DMA (VERIFIED $5FC0 @0x5ede/0x5ee2): the firmware arms the channel for a read
+	// by writing E800 = (op-family from the $63e table, bits 5-7) | bit7; the gate array then DMAs the
+	// raw track bytes into the local SRAM sector buffer at 0x4000, which the fw parses for its sector.
+	// Model it: on the arm, fill 0x4000 with the mounted image's raw track byte stream (build_serdes_
+	// stream - the byte content the ENDEC would clock in). One track = up to 4096 bytes (the fw's count).
+	// Gate strictly to the READ handler's arm write @0x5ede (D2 -> ($6800,A5)); BIT(data,7) alone fires
+	// on ~55 unrelated E800 writes and corrupts the SRAM self-test (@0x9CXX walking-pattern RAM test).
+	if (m_fw_driven && a == 0xe800 && BIT(data, 7) && m_cpu->pc() >= 0x5ed0 && m_cpu->pc() <= 0x5ef0)
+	{
+		floppy_image_device *const fdd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
+		if (fdd)
+		{
+			int const cyl = fdd->get_cyl();
+			int const side = m_cpu->space(AS_PROGRAM).read_word(0x7436) & 1;   // snoop the fw's target head
+			build_serdes_stream(cyl, side);
+			address_space &cs = m_cpu->space(AS_PROGRAM);
+			size_t const n = std::min<size_t>(m_serdes_stream.size(), 0x1000);
+			for (size_t k = 0; k < n; k++)
+				cs.write_byte((0x4000 + k) & 0xffff, m_serdes_stream[k]);
+			m_ch_op_ok = true;   // the ENDEC/74LS1802 reports the read + CRC/ECC OK (E01E bit4); without
+			                     // this the fw treats even a good buffer as a bad read and retries/rejects
+			LOG("GATE-READ-DMA: 0x4000 <- %u track bytes cyl%d side%d (E800 arm %04x)\n",
+					unsigned(n), cyl, side, data);
+		}
+	}
+	// TEMP LOG (STRIP): B0 calibration - E802/E800/E804 writes with the physical cylinder
+	if (a == 0xe802)
+	{
+		static int n = 0; static u16 last = 0xeeee;
+		if (data != last && n++ < 150)
+		{
+			floppy_image_device *const fdd = m_floppy[0]->get_device();
+			logerror("B0 E802 = %04x  cyl=%d pc=%06x @%.4f\n", data, fdd ? fdd->get_cyl() : -1, m_cpu->pc(), machine().time().as_double());
+			last = data;
+		}
+	}
+	// Phase B: the read-channel DATA arm - the fw's IRQ4 sequencer writes the $79CA/CC mode pair
+	// into the E000 file (0x2FFF family, bits 8-11 set distinguish it from the 0x023F idle value).
+	if (m_fw_driven && a == 0xe000 && (data & 0x0fff) == 0x0fff)
+	{
+		LOG("DATAARM E000=%04x (pc=%06x) -> disk op scheduled @%.4f\n", data, m_cpu->pc(), machine().time().as_double());
+		m_dataop->adjust(attotime::from_msec(3));   // ~rotational latency to the next sector
+	}
+	// The E000 ID-capture start ritual: {0x2AF, rd, 0x2FF, rd, mode} with the E802 arm bits (15+11)
+	// set and D800 = the local ID buffer ($7DAC/$7D9E as word addrs).
+	if (a == 0xe000 && data == 0x02ff)
+	{
+		u16 const e802 = m_ch[(0xe802 - 0xe000) / 2];
+		u32 const dst = u32(m_d800) << 1;
+		// TEMP LOG (STRIP): every E000 start, unconditionally
+		{ static int n = 0; if (n++ < 40) logerror("E000START e802=%04x d800=%04x(byte %06x) d000=%04x c800[0]=%04x pc=%06x @%.4f\n",
+				e802, m_d800, dst, m_d000, m_c800[0], m_cpu->pc(), machine().time().as_double()); }
+		if ((e802 & 0x8800) == 0x8800 && (dst == 0x7dac || dst == 0x7d9e))
+		{
+			floppy_image_device *const fdd = m_floppy[0]->get_device();
+			// B0 assertion (Dave): unit / direction / physical cylinder at every capture start
+			LOG("IDCAP start: unit-sel=%02x dir13=%d cyl=%d dst=%04x pc=%06x @%.4f\n",
+					m_ch[(0xe804 - 0xe000) / 2] & 0xff, BIT(e802, 13), fdd ? fdd->get_cyl() : -1,
+					dst, m_cpu->pc(), machine().time().as_double());
+			m_idcap_dst = dst;
+			m_idcap->adjust(attotime::from_msec(2));   // ~next-ID rotational delay (refine later)
+		}
+	}
+
+	// E800 = DMA/channel control.  bit6 = DMA enable (0x?d3 start / 0x?12 stop);
+	// bit9 = 8253 counter-0 gate (timer self-test: 0xc14 gate off -> 0xe14 gate on).
+	if (a == 0xe800)
+	{
+		m_dma_active = BIT(data, 6);
+		m_gate0 = BIT(data, 9);
+		m_pit[1]->write_gate0(BIT(data, 9));
+
+		// kickoff = the RISING EDGE of bit12 (the disk-op does ori #$1000; the IRQ4 handler clears it).
+		// Edge-detect so incidental E800 writes that carry bit12 (e.g. the IRQ1 timer handler) don't
+		// re-trigger a transfer mid-DMA.
+		bool const kick = BIT(data, 12) && !m_e800_bit12_prev;
+		m_e800_bit12_prev = BIT(data, 12);
+
+		// channel-start: E800 bit12 (0x1000) launches the transfer (disk-op sets it via ori #$1000).
+		// Dump the DMA setup so the data path can be mapped: D000 (local word addr), the active C800
+		// scatter/gather entries (Multibus page translation), and CPU regs (descriptor pointer A3).
+		if (kick && m_trace)
+		{
+			address_space &cs = m_cpu->space(AS_PROGRAM);
+			LOG("CHANSTART E800=%04x D000=%04x(byte %06x) A2=%04x A3=%04x D0=%04x D1=%04x\n",
+				data, m_d000, u32(m_d000) << 1,
+				u16(m_cpu->state_int(M68K_A2)), u16(m_cpu->state_int(M68K_A3)),
+				u16(m_cpu->state_int(M68K_D0)), u16(m_cpu->state_int(M68K_D1)));
+			std::string sg;
+			for (unsigned i = 0; i < 0x80; i++)
+				if (m_c800[i]) sg += util::string_format(" [%02x]=%04x", i, m_c800[i]);
+			LOG("CHANSTART C800:%s\n", sg.empty() ? " (empty)" : sg.c_str());
+			u16 const a3 = u16(m_cpu->state_int(M68K_A3));
+			std::string ds;
+			for (int k = -8; k <= 12; k += 2) ds += util::string_format(" %04x", cs.read_word((a3 + k) & 0xffff));
+			LOG("CHANSTART A3-descr:%s\n", ds.c_str());
+			// dump the D000 local buffer + the 0x7440 work buffer: look for the Multibus addr 0x0fe780
+			// (bytes 0f e7 80, or word 0xf3c0 = 0x0fe780>>1) = a memory-resident DMA descriptor.
+			u16 const db = u16(m_d000) << 1;
+			std::string lb;
+			for (int k = -16; k <= 16; k += 2) lb += util::string_format(" %04x", cs.read_word((db + k) & 0xffff));
+			LOG("CHANSTART D000buf @%04x:%s\n", db, lb.c_str());
+			std::string wb;
+			for (u16 k = 0x7430; k < 0x7460; k += 2) wb += util::string_format(" %04x", cs.read_word(k));
+			LOG("CHANSTART 7440buf:%s\n", wb.c_str());
+		}
+
+		// A real transfer (D000 set) launched: the gate array runs it and raises IRQ4 on completion
+		// (the IRQ4 handler at 0x3bfe clears E800 bit12).  Pulse IRQ4 so the command completes.
+		if (kick && m_d000)
+		{
+			// The gate array autonomously bus-masters CPUAP RAM: on the first transfer of a command it
+			// fetches the IOPB (the firmware never relocates the pointer - it lives only in the mailbox
+			// at 0x7ff9-0x7ffb).  Byte-for-byte copy CPUAP RAM -> local D000<<1 (no endian swap; a real
+			// byte DMA).  TEST: verify the destination via the debugger - 0x71f0 may be worker code.
+			address_space &cs = m_cpu->space(AS_PROGRAM);
+			address_space &bs = m_bus->space(AS_PROGRAM);
+			u32 const dst = u32(m_d000) << 1;
+			if (!m_iopb_fetched)
+			{
+				// 1st kickoff: fetch the IOPB from the mailbox pointer (V/SMD 3200 format).
+				m_iopb_fetched = true;
+				u32 const iopb = (u32(cs.read_byte(0x7ff9)) << 16) | (u32(cs.read_byte(0x7ffa)) << 8) | cs.read_byte(0x7ffb);
+				// the host IOPB is 14 words (0x1c bytes); copy ONLY that - 0x1c+ is the firmware's
+				// own work area (clobbering it with host data faults on a stale odd pointer).
+				for (u32 k = 0; k < 0x1c; k++)
+					cs.write_byte((dst + k) & 0xffff, bs.read_byte((iopb + k) & 0xffffff));
+				m_iopb_cmd = cs.read_byte(dst);   // w0 high byte = command
+				m_iopb_buffer = ((u32(cs.read_byte(dst + 0xc)) << 24) | (u32(cs.read_byte(dst + 0xd)) << 16)
+					| (u32(cs.read_byte(dst + 0xe)) << 8) | cs.read_byte(dst + 0xf)) & 0xffffff;  // words 6-7
+				m_iopb_addr = iopb;
+				// post BUSY (0x81) to the host IOPB status (CPUAP polls IOPB+2 for 0x81->0x80).
+				bs.write_byte((iopb + 2) & 0xffffff, 0x81);
+				bs.write_byte((iopb + 3) & 0xffffff, 0x81);
+				if (m_trace) LOG("GATE-DMA IOPB fetch: CPUAP %06x -> local %04x; cmd=%02x buffer=%06x\n", iopb, dst, m_iopb_cmd, m_iopb_buffer);
+			}
+			else if (m_iopb_cmd == 0x89)
+			{
+				// RESTORE: the position model returns to track 0 sector 0 (the physical drive
+				// recalibrates via the fw's own step loop; keep the logical model in step)
+				u32 const unit = cs.read_byte((dst + 4) & 0xffff) & 3;
+				m_unit_trk[unit] = 0;
+				m_unit_sidx[unit] = 0;
+			}
+			else if (m_iopb_cmd == 0x87)
+			{
+				// INITIALIZE: the controller reads the host-supplied UIB (drive geometry) from the
+				// IOPB buffer addr into local RAM.  Host -> controller.  Copy only 0x1c bytes so the
+				// firmware work area at dst+0x1c (read by later commands, e.g. RESTORE's ($24,A0)) survives.
+				// STEP 131: latch the per-unit geometry the host declares - UIB[0]=heads, UIB[1]=sectors/track,
+				// UIB[2-3]=bytes/sector (LE, NS32016-authored).  Unit from the IOPB byte[4] BEFORE the UIB
+				// copy overwrites the local block.
+				u32 const unit = cs.read_byte((dst + 4) & 0xffff) & 3;
+				for (u32 k = 0; k < 0x1c; k++)
+					cs.write_byte((dst + k) & 0xffff, bs.read_byte((m_iopb_buffer + k) & 0xffffff));
+				m_unit_heads[unit] = bs.read_byte(m_iopb_buffer & 0xffffff);
+				m_unit_spt[unit] = bs.read_byte((m_iopb_buffer + 1) & 0xffffff);
+				m_unit_secsize[unit] = u16(bs.read_byte((m_iopb_buffer + 2) & 0xffffff)) | (u16(bs.read_byte((m_iopb_buffer + 3) & 0xffffff)) << 8);
+				m_unit_sec0[unit] = bs.read_byte((m_iopb_buffer + 4) & 0xffffff);
+				m_unit_btrk[unit] = m_unit_trk[unit];   // latch the INIT-time position = base for addressed reads
+				m_unit_bsidx[unit] = m_unit_sidx[unit];
+				LOG("INIT unit%u: heads=%u spt=%u secsize=%u sec0=%u base=trk%u.%u @%.4f\n", unit, m_unit_heads[unit], m_unit_spt[unit], m_unit_secsize[unit], m_unit_sec0[unit], m_unit_btrk[unit], m_unit_bsidx[unit], machine().time().as_double());
+				if (getenv("STORAGER_UNITLOG"))   // TEMP (STRIP): the sector size the KERNEL declares for this HD unit (512 vs 1024 = the question)
+					logerror("UNITINIT unit%u: heads=%u spt=%u secsize=%u sec0=%u @%.4f\n", unit, m_unit_heads[unit], m_unit_spt[unit], m_unit_secsize[unit], m_unit_sec0[unit], machine().time().as_double());
+			}
+			// The REAL fix for the re-delivery is the channel-completion signalling below (m_ch_op_ok +
+			// IRQ4): without it the firmware never sees "op OK" and re-kicks the command (a late retry that
+			// clobbers the buffer).  With it the read completes on the first pass; m_read_pending additionally
+			// gates the DATA transfer to once per command so the firmware's per-phase (seek/ID/data) kickoffs
+			// don't each re-DMA the whole block.  A real controller streams a read's sectors exactly once.
+			else if (m_fw_driven && cs.read_byte(dst) == 0x95 && m_read_pending)   // fw-driven; HLE uses read95_deliver
+			{                                     // a later non-read kickoff, e.g. cmd 0xFE, must not deliver)
+				// STEP 327: ESDI HD read leg. IOPB[4] = unit (2=floppy, 0/1=ESDI HD). For an HD unit, read
+				// the mounted MC1325 image at LBA (IOPB[6-9] BE) x 512, count (IOPB[a-b] BE) x 512 bytes ->
+				// the CPUAP host buffer. 512B physical sectors (ESDI Micropolis, 35 spt); the SINIX label is
+				// at LBA 0 ("SINIXdisklayout MC1325"). Same deliver-then-done completion as the floppy.
+				u32 const runit = cs.read_byte((dst + 4) & 0xffff) & 7;
+				logerror("BYPASS entry runit=%u iopb_buf=%06x rp=%d @%.4f\n", runit, m_iopb_buffer & 0xffffff, m_read_pending, machine().time().as_double());   // TEMP (STRIP)
+				if (runit < 2 && m_iopb_buffer)
+				{
+					u32 const lba = (u32(cs.read_byte((dst + 6) & 0xffff)) << 24) | (u32(cs.read_byte((dst + 7) & 0xffff)) << 16)
+								  | (u32(cs.read_byte((dst + 8) & 0xffff)) << 8) | cs.read_byte((dst + 9) & 0xffff);
+					u32 const count = std::max<u32>(1u, (u32(cs.read_byte((dst + 0xa) & 0xffff)) << 8) | cs.read_byte((dst + 0xb) & 0xffff));
+					if (m_hd[runit]->exists() && count <= 512)
+					{
+						std::vector<u8> sec(size_t(count) * 1024, 0);
+						m_hd[runit]->img_read(u64(lba) * 1024, sec.data(), u32(sec.size()));
+						for (u32 k = 0; k < u32(sec.size()); k++)
+							bs.write_byte((m_iopb_buffer + k) & 0xffffff, sec[k]);
+						if (m_iopb_addr)
+						{
+							bs.write_byte((m_iopb_addr + 2) & 0xffffff, 0x80);
+							bs.write_byte((m_iopb_addr + 3) & 0xffffff, 0x80);
+							bs.write_byte(0x0fe782, 0x80);
+							bs.write_byte(0x0fe783, 0x80);
+						}
+						// Signal CHANNEL completion the same way the floppy DATAOP path does: set E01E bit4
+						// (read-OK, polled by the fw in ch_r) and raise the completion IRQ4.  Without these
+						// the firmware's channel wait never sees "op OK", so it RE-KICKS the same command (the
+						// retry loop) - a subsequent kickoff then re-delivers and clobbers the buffer.  Posting
+						// the host IOPB DONE (above) alone is not enough; the fw waits on the channel status.
+						m_ch_op_ok = true;
+						{ if (m_fw_driven && machine().time().as_double() > 6.5) logerror("IRQ4fire pc=%06x @%.4f\n", m_cpu->pc(), machine().time().as_double()); m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE); }
+						m_read_pending = false;
+						LOG("HD READ host-DMA: unit%u lba%u x%ublk*1024 -> CPUAP %06x (%u B) first16: %.16s@%.4f\n",
+								runit, lba, count, m_iopb_buffer, u32(sec.size()), reinterpret_cast<char *>(sec.data()), machine().time().as_double());
+					}
+				}
+				// READ host-DMA. The 68K has read the sector(s) through the disk channel (the DATAOP
+				// staging) and programmed this DMA (IOPB words 6-7 = host dest, count in the IOPB); the
+				// gate array now MOVES the data across the Multibus to the CPUAP. Model the gate-array
+				// DMA: serve the sought sectors' raw bytes from the mounted floppy (decode_track_ids -
+				// the same source the disk channel decoded) into the host buffer, in logical order from
+				// the drive's current position. This is find-by-position + gate-array DMA, no protocol.
+				floppy_image_device *const fdd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
+				if (runit >= 2 && fdd && m_iopb_buffer)
+				{
+					if (!m_floppy_loaded) load_floppy();   // a live swap invalidates the map; reload from the newly-mounted image
+					int const cyl = fdd->get_cyl();
+					int const side = cs.read_word(0x7436) & 1;   // the fw's target head
+					// PORTED from the HLE overlay (the proven mapping): the CPUAP reads 512-BYTE LOGICAL
+					// BLOCKS; each = sec_per_blk=512/ssz media sectors. Deliver count*sec_per_blk sectors,
+					// logical->physical via sec0 (FM trk0: 7=VOL1 first), advancing across tracks. fw-driven
+					// doesn't INIT the units, so derive geometry from the decoded track (heads=2).
+					// Geometry keyed off the POSITION (physical track layout, VERIFIED from the IMD):
+					// htrk 0-1 (cyl0/h0-1) = FM 128B / sec0=7 (VOL1 label); htrk 2+ = MFM 256B / sec0=13
+					// (boot loader + kernel). This is authoritative + sidesteps (a) the fw drive-probe
+					// re-INIT that clobbers m_unit_secsize, and (b) decode_track_ids reading the MFM ID's
+					// N=2 as 512 (the physical sector is 256). The CPUAP's read is uniform per its re-INIT.
+					u32 const heads = m_unit_heads[2] ? m_unit_heads[2] : 2u;
+					u32 const spt = m_unit_spt[2] ? m_unit_spt[2] : 16u;
+					u32 htrk = m_unit_trk[2], hsidx = m_unit_sidx[2];
+					u32 const ssz = (htrk < 2) ? 128u : 256u;
+					u32 const sec0u = (htrk < 2) ? 7u : 1u;   // FM: R7=VOL1 (logical 0); MFM: R1 (the HLE
+					                                          // uses sec0 only for FM; MFM logical 0 = R1)
+					u32 const sec_per_blk = std::max<u32>(1u, 512u / ssz);
+					u32 const count = (u32(cs.read_byte((dst + 0xa) & 0xffff)) << 8) | cs.read_byte((dst + 0xb) & 0xffff);   // BLOCKS
+					if (cs.read_byte((dst + 1) & 0xffff) & 1)   // addressed mode: position = INIT base + addr
+					{
+						u32 const addr = (u32(cs.read_byte((dst + 6) & 0xffff)) << 24) | (u32(cs.read_byte((dst + 7) & 0xffff)) << 16)
+									   | (u32(cs.read_byte((dst + 8) & 0xffff)) << 8) | cs.read_byte((dst + 9) & 0xffff);
+						u32 const abs_s = m_unit_btrk[2] * spt + m_unit_bsidx[2] + addr;
+						htrk = abs_s / spt; hsidx = abs_s % spt;
+					}
+					u32 off = 0; u8 firstr = 0;
+					for (u32 n = 0; n < count * sec_per_blk && count <= 64; n++)
+					{
+						u32 const cylno = htrk / heads, head = htrk % heads;
+						u32 const secid = ((sec0u - 1 + hsidx) % spt) + 1;
+						// serve from m_sectors (the direct IMD sector map from load_floppy) - the SAME source
+						// the HLE read95_deliver uses; decode_track_ids' bitstream decode fails on these MFM
+						// tracks (falls to FM garbage). The direct map has the correct 128B FM / 256B MFM data.
+						auto const it = m_sectors.find((cylno << 16) | (head << 8) | secid);
+						if (!n) firstr = u8(secid);
+						for (u32 k = 0; k < ssz; k++)
+							bs.write_byte((m_iopb_buffer + off + k) & 0xffffff, (it != m_sectors.end() && k < it->second.size()) ? it->second[k] : 0);
+						off += ssz;
+						if (++hsidx >= spt) { hsidx = 0; htrk++; }
+					}
+					m_unit_trk[2] = htrk; m_unit_sidx[2] = hsidx;   // advance the running position
+					// STEP 324: deliver-THEN-done. The data is now in the host buffer, so NOW post DONE
+					// (0x81->0x80) + clear m_read_pending. The CPUAP's read helper (CXP 0x2B) polls
+					// IOPB+2 / 0x0fe782 for 0x80 and returns; with the data already written it reads the
+					// fresh boot-image magic 0x10B (STEP 323: else it read stale VOL1 1us early).
+					if (m_iopb_addr)
+					{
+						bs.write_byte((m_iopb_addr + 2) & 0xffffff, 0x80);
+						bs.write_byte((m_iopb_addr + 3) & 0xffffff, 0x80);
+						bs.write_byte(0x0fe782, 0x80);
+						bs.write_byte(0x0fe783, 0x80);
+					}
+					m_ch_op_ok = true;   // channel-op-OK (E01E bit4) + IRQ4 - see the HD read leg: without
+					{ if (m_fw_driven && machine().time().as_double() > 6.5) logerror("IRQ4fire pc=%06x @%.4f\n", m_cpu->pc(), machine().time().as_double()); m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE); }   // this the fw retries the op and re-delivers
+					m_read_pending = false;
+					std::string dd;
+					for (u32 k = 0; k < 12 && k < off; k++) dd += util::string_format("%02x ", bs.read_byte((m_iopb_buffer + k) & 0xffffff));
+					LOG("READ host-DMA: cyl%d s%d x%ublk*%u ssz%u R%u.. -> CPUAP %06x (%u B) first12: %s@%.4f\n",
+							cyl, side, count, sec_per_blk, ssz, firstr, m_iopb_buffer, off, dd.c_str(), machine().time().as_double());
+				}
+			}
+			else if (m_fw_driven && cs.read_byte(dst) == 0x94)   // EXTRAPOLATED floppy WRITE (STEP 326)
+			{
+				// WRITE host-DMA = the MIRROR of the 0x95 READ leg, REVERSED (host buffer -> media).
+				// *** UNTESTED: the boot path issues no writes, so the write IOPB cmd (0x94 here) is
+				// EXTRAPOLATED, NOT observed - confirm the opcode + option/direction bits against a real
+				// write (SINIX install/mkfs on the floppy) when a write scenario is testable. ***
+				// Flow (from the read + the SASI 0x0a IOREG write ~line 909): the CPUAP has already placed
+				// the source data in the host buffer (IOPB words 6-7); the fw seeks + ID-verifies via the
+				// SAME DATAOP path, then programs the gate-array host-DMA in the WRITE direction (gate array
+				// reads the host buffer + writes the disk). Model: consume the host bytes into m_sectors (the
+				// same map the read serves from). Geometry IDENTICAL to the read (position-keyed).
+				// STEP 364: HD-unit (0/1) writes go to the HD IMAGE, mirroring the cmd-0x95 HD read leg
+				// (~line 1636) REVERSED (host buffer -> HD). The 0x94 leg was floppy-only (m_sectors), so HD
+				// writes were mis-routed to the floppy and never reached the HD - the "broken after format" /
+				// "/: file system full" root cause. Same LBA[6..9]/count[a..b] units + deliver-then-DONE/IRQ4.
+				u32 const wunit = cs.read_byte((dst + 4) & 0xffff) & 7;
+				if (wunit < 2 && m_iopb_buffer)
+				{
+					u32 const lba = (u32(cs.read_byte((dst + 6) & 0xffff)) << 24) | (u32(cs.read_byte((dst + 7) & 0xffff)) << 16)
+								  | (u32(cs.read_byte((dst + 8) & 0xffff)) << 8) | cs.read_byte((dst + 9) & 0xffff);
+					u32 const count = std::max<u32>(1u, (u32(cs.read_byte((dst + 0xa) & 0xffff)) << 8) | cs.read_byte((dst + 0xb) & 0xffff));
+					if (m_hd[wunit]->exists() && count <= 512)
+					{
+						std::vector<u8> sec(size_t(count) * 1024, 0);
+						for (u32 k = 0; k < u32(sec.size()); k++)
+							sec[k] = bs.read_byte((m_iopb_buffer + k) & 0xffffff);   // HOST buffer -> staging
+						m_hd[wunit]->img_write(u64(lba) * 1024, sec.data(), u32(sec.size()));   // staging -> HD image
+						if (m_iopb_addr)
+						{
+							bs.write_byte((m_iopb_addr + 2) & 0xffffff, 0x80);
+							bs.write_byte((m_iopb_addr + 3) & 0xffffff, 0x80);
+							bs.write_byte(0x0fe782, 0x80);
+							bs.write_byte(0x0fe783, 0x80);
+						}
+						m_ch_op_ok = true;
+						m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE);
+						m_read_pending = false;
+						LOG("HD WRITE cmd94 unit%u LBA%06x x%ublk -> HD image @%.4f\n", wunit, lba, count, machine().time().as_double());
+					}
+				}
+				floppy_image_device *const fdd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
+				if (wunit >= 2 && fdd && m_iopb_buffer)
+				{
+					int const cyl = fdd->get_cyl();
+					int const side = cs.read_word(0x7436) & 1;
+					u32 const heads = m_unit_heads[2] ? m_unit_heads[2] : 2u;
+					u32 const spt = m_unit_spt[2] ? m_unit_spt[2] : 16u;
+					u32 htrk = m_unit_trk[2], hsidx = m_unit_sidx[2];
+					u32 const ssz = (htrk < 2) ? 128u : 256u;
+					u32 const sec0u = (htrk < 2) ? 7u : 1u;
+					u32 const sec_per_blk = std::max<u32>(1u, 512u / ssz);
+					u32 const count = (u32(cs.read_byte((dst + 0xa) & 0xffff)) << 8) | cs.read_byte((dst + 0xb) & 0xffff);
+					if (cs.read_byte((dst + 1) & 0xffff) & 1)   // addressed mode: position = INIT base + addr
+					{
+						u32 const addr = (u32(cs.read_byte((dst + 6) & 0xffff)) << 24) | (u32(cs.read_byte((dst + 7) & 0xffff)) << 16)
+									   | (u32(cs.read_byte((dst + 8) & 0xffff)) << 8) | cs.read_byte((dst + 9) & 0xffff);
+						u32 const abs_s = m_unit_btrk[2] * spt + m_unit_bsidx[2] + addr;
+						htrk = abs_s / spt; hsidx = abs_s % spt;
+					}
+					u32 off = 0; u8 firstr = 0; u32 dropped = 0;
+					for (u32 n = 0; n < count * sec_per_blk && count <= 64; n++)
+					{
+						u32 const cylno = htrk / heads, head = htrk % heads;
+						u32 const secid = ((sec0u - 1 + hsidx) % spt) + 1;
+						auto it = m_sectors.find((cylno << 16) | (head << 8) | secid);
+						if (!n) firstr = u8(secid);
+						for (u32 k = 0; k < ssz; k++)
+						{
+							u8 const b = bs.read_byte((m_iopb_buffer + off + k) & 0xffffff);   // HOST -> DISK
+							if (it != m_sectors.end() && k < it->second.size())
+								it->second[k] = b;
+							else
+								dropped++;   // no target sector/size = an INCOMPLETE write (would corrupt the fs)
+						}
+						off += ssz;
+						if (++hsidx >= spt) { hsidx = 0; htrk++; }
+					}
+					m_unit_trk[2] = htrk; m_unit_sidx[2] = hsidx;
+					// completion: data consumed to the media map; post DONE + clear pending (same order-safe
+					// pattern as the read). NOTE: m_sectors is the in-SESSION floppy image; like the HLE IOREG
+					// write it is NOT flushed to the .imd on exit (miniroot writes are session-local). For
+					// durable floppy writes, also write the floppy_image_device here.
+					if (m_iopb_addr)
+					{
+						bs.write_byte((m_iopb_addr + 2) & 0xffffff, 0x80);
+						bs.write_byte((m_iopb_addr + 3) & 0xffffff, 0x80);
+						bs.write_byte(0x0fe782, 0x80);
+						bs.write_byte(0x0fe783, 0x80);
+					}
+					m_ch_op_ok = true;   // channel-op-OK (E01E bit4) + IRQ4: a WRITE the fw never sees complete
+					{ if (m_fw_driven && machine().time().as_double() > 6.5) logerror("IRQ4fire pc=%06x @%.4f\n", m_cpu->pc(), machine().time().as_double()); m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE); }   // is retried too -> re-delivery corrupts (the
+					                                                // "format failure": retried verify/write stomps the miniroot)
+					m_read_pending = false;
+					LOG("WRITE host-DMA (EXTRAPOLATED/UNTESTED): cyl%d s%d x%ublk*%u ssz%u R%u.. <- CPUAP %06x (%u B, %u dropped)@%.4f\n",
+							cyl, side, count, sec_per_blk, ssz, firstr, m_iopb_buffer, off, dropped, machine().time().as_double());
+				}
+			}
+			// Completion edge: post DONE (0x80) to the IOPB status for non-data commands. For cmd 0x95
+			// (READ) DON'T post the CPUAP DONE directly - the fw drives the completion IRQ with its own
+			// pacing (gate-array m_ch_op_ok/m_dataop below). Posting it instantly here short-circuited the
+			// fw's ~2s processing window so the CPUAP issued read 2 early and never reached read 3
+			// (STEP 317). Matches the HLE, which also never posts DONE here for cmd 0x95.
+			if (m_iopb_addr && m_iopb_cmd != 0x95)
+			{
+				bs.write_byte((m_iopb_addr + 2) & 0xffffff, 0x80);
+				bs.write_byte((m_iopb_addr + 3) & 0xffffff, 0x80);
+				bs.write_byte(0x0fe782, 0x80);
+				bs.write_byte(0x0fe783, 0x80);
+			}
+			// fw-driven mode: the IRQ4 ISR is the phase sequencer - it builds the descriptor,
+			// programs E800 from the +0xA/+0xC masks and the $63E op table, loads D000, and RE-KICKS
+			// (fw @0x3D42). That second kick IS the disk operation: perform it with rotational pacing
+			// and let its completion IRQ4 drive the ISR's continuation.
+			// fw-driven cmd95: every post-fetch kick is a channel op - the gate array performs it
+			// (content by the E800 op family) and completes on the level-4 descriptor interrupt.
+			// (Level 6 = the transfer-stage pump, reached only after the verify chain concludes.)
+			if (m_fw_driven && m_iopb_cmd == 0x95)
+			{
+				// the fw's op wait window is short (~1.5ms observed) - the baseline completed
+				// synchronously at the kick; deliver just-async (100us) to stay inside it
+				m_ch_op_ok = false;   // the new op is in flight
+				LOG("DISKOP kick E800=%04x D000=%04x -> delivery in 100us @%.4f\n", data, m_d000, machine().time().as_double());
+				// TEMP (STRIP): Dave's ID-verify comparison probe at every cmd-0x95 kick
+				{
+					address_space &xs = m_cpu->space(AS_PROGRAM);
+					logerror("IDVFY E800=%04x | want C=%04x H=%04x R=%04x | ID7dac=%02x%02x%02x.%02x C%02x H%02x R%02x N%02x"
+							 " | 7950=%04x 79a4=%04x 7a0c=%04x 741c=%04x | req 71bc=%04x 71be=%04x"
+							 " | node +12=%04x +14=%04x +18=%04x +1a=%04x +20=%04x | E01E=%04x @%.4f\n",
+						data, xs.read_word(0x7438), xs.read_word(0x7436), xs.read_word(0x7428),
+						xs.read_byte(0x7dac), xs.read_byte(0x7dad), xs.read_byte(0x7dae), xs.read_byte(0x7daf),
+						xs.read_byte(0x7db0), xs.read_byte(0x7db1), xs.read_byte(0x7db2), xs.read_byte(0x7db3),
+						xs.read_word(0x7950), xs.read_word(0x79a4), xs.read_word(0x7a0c), xs.read_word(0x741c),
+						xs.read_word(0x71bc), xs.read_word(0x71be),
+						xs.read_word(0x749c), xs.read_word(0x749e), xs.read_word(0x74a2), xs.read_word(0x74a4), xs.read_word(0x74aa),
+						m_ch[(0xe01e - 0xe000) / 2], machine().time().as_double());
+				}
+				m_dataop->adjust(attotime::from_usec(100));
+				// Dave #2: latch a deferred gate-array channel completion for the armed descriptor node.
+				if (!m_hd_chan_irq4)
+				{
+					u16 node = m_cpu->space(AS_PROGRAM).read_word(0x743a);
+					if (node != 0x748a && node != 0x7442) node = 0x748a;   // fallback to the known verify node
+					m_hd_chan_node = node;
+					m_hd_chan_pending = true;
+					m_hd_chan_tries = 0;
+					m_hd_chan->adjust(attotime::from_usec(20));
+				}
+				return;
+			}
+			if (m_fw_driven && m_iopb_cmd == 0x95 && m_trace)
+			{
+				LOG("CHANKICK (fw-driven, no auto-complete) cmd=%02x D000=%04x D800=%04x C800[0]=%04x @%.4f\n",
+						m_iopb_cmd, m_d000, m_d800, m_c800[0], machine().time().as_double());
+				// TEMP LOG (STRIP): the live descriptor chain - anchor *($743A) + the two static queues
+				u16 const anchor = cs.read_word(0x743a);
+				std::string dd;
+				for (int k = 0; k < 0x20; k += 2) dd += util::string_format(" %04x", cs.read_word((anchor + k) & 0xffff));
+				LOG("DESCR anchor=%04x:%s\n", anchor, dd.c_str());
+				for (u16 base : { u16(0x7442), u16(0x748a) })
+				{
+					std::string qd;
+					for (int k = 0; k < 0x28; k += 2) qd += util::string_format(" %04x", cs.read_word(base + k));
+					LOG("DESCR q%04x:%s\n", base, qd.c_str());
+				}
+				LOG("DESCR e000file: %04x %04x %04x %04x  e800=%04x e802=%04x e804=%04x\n",
+						m_ch[0], m_ch[1], m_ch[2], m_ch[3],
+						m_ch[(0xe800 - 0xe000) / 2], m_ch[(0xe802 - 0xe000) / 2], m_ch[(0xe804 - 0xe000) / 2]);
+				std::string wb;
+				for (u16 k = 0x7430; k < 0x7460; k += 2) wb += util::string_format(" %04x", cs.read_word(k));
+				LOG("DESCR work7430:%s\n", wb.c_str());
+			}
+			if (m_trace) LOG("CHANCOMPLETE -> IRQ4 (D000 byte %06x)\n", u32(m_d000) << 1);
+			{ if (m_fw_driven && machine().time().as_double() > 6.5) logerror("IRQ4fire pc=%06x @%.4f\n", m_cpu->pc(), machine().time().as_double()); m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE); }
+		}
+		// (the old EPROM->RAM shadow-load is gone: the worker code is fetched directly from ROM via the
+		// AS_OPCODES program/data split; RAM at 0x4000-0x7fff is data-only, so it stays uncorrupted.)
+	}
+
+	// E802 = interrupt control.  bit6 = the IRQ2 ack the handler toggles on entry.  bit7 (set only at
+	// command completion, e.g. 0x00c1 @pc 0x18ec) = assert the host completion interrupt to the CPUAP.
+	if (a == 0xe802)
+	{
+		m_cpu->set_input_line(M68K_IRQ_2, CLEAR_LINE);
+		bool const prev_step = m_e802_step;
+		unsigned const stepbit = m_fw_driven ? 6 : 0;   // fw: verified bit6; HLE: known-good bit0
+		m_e802_step = BIT(data, stepbit);   // bit6 = STEP - VERIFIED @fw 0x24ae (andi #$ffbf / ori #$40 on the
+		                              // $79f8 E802 shadow); the fw's seek loop pulses it + polls F000 trk0.
+		if (floppy_image_device *const fdd = m_floppy[0]->get_device())
+		{
+			// transfer ARM: bit15 rising while a fw-driven READ is active = the gate-array channel
+			// op starts (the fw's transfer stage arms after installing the level-6 pump); deliver
+			// the target sector one sector-time later and interrupt on level 6
+			if (m_fw_driven && m_iopb_cmd == 0x95 && BIT(data, 15) && !BIT(m_e802_prev, 15))
+			{
+				LOG("DATAARM E802 %04x (pc=%06x) -> delivery in 4ms @%.4f\n", data, m_cpu->pc(), machine().time().as_double());
+				m_dataop->adjust(attotime::from_msec(4));
+			}
+			m_e802_prev = data;
+			// E802 bit13 = step DIRECTION (fw @0x1066/0x1088: bit13 SET pairs with the +1 position
+			// delta = inward/higher cylinders, CLEAR with -1 = outward; MAME dir_w: 0 = increment).
+			// B0-calibrated 2026-07-02: the RESTORE full-stroke (bit13 clear) must move toward cyl 0.
+			fdd->dir_w(BIT(data, 13) ? 0 : 1);
+			fdd->stp_w(BIT(data, stepbit));   // MAME steps on the 1->0 edge; dir_w=1 -> toward track 0
+			m_pit[0]->write_gate1(BIT(data, stepbit));   // STEP retriggers the settle one-shot (pit0 ch1 mode 5)
+			if (!prev_step && BIT(data, stepbit)) m_seek_deadline = machine().time() + attotime::from_msec(50);   // STEP edge -> 40ms track-to-track + 10ms settle (datasheet)
+		}
+		bool const host_int = BIT(data, 7);   // bit7 = host completion interrupt LEVEL (set 0x18e0, cleared 0x506e)
+		if (host_int && !m_host_int_prev && m_iopb_addr)
+		{
+			// rising edge = command completion: post DONE (0x80) to the host IOPB status.
+			address_space &bs = m_bus->space(AS_PROGRAM);
+			bs.write_byte((m_iopb_addr + 2) & 0xffffff, 0x80);
+			bs.write_byte((m_iopb_addr + 3) & 0xffffff, 0x80);
+			if (m_trace) LOG("HOST-INT rise: iopb %06x status 0x80 + CPUAP int asserted\n", m_iopb_addr);
+		}
+		// The classic channel's completion is consumed by POLLING the IOPB status (ROM monitor and
+		// boot loader both do); do NOT drive the Multibus interrupt lines from it - INT2 is the
+		// kernel's sa interrupt (ioreg channel), and a stale level here sits pending until the
+		// kernel first unmasks, then storms IR3.
+		m_host_int_prev = host_int;
+	}
+}
+
+void multibus_storager_device::floppy_formats(format_registration &fr)
+{
+	fr.add_mfm_containers();
+	fr.add(FLOPPY_IMD_FORMAT);
+}
+
+static void storager_floppies(device_slot_interface &device)
+{
+	device.option_add("525qd", FLOPPY_525_QD);   // 5.25" 80-track DS (SINIX media); refine for FM/MFM rate
+}
+
+void multibus_storager_device::device_add_mconfig(machine_config &config)
+{
+	M68000(config, m_cpu, 50_MHz_XTAL / 4);
+	m_cpu->set_addrmap(AS_PROGRAM, &multibus_storager_device::mem_map);
+	m_cpu->set_addrmap(AS_OPCODES, &multibus_storager_device::opcodes_map);   // fetches see ROM at 0x4000+
+
+	// floppy drives (5.25" DS); the SINIX boot media is on drive 0.  Status (track0/wp/door-closed) ->
+	// F000, control (motor/dir/step/side/select) <- E804, per Dave's hardware guidance.
+	FLOPPY_CONNECTOR(config, m_floppy[0], storager_floppies, "525qd", multibus_storager_device::floppy_formats);
+	FLOPPY_CONNECTOR(config, m_floppy[1], storager_floppies, nullptr, multibus_storager_device::floppy_formats);
+
+	// ESDI rigid disks (MC1325 et al) as raw images.  Two physical drives = two Storager LUNs:
+	// unit 0 = -hard1 (SINIX root+usr), unit 1 = -hard2 (usr_db+usr_sma).  SINIX minor encodes the
+	// LUN in bit 3 (minor>>3), so 0,11 / 0,13 select drive 1 -- the disk paths index m_hd[unit].
+	STORAGER_HD_IMAGE(config, m_hd[0], 0);
+	STORAGER_HD_IMAGE(config, m_hd[1], 0);
+
+	// two 8253 PITs.  pit[1] counter 0 (loaded via $8001/$8007) drives F000 bit 11 in the timer
+	// self-test; clock estimated at 10MHz/8 = 1.25MHz (pending schematic confirmation).
+	PIT8253(config, m_pit[0]);
+	m_pit[0]->set_clk<0>(10_MHz_XTAL / 8);
+	m_pit[0]->set_clk<1>(10_MHz_XTAL / 8);
+	m_pit[0]->set_clk<2>(10_MHz_XTAL / 8);
+	// ch1 = mode-5 hardware-triggered one-shot per the fw's init ($8006 <- 0x7A): the seek-settle
+	// timer, (re)triggered by the STEP line on its gate; OUT low = settling (F000 bit1 busy)
+	m_pit[0]->out_handler<1>().set([this](int state) { m_settle_out = state; });
+	PIT8253(config, m_pit[1]);
+	m_pit[1]->set_clk<0>(10_MHz_XTAL / 4);   // ctr0 ~38Hz tick (count 0xFF00, clk 2.5MHz = at the 8253's ~2.6MHz limit)
+	m_pit[1]->set_clk<1>(10_MHz_XTAL / 8);
+	m_pit[1]->set_clk<2>(10_MHz_XTAL / 8);
+	m_pit[1]->out_handler<0>().set(FUNC(multibus_storager_device::timer0_out));
+	m_pit[1]->out_handler<2>().set(FUNC(multibus_storager_device::timer2_out));
+}
+
+void multibus_storager_device::timer0_out(int state)
+{
+	// PIT1 OUT0 is the system tick -> 68000 IRQ1 (vector lvl1 = handler 0x2b58, which ticks the timeout
+	// queue $736c, setting flags like $7a36 that command waits poll for; the handler re-arms THIS counter
+	// via gate0 + the $8001 count reload).  Wiring it is the real fix for the post-mount hang, BUT the
+	// PIT input clock is unknown (10_MHz/8 here is a GUESS - the divider/source isn't from any dump), so
+	// the tick rate vs the firmware's software-timeout can't be trusted yet; left unwired pending the
+	// actual clock.  See STEP 21.
+	bool const rising = state && !m_timer_out;
+	// TEMP LOG (STRIP): fw-driven delay diagnosis
+	{ static int n = 0; if (m_fw_driven && n++ < 60) logerror("PIT1-OUT0 -> %d @%.5f\n", state, machine().time().as_double()); }
+	m_timer_out = bool(state);                       // F000 bit11 (polled in the timer self-test)
+	if (rising && m_gate0)                            // TEST: ctr0 OUT -> IRQ1 (does it autovector 0x2b58 or go spurious 0x24a?)
+		m_cpu->set_input_line(M68K_IRQ_1, HOLD_LINE);
+}
+
+void multibus_storager_device::timer2_out(int state)
+{
+	m_tick_prev = bool(state);
+}
+
+// Instruction-fetch (AS_OPCODES) space: the EPROM is decoded for fetches across the whole 0x0-0xFFFF,
+// so the worker code at 0x4000-0x7FFF runs DIRECTLY from ROM.  The data space (mem_map) has RAM there.
+// This program/data (FC) split is why the firmware bsr's worker routines (0x75c2 etc.) it never installs:
+// they are fetched from EPROM, while the same addresses serve RAM for data (variables/stack/mailbox).
+void multibus_storager_device::opcodes_map(address_map &map)
+{
+	map(0x000000, 0x00ffff).rom().region("cpu", 0).mirror(0xff0000);
+}
+
+void multibus_storager_device::mem_map(address_map &map)
+{
+	// 8kx8 * 2 sram, 4kx1 sram, 64kx8 eprom, 32x8 * 2 prom.
+	// The firmware reaches on-board I/O both A5-relative (A5=0x8000 -> 0x00xxxx) and via 68000
+	// short-absolute sign-extension (0xFFxxxx), so the I/O blocks are mirrored across A16-A23.
+	// The board decodes only A1-A15 (A16-A23 are don't-care), so the whole map aliases across
+	// A16-A23.  The firmware relies on this: it reaches ROM/RAM/I/O via 68000 short-absolute and
+	// PC-relative addressing that sign-extends to 0xFFxxxx (e.g. bsr from 0x874 targets 0xFF9018 =
+	// ROM 0x9018).  Mirror everything with 0xff0000.
+	map(0x000000, 0x00ffff).rom().region("cpu", 0).mirror(0xff0000);
+	map(0x004000, 0x007fff).ram();   // RAM is positive-addressed (<0x8000); no high mirror needed
+
+	// two 8253 PITs interleaved at 0x8000 (#0 = even/high byte, #1 = odd/low byte)
+	map(0x008000, 0x008007).mirror(0xff0000).rw(m_pit[0], FUNC(pit8253_device::read), FUNC(pit8253_device::write)).umask16(0xff00);
+	map(0x008000, 0x008007).mirror(0xff0000).rw(m_pit[1], FUNC(pit8253_device::read), FUNC(pit8253_device::write)).umask16(0x00ff);
+
+	// disk read/write channel + main control + drive status (74LS1801/1802 ENDEC + drives).
+	// 0xC800 board/host control (written 0 during hw init); 0xE000-0xE01F channel; 0xE800-0xE807
+	// control (E800/E802/E804/E806); 0xF000 status.  Logged for RE (ch_r/ch_w); E802 = IRQ2 ack.
+	map(0x00c800, 0x00c8ff).mirror(0xff0000).rw(FUNC(multibus_storager_device::c800_r), FUNC(multibus_storager_device::c800_w));
+	map(0x00d000, 0x00d001).mirror(0xff0000).w(FUNC(multibus_storager_device::d000_w));   // write-only; reads = ROM
+	map(0x00d800, 0x00d801).mirror(0xff0000).w(FUNC(multibus_storager_device::d800_w));   // DMA host high-addr (paired w/ C800)
+	map(0x00e000, 0x00ffff).mirror(0xff0000).rw(FUNC(multibus_storager_device::ch_r), FUNC(multibus_storager_device::ch_w));
+	// Multibus memory window (bus master): 0x010000-0xFEFFFF -> Multibus, 1:1 (CPUAP RAM at 0x0xxxxx).
+	map(0x010000, 0xfeffff).rw(FUNC(multibus_storager_device::bus_mem_r), FUNC(multibus_storager_device::bus_mem_w));
+}
+
+ROM_START(storager)
+	ROM_REGION16_BE(0x10000, "cpu", 0)
+
+	// Siemens MX-300/PC-MX2, MC68000P12, 50MHz & 32MHz crystals, VGC7219-0419 II-SER--24M (default)
+	ROM_SYSTEM_BIOS(0, "v260", "v260")
+	ROMX_LOAD("05820084260.u84", 0x0000, 0x8000, CRC(43616528) SHA1(e7e84566b0db49d83feba4014fb319f30767d934), ROM_SKIP(1) | ROM_BIOS(0))
+	ROMX_LOAD("05820085260.u85", 0x0001, 0x8000, CRC(206c064d) SHA1(a47f6f0174d0c5ffbfa61ec6724ce549585cdaeb), ROM_SKIP(1) | ROM_BIOS(0))
+
+	// MC68000L10, 40MHz & 32MHz crystals, 74LS1801F & 74LS1802A
+	ROM_SYSTEM_BIOS(1, "v180", "v180")
+	ROMX_LOAD("58084180.u84", 0x0000, 0x8000, CRC(38805bbf) SHA1(f1ed5419cc14dfb75944183742597da2d4940d85), ROM_SKIP(1) | ROM_BIOS(1))
+	ROMX_LOAD("58085180.u85", 0x0001, 0x8000, CRC(e21001ce) SHA1(d380b8b0a284f51ded1532d0ba05338d28d89466), ROM_SKIP(1) | ROM_BIOS(1))
+
+	// SGI 026-0005-001 REV C S/N 6202, MC68000L10, "Storager 3030", 40MHz & 32MHz crystals, S8526-G II-0003-160-00T
+	ROM_SYSTEM_BIOS(2, "sgic", "sgic")
+	ROMX_LOAD("05808423a.u84", 0x0000, 0x8000, CRC(161e6a90) SHA1(d4dcbf630a83e4c5994d8331ac85d81130400e33), ROM_SKIP(1) | ROM_BIOS(2))
+	ROMX_LOAD("05808523a.u85", 0x0001, 0x8000, CRC(4c99e4b8) SHA1(899855e54c4520816ad43eb19b972b45783ccb6b), ROM_SKIP(1) | ROM_BIOS(2))
+
+	// SGI 026-0005-001 REV B S/N 6666, MC68000L10
+	ROM_SYSTEM_BIOS(3, "sgib", "sgib")
+	ROMX_LOAD("0580008426b.u84", 0x0000, 0x8000, NO_DUMP, ROM_SKIP(1) | ROM_BIOS(3))
+	ROMX_LOAD("0580008526b.u85", 0x0001, 0x8000, NO_DUMP, ROM_SKIP(1) | ROM_BIOS(3))
+
+ROM_END
+
+static INPUT_PORTS_START(storager)
+INPUT_PORTS_END
+
+const tiny_rom_entry *multibus_storager_device::device_rom_region() const
+{
+	return ROM_NAME(storager);
+}
+
+ioport_constructor multibus_storager_device::device_input_ports() const
+{
+	return INPUT_PORTS_NAME(storager);
+}
+
+} // anonymous namespace
+
+DEFINE_DEVICE_TYPE_PRIVATE(MULTIBUS_STORAGER, device_multibus_interface, multibus_storager_device, "storager", "Interphase 3030 Storager")

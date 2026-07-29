@@ -1,0 +1,31 @@
+# Storager LLE read phase trace (NOBYPASS, -flop1 mx2-001). Regenerated 2026-07-11 (w/ dispatch taps).
+# ROOT CAUSE: the fw command dispatch ($0D54) runs for 0x89 (->$5f74) but NOT for 0x87/0x95.
+#   0x95 READ handler = $5FC0 (dispatch table @$92, entry $126, flags $8c27) - fires 0x.
+#   => the emulator HLE intercepts 0x87 & 0x95 before the fw dispatch, so $5FC0 never builds the
+#      read descriptor ($7434=$7dac>>1 @$38ec-twin $60d6 never runs) -> $7434=0 -> D800=0.
+#   The emulator's DATAOP/CHANKICK IRQ4s (3x cmd=95) drive the fw IRQ4 engine into the step machine
+#      ($28e0->$369a) on an UNBUILT descriptor -> SEEKWAIT hang with null D800, no ID check, no IRQ6.
+#   0x88 handler = $3736 (a DIFFERENT command's constructor); 0x93/0x94/0x97 also -> $5FC0.
+#
+# Milestone counts:
+#      1 PHASE CHANSVC
+#      1 PHASE CMD-DISPATCH
+#      1 PHASE H89-restore
+#      6 PHASE IRQ4-entry
+#      1 PHASE RDSTEP-op0
+#   11990 PHASE SEEKWAIT
+#
+# Chronological (SEEKWAIT collapsed):
+PHASE CHANSVC     D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=87 @6.40038
+PHASE IRQ4-entry  D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=89 @6.40064
+PHASE IRQ4-entry  D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=89 @6.40064
+PHASE IRQ4-entry  D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=89 @6.40073
+PHASE CMD-DISPATCH D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=89 @6.40087
+PHASE H89-restore D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=89 @6.40103
+PHASE IRQ4-entry  D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=95 @6.40197
+PHASE IRQ4-entry  D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=95 @6.40197
+PHASE IRQ4-entry  D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=95 @6.40205
+PHASE RDSTEP-op0  D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=95 @6.40220
+PHASE SEEKWAIT    D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=95 @6.40222
+PHASE SEEKWAIT    D800<<1=0000 7434=0000 7dac[0:7]=0000000000000000 cmd=95 @6.40222
+  ... SEEKWAIT x11988 (hang) ...

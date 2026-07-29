@@ -797,6 +797,18 @@ void multibus_storager_device::run_channel_dma()
 		// Under SRAM_BYTE_SWAPPED the local read_byte already returns the other half, so the
 		// compensation inverts - otherwise the host's view double-corrects back to raw big-endian.
 		u32 const swap = SRAM_BYTE_SWAPPED ? (is_data ? 1 : 0) : (is_data ? 0 : 1);
+		// TEMP cont.436: is the DATA payload right after the cont.426 swap inversion?  The
+		// firmware says "no sys-floppy", so dump what the host actually receives.
+		if (to_host && is_data && len >= 16)
+		{
+			char t[17]; t[16] = 0;
+			for (int k = 0; k < 16; k++)
+			{
+				u8 const c = cs.read_byte((ld + k) & 0xffff);
+				t[k] = (c >= 0x20 && c < 0x7f) ? char(c) : '.';
+			}
+			logerror("DATA->host %06x len=%d swap=%d  first16: \"%s\"\n", m_c000, len, swap, t);
+		}
 		// TEMP: the host's completion verdict is node+3, which the swap lands at host+2.
 		if (to_host && !is_data && len > 3)
 		{

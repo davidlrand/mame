@@ -388,6 +388,49 @@ watch_pump:   # cont.421 - the read's completion architecture, traced end to end
 # ============================================================================================
 # ============================================================================================
 # ============================================================================================
+# ============================================================================================
+floppy_boot_status:   # cont.436 - the fundamental question, answered
+  ANSWER: >
+    NO.  pcmx2 does not boot to a usable state from floppy.  Measured on the 97801 console
+    (docs/storager-lle/fboot120.lua, 120s run, -flop siemens/set1/mx2-001.imd, no hard disk):
+      @6.4  testend
+      @8.3  no sys-floppy, going to harddisk
+      @63.1 READ -compl-stat: 42 sensb: 29 ... sasiopen: no label SINIX found
+      @63+  waiting for harddisk ready   (loops indefinitely)
+    The firmware does not recognise the mounted disk as a system floppy, at 8.3s.
+  THE FAILURE IS UPSTREAM OF THE WHOLE COMPLETION CAMPAIGN: >
+    The storager's reads COMPLETE in that window - the 87/89/95 preamble at 6.40-6.41 posts 0x80 -
+    and the disk is still rejected.  None of the twelve commits of cont.426-435 bear on this.
+  VERIFIED GOOD (both were open caveats, now closed): >
+    1. DATA PAYLOAD BYTE ORDER.  The host receives "VOL1SINIX0" and "HDR1 NSC Boot" reading
+       correctly, not scrambled - so the cont.426 data-field swap inversion (swap = is_data ? 1 : 0)
+       is CORRECT.  This was flagged unchecked since cont.426 and is now checked.
+    2. CAPTURE RECORD LAYOUT, both densities.  Read from the firmware's own POSPTRs (UIB+$C8/$CA/
+       $CC/$CE, absolute addresses, written by $2CF2's density-driven init):
+         FM  : C=$7DAD H=$7DAE S=$7DAF X=$7DBA   = +1/+2/+3/+14 from $7DAC
+         MFM : C=$7DB0 H=$7DB1 S=$7DB2 X=$7DC0   = +4/+5/+6/+20
+       The model writes FE,C,H,R,N (FM) and A1,A1,A1,FE,C,H,R,N (MFM), so R lands at +3 and +6
+       respectively.  BOTH MATCH.  No clobber: UIB+$CE never holds anything but those two values.
+  THE SYMPTOM, unexplained: >
+    The host buffer fills sequentially from $0FC0DD, but the label arrives at $0FC3DD - 0x300, six
+    128-byte sectors late.  So sectors are placed by ARRIVAL rather than by identity, the firmware
+    inspects $0FC0DD, finds no VOL1SINIX0, and reports "no sys-floppy".
+    WHY they are placed by arrival is NOT established.
+  TWO MECHANISMS PROPOSED AND BOTH WITHDRAWN - do not resurrect either without new evidence: >
+    (a) "the firmware accepts every record in arrival order" - REFUTED: 135 rejects measured at
+        $7D4A against 3 records reaching the want-list compare at $7E50.  It rejects heavily.
+    (b) "$7D08 reads the node base, so D0 is the constant $95 (the command byte) and the compare is
+        vacuous" - WITHDRAWN as a PREFETCH ARTIFACT.  The tap on $7D08 fires on its opcode fetch,
+        which the 68000 performs while $7D04 is still executing, so A0 still held its previous
+        value.  Fifth instance of that class in this campaign; see storager-measurement-discipline.
+        $7D04 is not skipped either - $7CEA/$7CF0 both land on $7D02, which falls through, and
+        nothing branches past it.
+  next: >
+    Why the host address advances per accepted record without regard to the recovered sector ID.
+    Both endpoints are instrumented; the compare at $7E58 needs a tap placed clear of the prefetch
+    shadow (deep inside the taken branch, not on the compare's own opcode).
+  conf: "V (no boot, the 8.3s failure, payload, layout) / ? (the placement mechanism)"
+
 ladder_ownership:   # cont.433 - who runs the read's builder.  READ THE RETRACTION FIRST.
   RETRACTED from cont.432: >
     "The builder emits the correct read ladder (0024 0028 0056 0058 ...), and something overwrites it

@@ -1,0 +1,667 @@
+# C800/D800/D000 boot-trace extract, 2026-07-17 (VGC7219-GATE-ARRAY-SPEC.md §3.4/§6.4 evidence)
+# run: 7-gate recipe, mx2-001.imd floppy boot, BOOTED try1. Full logs were session-scratchpad run-c800-1* / run-c800-fix-1*.
+
+## op-0x18 C800 file load (pc 30e4) + op-0x1A replay (pc 31d0), read1 era:
+[:slot1:storager] C800WR [00]=0019 pc=0030e4 @7.96450
+[:slot1:storager] C800WR [00]=0026 pc=0030e4 @7.96451
+[:slot1:storager] C800WR [00]=0026 pc=0030e4 @7.96451
+[:slot1:storager] C800WR [00]=0028 pc=0030e4 @7.96452
+[:slot1:storager] C800WR [03]=003f pc=0030e4 @7.96453
+[:slot1:storager] C800WR [03]=003f pc=0030e4 @7.96453
+[:slot1:storager] C800WR [04]=0001 pc=0030e4 @7.96454
+[:slot1:storager] C800WR [04]=002a pc=0030e4 @7.96455
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.96456
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.96456
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.96457
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.96458
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.96458
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.96459
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.96460
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.96460
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @7.97508
+[:slot1:storager] C800WR [00]=2040 pc=00899e @7.97512
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @7.97590
+[:slot1:storager] C800WR [00]=2040 pc=00899e @7.97595
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @7.97628
+[:slot1:storager] C800WR [00]=2040 pc=00899e @7.97633
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @7.98754
+[:slot1:storager] C800WR [00]=2040 pc=00899e @7.98758
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @7.98767
+[:slot1:storager] C800WR [00]=2040 pc=00899e @7.98772
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @7.98812
+[:slot1:storager] C800WR [00]=2040 pc=00899e @7.98816
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @7.98849
+[:slot1:storager] C800WR [00]=2040 pc=00899e @7.98853
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @7.98879
+[:slot1:storager] C800WR [00]=2040 pc=00899e @7.98883
+[:slot1:storager] C800WR-1A [00]=0019 pc=0031d0 @7.98897
+[:slot1:storager] C800WR-1A [00]=0026 pc=0031d0 @7.98898
+[:slot1:storager] C800WR-1A [00]=0026 pc=0031d0 @7.98898
+[:slot1:storager] C800WR-1A [00]=0028 pc=0031d0 @7.98899
+[:slot1:storager] C800WR-1A [03]=003f pc=0031d0 @7.98900
+[:slot1:storager] C800WR-1A [03]=003f pc=0031d0 @7.98901
+[:slot1:storager] C800WR-1A [04]=0001 pc=0031d0 @7.98901
+[:slot1:storager] C800WR-1A [04]=002a pc=0031d0 @7.98902
+[:slot1:storager] C800WR-1A [3f]=003f pc=0031d0 @7.98903
+[:slot1:storager] C800WR-1A [3f]=003f pc=0031d0 @7.98903
+[:slot1:storager] C800WR-1A [3f]=003f pc=0031d0 @7.98904
+[:slot1:storager] C800WR-1A [3f]=003f pc=0031d0 @7.98905
+[:slot1:storager] C800WR-1A [3f]=003f pc=0031d0 @7.98905
+[:slot1:storager] C800WR-1A [3f]=003f pc=0031d0 @7.98906
+[:slot1:storager] C800WR-1A [3f]=003f pc=0031d0 @7.98907
+[:slot1:storager] C800WR-1A [3f]=003f pc=0031d0 @7.98907
+[:slot1:storager] C800WR [00]=0019 pc=0030e4 @7.98915
+[:slot1:storager] C800WR [00]=0026 pc=0030e4 @7.98916
+[:slot1:storager] C800WR [00]=0026 pc=0030e4 @7.98917
+[:slot1:storager] C800WR [00]=0028 pc=0030e4 @7.98918
+[:slot1:storager] C800WR [03]=003f pc=0030e4 @7.98918
+[:slot1:storager] C800WR [03]=003f pc=0030e4 @7.98919
+[:slot1:storager] C800WR [04]=0001 pc=0030e4 @7.98920
+[:slot1:storager] C800WR [04]=002a pc=0030e4 @7.98920
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.98921
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.98922
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.98922
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.98923
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.98924
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.98924
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.98925
+[:slot1:storager] C800WR [3f]=003f pc=0030e4 @7.98926
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @7.99999
+[:slot1:storager] C800WR [00]=2040 pc=00899e @8.00004
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.00090
+[:slot1:storager] C800WR [00]=2040 pc=00899e @8.00095
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.01270
+[:slot1:storager] C800WR [00]=2080 pc=00899e @8.01275
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.01340
+[:slot1:storager] C800WR [00]=2080 pc=00899e @8.01345
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.02520
+[:slot1:storager] C800WR [00]=20c0 pc=00899e @8.02525
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.02590
+[:slot1:storager] C800WR [00]=20c0 pc=00899e @8.02595
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.03770
+[:slot1:storager] C800WR [00]=2100 pc=00899e @8.03775
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.03840
+[:slot1:storager] C800WR [00]=2100 pc=00899e @8.03845
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.05021
+[:slot1:storager] C800WR [00]=2140 pc=00899e @8.05026
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.05091
+[:slot1:storager] C800WR [00]=2140 pc=00899e @8.05095
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.05129
+[:slot1:storager] C800WR [00]=2140 pc=00899e @8.05134
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.06254
+[:slot1:storager] C800WR [00]=2140 pc=00899e @8.06258
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.06267
+[:slot1:storager] C800WR [00]=2140 pc=00899e @8.06272
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.06340
+[:slot1:storager] C800WR [00]=2140 pc=00899e @8.06345
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.06378
+[:slot1:storager] C800WR [00]=2140 pc=00899e @8.06383
+[:slot1:storager] C800WR [1f]=0000 pc=0088da @8.07504
+[:slot1:storager] C800WR [00]=2140 pc=00899e @8.07508
+
+## all 59 D800 writes = 3ED6 (=7DAC>>1), pc 8996:
+[:slot1:storager] PHASE D800wr      D800<<1=7dac pc=008996 cmd=95 @7.97512
+[:slot1:storager] PHASE D800wr      D800<<1=7dac pc=008996 cmd=95 @7.97595
+[:slot1:storager] PHASE D800wr      D800<<1=7dac pc=008996 cmd=95 @7.97633
+  [... 59 total, all identical value/pc, 7.975-8.2 ...]
+
+## launch records at $748A (Lua dump) + doorbell/TRUCKDRY:
+LAUNCH @6.400499 rec=748a: 0001 0001 0030 ffff d000 efff e010 0001 38f8 0001 0000 0000 7440 7208 0015 0003 0000
+LAUNCH @6.400867 rec=748a: 0001 0001 0030 ffff d000 2fff 2010 0002 38f8 0001 0000 0000 7440 7208 0003 0003 0000
+LAUNCH @6.400916 rec=748a: 0001 0001 0030 ffff d000 2fff 2010 0002 38f8 0001 0000 0000 7440 7208 0003 0003 0000
+LAUNCH @6.401283 rec=748a: 0001 0001 0030 ffff d000 2fff 2010 0002 38f8 0000 0000 0000 7440 7208 0003 0003 0000
+LAUNCH @6.401636 rec=748a: 0001 0001 0030 ffff d000 2fff 2010 0002 38f8 0001 0000 0000 7440 7208 0015 0003 0000
+LAUNCH @6.402005 rec=748a: 0001 0001 0030 ffff d000 2fff 2010 0002 38f8 0000 0000 0000 7440 7208 0003 0003 0000
+[:slot1:storager] TRUCKDRY E800=127b fam=3 D000=0000(loc 00000) D800=0000 C800: [01]=0003 [02]=0003 [04]=0004 [08]=0004 [10]=0005 iopb_buf=000000 cmd=00 pc=003d4a @0.41496
+[:slot1:storager] DOORBELL fetch: IOPB 0fe780 -> 71f0 cmd=87 buffer=0fe948
+[:slot1:storager] TRUCKDRY E800=f23d fam=1 D000=38f8(loc 071f0) D800=0000 C800: [01]=0003 [02]=0003 [04]=0004 [08]=0004 [10]=0005 iopb_buf=0fe948 cmd=87 pc=003d4a @6.40053
+[:slot1:storager] DOORBELL fetch: IOPB 0fe780 -> 71f0 cmd=89 buffer=000000
+[:slot1:storager] TRUCKDRY E800=325d fam=2 D000=38f8(loc 071f0) D800=0000 C800: [01]=0003 [02]=0003 [04]=0004 [08]=0004 [10]=0005 iopb_buf=000000 cmd=89 pc=003d4a @6.40090
+[:slot1:storager] DOORBELL fetch: IOPB 00e780 -> 71f0 cmd=80 buffer=e70000
+[:slot1:storager] TRUCKDRY E800=325d fam=2 D000=38f8(loc 071f0) D800=0000 C800: [01]=0003 [02]=0003 [04]=0004 [08]=0004 [10]=0005 iopb_buf=e70000 cmd=80 pc=003d4a @6.40167
+[:slot1:storager] TRUCKDRY E800=325d fam=2 D000=38f8(loc 071f0) D800=0000 C800: [01]=0003 [02]=0003 [04]=0004 [08]=0004 [10]=0005 iopb_buf=e70000 cmd=80 pc=003d4a @6.40204
+
+## C000-bank launch writes (unmapped in model):
+   1 [:slot1:storager:cpu] ':slot1:storager:cpu' (003D08): unmapped program memory write to FFC000 = 0700 & FFFF
+  16 [:slot1:storager:cpu] ':slot1:storager:cpu' (003D08): unmapped program memory write to FFC030 = FFFF & FFFF
+
+## $7696 chunk table + microseq at 6.3s:
+TBL7696 @6.313789: [0]=4000,ff00,0000 [1]=4200,ff00,0000 [2]=4400,ff00,0000 [3]=4600,ff00,0000 [4]=4800,ff00,0000 [5]=4a00,ff00,0000 [6]=4c00,ff00,0000 [7]=4e00,ff00,0000 [8]=5000,ff00,0000 [9]=5200,ff00,0000 [10]=5400,ff00,0000 [11]=5600,ff00,0000 [12]=5800,ff00,0000 [13]=5a00,ff00,0000 [14]=5c00,ff00,0000 [15]=5e00,ff00,0000
+MICROSEQ ch0@722c: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ch1@7250: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+## C000 host-address counter trace (second pass, c000trace.lua, 2026-07-17):
+# decode: B = ~(((offset&0x1FE)>>1)<<16 | data); live cells 795e=B, 79d8={(~B>>15)&1FE,~B&FFFF}
+C000[000]=0700 -> ~load=000700 B=fff8ff pc=003d08 @0.414947 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.400518 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.400886 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.401655 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.402023 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.402130 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.403064 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.404481 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.404850 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.405773 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.406876 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @6.412551 | 795e=00000000 79d8=00000000
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @7.965792 | 795e=000fc0dd 79d8=01e03f22
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @7.976604 | 795e=000fc0dd 79d8=01e03f22
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @7.978358 | 795e=000fc0dd 79d8=01e03f22
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @8.184954 | 795e=000fc0dd 79d8=01e03f22
+C000[030]=ffff -> ~load=18ffff B=e70000 pc=003d08 @8.186062 | 795e=000fc0dd 79d8=01e03f22
+# note [$795E]=0FC0DD / [$79D8]=01E03F22 at 7.965+ = exact ~B split of the read1 host buffer;
+# its consuming launch never fires under the model carry shim (all live loads = stale ~E70000 pair from work+$1C).
+
+## Kernel-era + field-word trace (kerneltrace.lua, 2026-07-17c):
+# Boot STALLS at read2: 'no sys-floppy, going to harddisk' @8.2 - kernel era (and its C800 ~pair
+# writes + live MFM words) unreachable. Findings below.
+# 1) full 16-word E000 state-list load (template $49E/$52E word set, bit10 masked):
+E000[00]=a6d pc=003112 @7.964616
+E000[04]=829 pc=003112 @7.964618
+E000[08]=033 pc=003112 @7.964620
+E000[0c]=a6d pc=003112 @7.964622
+E000[10]=a09 pc=003112 @7.964623
+E000[14]=a09 pc=003112 @7.964625
+E000[18]=a09 pc=003112 @7.964627
+E000[1c]=a09 pc=003112 @7.964629
+E000[00]=a09 pc=003112 @7.964630
+E000[04]=809 pc=003112 @7.964632
+E000[08]=829 pc=003112 @7.964634
+E000[0c]=83b pc=003112 @7.964636
+E000[10]=23f pc=003112 @7.964637
+E000[14]=23f pc=003112 @7.964639
+E000[18]=23f pc=003112 @7.964641
+E000[1c]=23f pc=003112 @7.964643
+# 2) per-record entry-0 re-arm (22F -> 23F -> word[0]) + aim stuck at chunk 1 all read2:
+E000[00]=23f pc=00892e @7.987571
+E000[00]=a6d pc=00893c @7.987575
+C800[00]=2040 pc=00899e @7.987582
+E000[00]=22f pc=008920 @7.987680
+E000[00]=23f pc=00892e @7.987707
+E000[00]=a6d pc=00893c @7.987711
+C800[00]=2040 pc=00899e @7.987718
+E000[00]=22f pc=008920 @7.988126
+E000[00]=23f pc=00892e @7.988153
+E000[00]=a6d pc=00893c @7.988157
+C800[00]=2040 pc=00899e @7.988164
+E000[00]=22f pc=008920 @7.988493
+E000[00]=23f pc=00892e @7.988520
+# 3) mailbox C000 preset VARIES per boot (B=e70000 prev run, B=cf0000 this run):
+C000[060]=ffff pc=003d08 @6.400518 B=cf0000
+C000[060]=ffff pc=003d08 @6.400886 B=cf0000
+# 4) read2 re-delivers read1's window (winbase stale 0001; VOL1 to host+0 again @8.2875):
+[:slot1:storager] DESCARM-WIN winbase=0001 7abc=0004 @7.97513
+[:slot1:storager] DESCARM-WIN winbase=0001 7abc=0004 @7.98874
+[:slot1:storager] DESCARM-WIN winbase=0001 7abc=0004 @8.17503
+[:slot1:storager] CARRY-R R=7 slot0 -> host+0 (128/1024) first4=56 4f 4c 31 @8.08750
+[:slot1:storager] CARRY-R R=7 slot0 -> host+0 (128/1024) first4=56 4f 4c 31 @8.28750
+# 5) screen:
+SCREEN @6.4 | testend
+SCREEN @8.2 | testend no sys-f
+SCREEN @8.2 | testend no sys-floppy, going to harddisk
+
+## Read2/aim-chain session (2026-07-17d) — probe evidence chain (scripts: labelprobe/pullprobe/chainprobe/stakewatch.lua)
+# 1) monitor check path (labelprobe): fe448c(read ret) -> fe448e 'S'@0x69(R6) FAIL -> fe4495 'S'@buf+4 FAIL -> fe44b9 magic FAIL -> fe44ca no-sys-floppy
+# 2) cmd#1 ask = 8 blk x512 (HLE line): READ95 unit2: trk0.0 -> trk2.0 (8 blk x512) -> 0fc0dd
+# 3) FWDONE=1: monitor shows 'READ -compl-stat: 13 sensb: 82' = the fw's own 0x82
+# 4) FWDONE+ARMGATE: 4 windows attempted, all DESCARM host=0fc0dd (7A1E never advanced) = retries
+# 5) stakewatch: ZERO ledger f0 writes, 742C never consumed; W7950 set@2994/29c8 (togglers RUN, IRQs fine), cleared@88d6/8a3e
+# 6) 8A14-8A36 = counted lock-on: 7DAC frame check + [7A0C]-- , accept at zero; 79A4 retry budget seen wrapped FFFA
+# 7) the '17 E000 reads of A1' at pc8922 = a fixed dbra settle loop (8891E: moveq 16), NOT a byte pull
+
+## cont.194 addendum: the floppy bypass + probe results (see storager-lle-read-dispatch memory)
+# $89FA btst#1 UIB+$12 gates the $8A14 lock-on to the HD class; floppy toggle-death is BY DESIGN.
+# W7A0C=0003 pc=6ab8 seeded once, never touched. IDFF restores the FF marker (7dac: a1 a1 a1 fe ff ok, HD-class keeper).
+# Floppy accept chain = $9884 -> $863C writes [$7964]=0x248 -> watch pump -> $94EC. Next oracle = stakewatch.lua (7964/742C/ledger taps).
+
+## cont.195: toggler fork map + the alternator race + parser layout (see storager-lle-read-dispatch memory)
+# togglers: bchg $7950; $298C: 0->89F2/1->92B4; $29C0(IRQ5): 1->8018/0->7BA8. Floppy pen makes IRQ5 always miss.
+# parser floppy leg: A1A1A1 FE C H R N (cont.45 right); $992E writes [$7428]=R on accept — never fired.
+# aim-poison live: W7428=FE pc=7E0E @8.0013; second writer pc=8114.
+# CPUAP_RTCFIX=1 => deterministic long boot (probe runs).
+W7428=0001 pc=0070e4 @7.989682
+W7428=00fe pc=007e0e @8.001260
+W7428=0104 pc=008114 @8.012543
+W7428=0001 pc=0070e4 @8.827144
+
+## cont.196-197: GAPS + NOC135 + the first full pair consume (evidence)
+# PENCALL (pen callers via E01E-ack stack peek):
+# RAISE6 source tags (the CARRY duplicate):
+[:slot1:storager] RAISE6-COMPL @7.976031
+[:slot1:storager] RAISE6-COMPL @7.988531
+[:slot1:storager] RAISE6-COMPL @8.000000
+[:slot1:storager] RAISE6-COMPL @8.001031
+[:slot1:storager] RAISE6-COMPL @8.013531
+[:slot1:storager] RAISE6-COMPL @8.026031
+# sw8 first-consume tape (sector 1 clean pair; then the 0x0104 aim-update and starvation):
+Warning: -video none doesn't make much sense without -seconds_to_run
+WLEDG[eca8]=c0c0 pc=001280 @6.401355
+WLEDG[eca8]=c0c0 pc=001280 @6.401358
+WLEDG[ecac]=c0c0 pc=001280 @6.401362
+WLEDG[ecac]=c0c0 pc=001280 @6.401366
+WLEDG[ecb0]=c0c0 pc=001280 @6.401370
+WLEDG[ecb0]=c0c0 pc=001280 @6.401373
+WLEDG[ecb4]=c0c0 pc=001280 @6.401377
+WLEDG[ecb4]=c0c0 pc=001280 @6.401381
+WLEDG[ecb8]=c0c0 pc=001280 @6.401384
+WLEDG[ecb8]=c0c0 pc=001280 @6.401388
+WLEDG[ecbc]=c0c0 pc=001280 @6.401392
+WLEDG[ecbc]=c0c0 pc=001280 @6.401395
+WLEDG[ecc0]=c0c0 pc=001280 @6.401399
+WLEDG[ecc0]=c0c0 pc=001280 @6.401403
+WLEDG[ecc4]=c0c0 pc=001280 @6.401406
+WLEDG[ecc4]=c0c0 pc=001280 @6.401410
+WLEDG[ecc8]=c0c0 pc=001280 @6.401414
+
+## cont.198: the missing state = the aim chain/pending queue (session close)
+# $7696 entries = {sram-addr, NEXT-LINK, x}; advance consumes the chain ($8628/$810E); setup pops [[74B8]] ($8480)
+# model table word1 = FF00 everywhere -> nothing appends per record -> sector-2+ starvation -> 0x82
+# next: tap 74B4/74B8 + 7696-word1 writers; decode $7E86 D0; find the per-record appender ($352E splice)
+
+## cont.199: the appender found; the loop closed on paper; broken input = the delivered-position decode
+# appender = $8018 tail: chunk link @8144/814A + $74B4/$74B6 push status 0x10 @81E6-8200 (mapwatch tape)
+# mover = $3DBC; callers 70F4/732A/8344 (8344 = scan success) -> the f0 gates everything
+# aim=FE = $7E0A storing the DELIVERED position (computes 0xFE=invalid) -> stake lands off-map -> $69
+HEAD off=074b0 =0000 pc=000ac8 @7.962790
+HEAD off=074b2 =0000 pc=000ac8 @7.962791
+HEAD off=074b4 =0000 pc=000ac8 @7.962793
+HEAD off=074b6 =0000 pc=000ac8 @7.962794
+HEAD off=074b8 =0000 pc=000ac8 @7.962796
+HEAD off=074ba =0000 pc=000ac8 @7.962797
+MAP off=07698 =ffff pc=000af2 @7.962820
+MAP off=07698 =fefe pc=00813c @7.985814
+
+## cont.200: ★ THE READ COMPLETES (sensb 80) ★ 2026-07-17
+# missing signal = the POSITION ordinal, delivered via the fw-published capture pointers UIB+C8..CE
+# {type@7DBA, C@7DAD, H@7DAE, ORDINAL@7DAF}; POSPTR stages through them; cont.135 = the stake vehicle (vindicated)
+# stack: RTCFIX + 7 gates + FWDONE + ARMGATE + GAPS + POSPTR -> cmd95 0x80; new frontier = post-read 0x87 re-INIT 0x82
+[:slot1:storager] POSSTAGE ord=15 c=00 h=00 -> ptrs{7dba 7dad 7dae 7daf} @7.97603
+[:slot1:storager] POSSTAGE ord=16 c=00 h=00 -> ptrs{7dba 7dad 7dae 7daf} @7.98853
+[:slot1:storager] POSSTAGE ord=1 c=00 h=00 -> ptrs{7dba 7dad 7dae 7daf} @8.00103
+SCREEN @8.2 | testend READ -compl-stat: 13 sensb: 80, Cyld = 0 Head= 0 Sect =
+
+## cont.202: the 0x87 frontier = the UIB fetch (uibwatch evidence)
+HOSTUIB fe948: 02 10 80 00 07 07 01 08 02 01 00 01 00 00 00 00 10 97 40 18 06 02 00 02 46 03 50 00 ff ff ff ff
+FWUIB 6e60: 02 10 00 01 0d 0d 01 08 02 01 00 01 00 00 00 00 10 97 44 20 06 02 00 02 46 03 50 00 ff ff ff ff
+# 6-byte diff = the monitor's re-INIT fields; fw validates the stale UIB; the mailbox C000 presets
+# (should be ~0xFE948) compute per-boot garbage -> the UIB transfer never lands. Next: intake ordering + the fetch.
+
+## cont.203: MBOXW + MBFETCH (the UIB fetch lands)
+[:slot1:storager] C000 preset fff8ff (write [000]=0700) pc=003d08 @0.41495
+[:slot1:storager] C000 preset 0fe780 (write [1e0]=187f) pc=003d08 @6.40052
+[:slot1:storager] C000 preset 0fe780 (write [1e0]=187f) pc=003d08 @6.40089
+[:slot1:storager] C000 preset 0fe948 (write [1e0]=16b7) pc=003d08 @6.40768
+[:slot1:storager] MBFETCH host=0fe948 -> local=6e60 x20 first8=02 10 80 00 07 07 01 08 @6.40769
+[:slot1:storager] MBFETCH host=0fe948 -> local=6e60 x20 first8=02 10 00 01 0d 0d 01 08 @8.22150
+# next: the completion-signature protocol under the corrected layout (fw readers 2540/2632/251E vs the C++ E7-posts)
+
+## cont.204: the mailbox completion protocol derived (three flavors; queue discovered)
+# 1: bit0+FFtriple = doorbell dispatch + QUEUE claim ([$7E1E] head/tail, entries $7E20+idx*16 = the 00E780 'pointer table')
+# 2: bit0+nonFF = channel completion (bit1? node+26=2 : node+26=4 + 71B2++ bump)
+# 3: bit1-only = descriptor-ring consume
+# 0x98E7 = stack-frame red herring; ring entries not stamped in INIT era; next = the 0x82's physical publication
+
+## cont.205: the publication = the fw's own bus-master IOPB stores (iopbwatch tape)
+IOPB @8.1975: 95 00 80 80 02 00 00 00
+IOPB @8.2149: 87 01 81 81 02 00 00 00
+IOPB @8.2323: 87 01 82 82 02 00 00 00
+IOPB @8.2498: 87 00 00 00 00 00 00 c2
+# READ 80/80; INIT 81/81 -> 82/82 ~11ms AFTER the UIB landed = an honest post-fetch ladder failure; not $1C
+# R0-status read returns the GO echo (13) - the generated BUSY/DONE register is unmodeled (future scent)
+
+## cont.206: R0-status modeled + regfile watch
+[:slot1:storager] R0DONE stamp 80 @6.41170
+[:slot1:storager] R0DONE stamp 80 @6.41550
+[:slot1:storager] R0DONE stamp 82 @8.18600
+[:slot1:storager] R0STAT rd -> 45 (mirror was 13) @8.18604
+[:slot1:storager] R0DONE stamp 80 @8.18674
+[:slot1:storager] R0DONE stamp 82 @8.22164
+# compl-stat WAS the R0 read (now 45); only 73F8 ever read (monitor era); INIT 82 = ~100us post-fetch
+
+## cont.207: the E7 fossil + the completion-post layer (session close)
+# E7 = the IOPB pointer mid-byte fossilised as a 'status' by run13's calibration; posts now 0x00 under MBOXW
+# fw completion post = {R1,R2,R3} <- completed-IOPB pointer readback + 0x80-class status (pc 15B2/15BC/6BCA @8.208)
+# 0x87 error path: node+$18 async post -> $120E publishes as the 82 code (lossy at host; name it fw-side next)
+[:slot1:storager] chstat[7ffa]<-0f00 pc=0015b2 @8.20803
+[:slot1:storager] chstat[7ffc]<-e700 pc=0015bc @8.20803
+[:slot1:storager] chstat[7ffe]<-8000 pc=006bca @8.20803
+
+## cont.208: THE RE-INIT PASSES (short arm) - five completions; the ch1-0x87 stalls pre-launch
+[:slot1:storager] DOORBELL fetch: IOPB 0fe780 -> 71f0 cmd=87 buffer=0fe948
+[:slot1:storager] MBFETCH host=0fe948 -> local=6e60 x20 first8=02 10 80 00 07 07 01 08 @1.34827
+[:slot1:storager] R0DONE stamp 80 @1.35332
+[:slot1:storager] DOORBELL fetch: IOPB 0fe780 -> 71f0 cmd=89 buffer=000000
+[:slot1:storager] R0DONE stamp 80 @1.37379
+[:slot1:storager] DOORBELL fetch: IOPB 0fe780 -> 71f0 cmd=95 buffer=0fc0dd
+[:slot1:storager] R0DONE stamp 82 @3.18597
+[:slot1:storager] R0DONE stamp 80 @3.18672
+[:slot1:storager] DOORBELL fetch: IOPB 0fe780 -> 71c6 cmd=87 buffer=0fe948
+[:slot1:storager] MBFETCH host=0fe948 -> local=6e60 x20 first8=02 10 00 01 0d 0d 01 08 @3.22150
+[:slot1:storager] R0DONE stamp 80 @3.22436
+[:slot1:storager] DOORBELL fetch: IOPB 0fe780 -> 71f0 cmd=87 buffer=0fe948
+# long-arm 82 = a model fetch-vs-ladder race; no fw error code exists on the passing path
+
+===== cont.209: THE LONG-ARM RACE (82/E7) — evidence chain =====
+# 1. The 82 stamp path: $17FE reads node+$18; nonzero -> $184A code byte + $184E stamp 0x82.
+# 2. C++ ERRCODE tap (immune to Lua tap churn): the poison store
+ERRCODE [7208]<-98e7 mm=ffff pc=00120e @8.221594   <- $120A dispatcher/epilogue store
+ERRCODE [7208]<-98e7 mm=ffff pc=00204c @8.221602   <- $2048 intake store ($0BBA return)
+# 3. Register+stack context at the store (the decisive dump):
+98E7-CTX D0=000198e7 D7=00002000 A0=0000749c A1=000071de A3=000071c6 A4=000071f0 SP=00007d8c mb7ff8: 13 00 0f 00 e7 00 80 00 79dc=01e016b7
+98E7-STK sp=7d8c: 0000 2038 71f0 71c6 7224 ... | old7208=0000 71de=98e7   <- node0 ($71DE) ALREADY poisoned
+# 4. The planting (mm=ff00/00ff byte pairs at "fw pc" = the C++ auto-fetch copy loop):
+ERRCH0 off=071de =9800 pc=001572 @8.208102 / =00e7 pc=001572 @8.208102
+DOORCMD cmd=87 749c=0000(IDLE->dispatch) iopb=0fe780 [2..5]=00 00 02 00 pc=001572 @8.2081
+# => host IOPB 0FE780 bytes +0x18/+0x19 = 98 E7, copied into node+$18 by the 0x1C-byte fetch.
+# FIX: all three copy loops 0x1C -> 0x18 (12-word host IOPB; +$18..$1F is fw-owned node state)
+#      + STORAGER_MBLATCH (m_mb_in[8] inbound latches; dbi readers use the latch, immune to the
+#      fw's outbound completion post {0F,E7,80} clobbering the shared SRAM cells).
+# VERIFIED: long arm INIT 82 -> 80 @8.22437; short arm unchanged (80 @3.22436). Arms identical.
+
+===== cont.209b: the 5th-command DEATH-SPIN (both arms, ~x.2276) =====
+DESCGO hdr=0000 e802=aad3 idx=01e0 ~lo=3f22 -> host=0fc0dd srcD000=5ffe cnt=0002 | src: all-00 | 7dac: a1 00 00 02 00 00 02 00 @3.22438   <- zombie descriptor consumed at launch
+IRQ4defer L6068 pc=003d4a pend=1 delay=2824us @3.2246    <- rotational completion schedule
+DOORCMD cmd=87 749c=0001(BUSY->channel-svc) iopb=0fe780 @3.22544  (5th cmd queues)
+71b2<-0001 pc=001d6c @3.22747                            <- deferred IRQ4 lands POST-completion
+OPRING [739a]<-0002 [7398]<-00ba [7396]<-7ff8 [7394]<-0102 @3.2275  <- $27BE enqueue from $1DF6
+RDSTEP-op0 ... @3.22753
+PARKTRAP sp=007d8a frame: 2008 0000 008c 0000 2314 @3.22759   <- ret $2314 = the $2312 jsr (A2)
+DEATH-25e SP=007d8a  <- $2304: lea $222,A2; move.w (A2,D0.w),D1; jsr (A2) with idle-phase D0
+#    -> zero table entry -> executes the $236/$23E mask-table DATA. GRIND flatlines after.
+
+===== cont.210: the DEATH-SPIN root + fixes (MBSPLIT, DMAFAST); read2 = 0x202A =====
+# The phantom claim (the [$71B2] leak):
+MB0WR [7ff2]<-0000 / [7ff4]<-0000 / [7ff6]<-0000 / [7ff0]<-0100 pc=0036a2 @8.188417   <- fw OUTBOUND attention post
+CLAIM-CTX A0=71c6 [A0+0]=0000 A2=7fe0 [A2]=01 ... mb0=01 00 ... @8.188459             <- own walk claims it inbound (EMPTY node!)
+# vs every legit claim: A0=71f0 [A0+0]=8701/8901/9500 A2=7fe8
+# FIX: STORAGER_MBSPLIT (mb[0] in/out latch split, fw-side read returns m_mb_in; bit0-clear write = ack)
+# FIX: STORAGER_DMAFAST (host-IOPB/UIB kicks = bus DMA -> 300us floor, not the 2824us rotational mark)
+# KICKGUARD census: c000==IOPB -> completion write-back kick (every cmd); c000==buf -> UIB fetch kick
+# VERIFIED: death gone, counters balanced, boot reaches read2 + HD era (98-class completes 80)
+
+# READ2: 0x202A head-mismatch @8.240028 (pc 7c92-lag = $7C8E store via [[71BE]])
+# $7C40: [[UIB+$CC]] captured H vs [$7436]; $7C52: C vs [$7438] (err 2012)
+MISMATCH-CTX code=202a want7436=0000 want7438=0000 cap7dac=a1 a1 a1 fe @8.240028      <- TEMPLATE RESIDUE
+# chain: POSSTAGE last @8.201; IAMSTAGE @8.2108 clobbers $7DAD/$7DAE (raw record, no ptr write-through);
+# read2 arm @8.23862 (pend=1, idtyp=1) -> next real mark ~4ms out (FM 15.6 B/ms, 3104B/track, 200ms/rev!)
+RAISE6-CARRY @8.239884                                                                 <- cont.135 carry-IRQ6, fork [$7950]=0
+# -> $89F2 ID-parser consumes it -> parses stale cells -> 202A -> "no sys-floppy, going to harddisk"
+# C135GATE v1 (withhold) kills read1; v2 (stage-then-raise) destabilizes. Parked OFF.
+# NEXT CAMPAIGN: mark-driven completion only (stage+POSPTR at every mark incl. IAM); retire the carry-raise.
+
+===== cont.211 (2026-07-18): MARKSTAGE + the IOPB/UIB decode =====
+# Dave's doctrine: pre-MSI-FDC hardware; the fw watches the bit-stream; DETECTION IS CAPTURE.
+# STORAGER_MARKSTAGE: stage_next_id(m_d800<<1, mk.pos) before EVERY ID-mark IRQ6 raise;
+#                     IAM record + POSPTR write-through. -> both READs complete (no 202A).
+# IOPB (95): +4/5={00,unit}, +8/9=0, +A = START BLOCK (read-A: 08 = THE BOOT FILE, read-B: 04),
+#            +C..F = buffer 0FC0DD, +10/11 = 73F8. Length = DESCGO cnt x 512.
+# UIB @0FE948 (full dump): FM  02 10 80 00 07 07 01 08 | 02 01 00 01 ... 46 03 50 00 | ff ff ff ff | ptr-table
+#                          MFM 02 10 00 01 0d 0d 01 08 | (same tail)
+#   +1=SPT 16, +2 bit7=FM, +3=ZONE START CYL (0/1), +$20.. = 8 LE pointers 0FE968..0FE984
+#   HD-era UIBs: 0c 22 00 02 0d 13... (unit0 ESDI), 08 09 00 04 11 11...
+# Monitor flow: INIT-FM, 89, READ(blk8) [=read-A, the BOOT READ], INIT-MFM, INIT-FM, READ(blk4) [read-B],
+#               verdict "no sys-floppy", HD-era probes (one step pulse @9.0036, pc a19a).
+# Aim formula CONFIRMED: pos = ((R-sec0)%16)+1;  read-A aims 9-14 = R15,R16,R1-R4 = FM blocks 8-13.
+# Media truth: 256B logical blocks; track0 = blks 0-7 (VOL1@R7=blk0, HDR1@R8); cyl1h0 = blks 8-23;
+#              boot file at cyl1 h0 R1: 0b 01 00 00 98 28 ... (magic 0x10B, text 0x2898). cyl0h1 = e5 empty.
+# FRONTIER: the boot READ spans the track boundary; fw staked 6 cells on cyl0, completed 80 after $69-retry,
+#           host got the cyl0 window (VOL1 @0FC0DD live-confirmed). Real HW steps MID-COMMAND and the
+#           stream follows. Model: stream pinned (cyl0,side0) intra-command. NEXT = mid-command seek+refollow.
+
+===== cont.212 (2026-07-18): the verdict on tape; monitor ROM decoded; UIB validator decoded =====
+# bufwatch: read-A delivery PERFECT (VOL1@+0, HDR1@+0x80, blk-byte 08 @+0xA0);
+#           READ#2 delivered THE LABEL AGAIN at +0x100 -> CMPD 0x10B sees "VOL1" -> no sys-floppy.
+# Monitor (cpuap_rev9): fe4484 READ#1 -> fe448e 'S' gate -> fe449d READ#2 setup (block<-HDR1+0x20,
+#   len 0x400) -> fe44b9 magic -> fe44e5 loader ("Load:text+data").
+# IOPB builder fe3c01: +4 unit, +5 head, +6/7 cyl BE, +9 sector (geometry table EXT(0xC)+2/+4);
+#   fe3e0f (95/96 class): +6..+9 <- 32-bit LOGICAL ADDRESS (-0xD..-0x10(FP)) - ZERO for READ#2!;
+#   +A/B count BE, +C=0x14, +D..F buffer BE. CPUAP tap masks are LE (ff00 = odd byte).
+# $3568 = the fw's UIB VALIDATOR (INIT err codes 62/50/52/51/42):
+#   UIB: +1=SPT(<0x41), +2/+3=SECTOR SIZE LE (80-800, even), +4/+5=GAPS (odd,>=5,sum<=0x60), +6=sec-ID-1(<=SPT)
+#   -> NO zone-base field; INIT = geometry only. UIB fetch len 0x20 CONFIRMED (0x40 clobbers fw state).
+# UIBRD consumption: $3568-$3636 validator (all fields); $2BDC-$2C4A parser; $3D4A launcher (+4,+A);
+#   +12 (4018/4420) hot readers $0E36/$5F46/$5F5A/$19FA/$88E0/$89FC/$9046.
+# FRONTIER: READ#2's position arrives as address 0 - decode CXP 0x2B's inputs {0x5D,0x61,0x65}(R6)
+#   and -0x10(FP)'s provenance; either the monitor computes it (and reads back something the model
+#   corrupts) or the controller resolves zone-relative addressing internally.
+
+===== cont.213 (2026-07-18): READ #2's ADDRESS — the full answer =====
+# addr = (HDR1+0x20 block x 1024) / sector_size + partition_base[type,unit]
+#   wrapper CXP 0x2B (fe3737): type=desc[0x4D]>>4&7, unit=&0xF; partition {size,base} at
+#   EXT(0x11)[type<<7]+unit*8 — STAGED FROM VOL1 ITSELF (fe36AE: label+0x44 -> partitions,
+#   label+0x30 -> geometry patch). Geometry EXT(0xC)[type*0x14], +8=secsize.
+#   -> builder fe3b65 arg 0x14(FP) -> IOPB+6..+9 BE (fe3e0f). Opcode arg: 8=read, 0xA=write.
+# fe3906 = the UIB builder (geom -> UIB, matches fw validator $3560 field-for-field).
+# gatewatch exec trace: READ1-issue @8.4046 -> S-GATE-chk1 @8.982327 -> NO-SYS-FLOPPY @8.982341.
+#   READ#2 NEVER ISSUES. Buffer desc+0x69 (0FC0DD) at the gate: {00 00 00 00, "SINIX0"...}
+#   = the fe422f pre-clear survived; READ#1's payload landed at +0x100.
+# WHY: fw staged host=0FC1DD (~lo=3e22; read-A: 3f22=0FC0DD), cnt still 0002 — the CONTINUATION
+#   seq (56/58 skipped) reused read-A's pair MID-ADVANCED: $8604 ran 2/8 (2x128=0x100) because
+#   the model's carry bypasses the fw's per-sector consumption. Real HW: 8/8 + full seq rebuild.
+# NEXT: route delivery through the fw's own machinery (pair advance + window drain) so a new
+#   READ takes the full microseq with a fresh pair. THE LAST BLOCKER before "Load: text+data".
+
+===== cont.215 (2026-07-18): the accept pipeline unblocked =====
+# $9884 parser: A3=[$7A66] (the RECORD buffer, not the $7DAC template!); sync check:
+#   (b0|80)^(b1|80)^b2==A1 && b3==FE  (|0x80 = missing-clock A1 normalization)
+# STORAGER_RECPTR: stage_next_id stages the record at [[7A66]] -> parser accepts; aims 5..D
+#   advance per sector pass; ledger chunks 0x14-0x1B assigned (SECMAP pc 812C tape).
+# TRUCKDATA v2: CARRY-class IRQ6 per END-instance data mark (enable bit11, truck-mode) ->
+#   stakes flow (pc 9318 F0s). Read-B completes a full honest cycle (~9.27).
+# REMAINING: placement - VOL1 at buffer+0, gate needs +0x300 (256B blocks: R7+R8 = block 3);
+#   1 truck served vs the fw's kicks; v6-carry/truck hybrid interleaves incoherently.
+# NEXT: serve every read-class kick, retire v6 for truck-mode entirely, verify $3E9C pair
+#   addressing -> gate chk2 -> READ#2 -> 0x10B -> "Load: text + data" (site fe44e5).
+
+===== cont.216 (2026-07-18): cadence A/Bs; the launch loop = the last blocker =====
+# PURECAD (no CARRY): 0 trucks 0 stakes - CARRY-IRQ6 load-bearing; floppy data completion = IRQ6.
+# TDATA6 v2/v4/v5 (dedup/repeat/end-instance permutations): all -> 1 truck, 3 stakes (cells 0/2/4).
+# THE BLOCKER: fw launch loop stops after kick #1 (one IRQ4defer @8.4360; $3E9C ran once).
+#   Pre-RECPTR: 4 kicks. E807 ring dispatches (0a/02 pc 28d8) only at 9.45 (give-up era).
+# NEXT: trace stake -> $8018 consume -> $3E9C -> $3D08 -> kick; what gates kick #2 after #1
+#   completes (E807 ring ack? [$749C] cycle? IRQ5 consume fork?). Read $8018 + $7B0E pop statically.
+# $8018 consume: $801C D800<-[$7434]; $8022 C800[0]<-[$741E] (consume re-aims the chunk ptr!);
+#   $8028 move.w $E000,D0 with D0 DISCARDED at $802C = E000[0] READ-STROBE (GA channel ack/advance)
+#   -> model E000 reads are side-effect-free -> the ack is lost -> launch chain stops. FIRST TEST
+#   next session: STORAGER_E000STROBE (fw E000[0] read -> advance/complete the channel op).
+
+===== cont.217 (2026-07-18): rotational pacing + the event-collapse insight =====
+# MARKSTATE tape: bursts 8.435-8.448 (aims 3->5, 2 re-arms, 1 kick), waits ~0.75 rev, resumes 8.61.
+#   = ONE SECTOR PER REVOLUTION (aim set just after its sector passed; caught next rev).
+# Insight: the model collapses field-START and field-END events into one instant; 68000 level
+#   priority (6>5) then orders service, not the wire. Real HW pipelines sector N's post-processing
+#   under sector N+1's ID. SPLITINST (split instances) REGRESSES (starves read-A too) - reverted.
+# $8018 = the RE-ARM (not consume): D800<-[$7434], C800[0]<-[$741E], E000[0] read-strobe, IRQ6 dip.
+#   Tail $8044+ = post-cycle dispatcher -> $80C0/$8214 (the launcher gate) - UNREAD, next session.
+# Config: 13 gates + MARKSTAGE + TRUCK + RECPTR. E000STROBE still untried.
+
+===== cont.218 (2026-07-18): the launcher decoded; seg-retired-at-truck (keeper) =====
+# $80C0: chunk-queue entries ($74C4[cursor*8]+2 == 0x40/0x80) -> clear -> $352E append to the
+#   $74AC POP QUEUE -> $8214 (post-cycle state machine; $82E2 = the ledger scan/$69).
+# The LAUNCHER = the $74AC pop (cont.127 $7B0E machinery), GATED on [$7B0E] bit15 = m_seg_retired.
+# FIX (ungated keeper): m_seg_retired + m_want_ready latch at every served TRUCK -> 4 trucks.
+# REMAINING: parser declines the aimed record DURING the drain (rec=5 want=5 @8.46, no accept),
+#   accepts it a rev later. Suspects: [[7A66]]/D800 re-pointed by the $8018 re-arm mid-drain;
+#   [$7426]=1; E802 enables. 4/8 truck; R5-R8 (the label) need the in-rev accepts.
+
+===== cont.219 (2026-07-18): [$7A66]-null; the two collection paths; the one question =====
+# [$7A66]=0 during the drain: the parser ran on delivered IRQ6s with a NULL buffer (read the $0
+#   vector "00007d96" on tape) - declines harmless; fw simply not armed. Idle 8.46-8.60 = waiting
+#   for block 0's rotation. ALL 8 accepts complete ~8.70 - but aims 5-8 advance via the NON-PARSER
+#   path (pc 812C = $8480/$8604 chunk walk); fork [$7950] not armed at their data marks; [$7A66]
+#   transient -> no stake gate holds -> R5-R8 unstaked -> 4/8 trucks stable.
+# KEEPERS: seg-retired+want-ready at every truck (launcher fuel); RECPTR; MARKSTAGE; TRUCK.
+# NEXT: read $8130-$8214 (past the ledger writers) - what completion does path-2 poll per chunk
+#   ($74C4 status 0x40 writer for path-2? E01E/F000 bit? other IRQ?) = the last missing signal.
+
+===== cont.220 (2026-07-18): pipeline fully mapped; THE COUNT = the last gap =====
+# $8152: [$79B8] (transfer-phase flag, cleared @$8214) decides: SET -> $74C4 entry linked into
+#   $74B4/B6 queue status 0x10/0x18 (awaiting GA capture; 0x40/0x80 promote -> $80C0 -> $74AC pop
+#   -> TRUCK); CLEAR -> status 2 = collect-only. [$79B8]=0 during R5-R8's collects: THE FW's
+#   TRANSFER PLAN = 4 SECTORS (512B) vs the monitor's 4 x 256B BLOCKS (1KB). Units, again.
+# LAST QUESTION: the fw's count conversion (IOPB +A/+B -> sector plan): $5FC0/$5FD0 validator,
+#   [$79A6] seed ($81CA reload), UIB+7=08 (=1024/128 sectors-per-KB-block? the unmatched constant).
+# All pipeline stages proven end-to-end. 4/8 stable. One conversion from "Load: text + data".
+
+===== cont.221 (2026-07-18): $92F6 sets [$79B8] - the stake arms the transfer phase =====
+# $92F6: [$7B18]=1, [$7426]=1, [$79B8]=1, ledger[aim]=F0, [$741C]=0, [$79BA]=1,
+#   (+[$79B6]-gated [$79AA]++/[$79A8]--). Chain closed: STAKE -> phase -> queue 0x10 ->
+#   promote 0x40 -> $80C0 -> $74AC pop -> TRUCK. Count confirmed BYTE-based (Dave):
+#   4 x 256B asked = 8 x 128B FM; [$79A8]=8 = the plan is right; stakes gate the batches.
+# AIMDATA (ord==aim on claimed slots): 7 raises, regressed to 1 truck (cadence collision).
+# NEXT: IRQ6-source+fork tape 8.43-8.70; cleanest gate candidate = raise only when [$79B8]==0
+#   (the fw's own "transfer phase needs re-arming" state). Then 8/8 -> label -> Load.
+# [$79B8]==0 gate: tested, same 7 raises/regression - they fire during the block-0 rotational
+#   WAIT (fw idle, [$7A66]=0), misaligning the toggler before block 0 collects (4->1 trucks).
+# FINAL COMBINATION (next session opener): raise iff ord==aim && [$7A66]!=0 (armed hunt only);
+#   fallback sequencing gate [$741C]==1 (capture-in-flight). Then stakes 5-8 -> 8/8 -> Load.
+
+===== cont.222 (2026-07-18): AIMDATA falsified; redirect to the armed-capture completion =====
+# AIMDATA (injected data-IRQ6 at the aimed sector): falsified in 5 gate forms - raises never
+#   stake (aim re-hunts R1 forever when active) and the same-field double (field=8.4ms span)
+#   collapses 4->1. The stakes for R1-R4 come from the ARMED-CAPTURE COMPLETION machinery
+#   (COMPL/idcap/$22F prime) in the baseline. NEXT: which raise source precedes each pc-9318
+#   stake in the baseline; why that source stops for R5-R8 (idcap arm/type cycle post-4th).
+
+===== cont.223 (2026-07-18): stamper/stake paths decoded; the hunt contradiction isolated =====
+# NORMAL stake = the parser ACCEPT-TAIL ($9284-$92A2) falling into $92AC: 742C=1 -> $92F6 stake.
+# HUNT ([$7968]=1 @$82B2; 742C cleared @$7E90): accept-tail -> $92CE no-stake -> $92F4 -> $933C
+#   -> hunt-found ($9342: 7426=1, 79B8=1, 741C=0). ON TAPE 741C STAYS 1 = hunt-era accepts do
+#   NOT traverse $9284/$92AC (the $8480-walk/pc-812C path instead). $7FEE = THE KICK (ori $1000).
+# Vectors constant: [$7302]=29C0, [$7304]=298C. 742C: 1 until 8.6524, 0 after (hunt start).
+# NEXT: read $89F2's hunt-collect exit for an accepted sector - where the hunt-found should fire.
+
+===== cont.224 (2026-07-18): THE JIT WARP (Dave's directive) - concept proven =====
+# m_serdes_warp clock offset; [$7428] aim-tap -> warp to (aim-th irq6 mark - 30B); >400B guard;
+#   forward-debounce (walker's transient [$7428]=2 {N,2,N+1,2} ping-pong); v6 carry retired under JIT.
+# PROVEN: aims 1-8 in 112ms (12x); 7 stakes at warp speed (run-jit-4). The fw runs at event pace.
+# REMAINING: (a) warp-at-accept skips the staked sector's data field (kicks lost); (b) deferred
+#   warp cascades off-by-one (even aims only). FIX SHAPE: key the pending warp to its own
+#   sector's field-end. Then 8/8 at warp speed -> label -> S-gate -> READ#2 -> 0x10B -> Load.
+
+===== cont.225 (2026-07-18): the capture ARM decoded; the odd-byte record base =====
+# $9796-$9830 ARM: 5-try loop (exhaust -> err 0x2029); per try: E802|=8800, [$7A66]<-$7DAD
+#   (=(D800<<1)+1: THE RECORD STARTS AT THE ODD BYTE - byte-serial into BE words), D800<-3ED6,
+#   C800[0]<-0, [$7A68]/[$7A6A] cleared, E000 program, E802|=1000 kick, 0x13880 poll:
+#   [$7A6A]=parser-mismatch->retry, [$7A68]=parser-success->proceed ($9970/$9978).
+# Rotational behavior explained: near aims hit in-window; distant exhaust->2029->outer re-arm.
+# JIT v4 (warp at the arm clear): tap silent - this flow may arm via $88AC/$89xx instead.
+# NEXT: unconditional [$7A68] tap to find the live arm sites; warp there; JIT parked env-off.
+
+===== cont.226 (2026-07-18): THE JIT WORKS - hunt-loop trigger + hysteresis =====
+# [$7A68] never written in the boot flow ($97xx arm = another class); trigger = the hunt-loop
+#   bit15 re-arm ($891A/$89B6). Zeno livelock fixed with hysteresis (fwd<400 || fwd>size-400).
+# RESULT: boot 5s faster (READ1 @3.13); 4 warps (genuine waits only); FOUR TRUCKS BACK-TO-BACK
+#   at 12.5ms in block order (0FC0DD/0FC15D/0FC1DD/0FC25D @3.164-3.202). JIT delivery achieved.
+# LAST BOUNDARY: $74C4..$74E3 = FOUR 8-byte chunk-queue slots -> the fw batches 4 sectors;
+#   batch 2 (the label blocks) needs the slot recycle ($80C0/status-0x40 -> pop -> free).
+#   NEXT: tape the 4 entries' status lifecycle 3.16-3.38; find where the recycle stops.
+
+===== cont.227 (2026-07-18): the batch-4 NAMED - [$7956] the block counter =====
+# Arena = $7544+ (cursor x8 + $74C4, cursors 0x11+). Lifecycle x4: 0x80 @32E0 (capture-complete
+#   poster) -> 0x40 @8068 -> prev 0x10 @81E6 -> 0x40 @3F24 (launch promote) -> TRUCK -> freed
+#   @4034/4056 (pop/recycle). Cycle 5: entry <- 0x02 @8164 (collect-only, [$79B8] dead).
+# HYPOTHESIS: [$7956] = BLOCK counter (seed 4 = IOPB count in 256B blocks; $7EBE subq/cycle);
+#   per-sector cadence exhausts it at 4 sectors. The fw distinguishes block halves via a state
+#   the model doesn't present. NEXT: read $7EB2-$7EC4 guard; tape [$7956].
+
+===== cont.228 (2026-07-18): the count chain complete - RAW sectors; the second-INIT question =====
+# $A424-$A446 count loader: BE word RAW from the IOPB -> [$7ABE].l (SECTORS, no conversion);
+#   $734E per-track clamp -> [$7ABC]; $6F5C seed -> [$7956] (subq @$7EBE/cycle; 0 -> END).
+# Wire count 4 x active secsize. KEY TAPE FACT: the two 87s fetched to DIFFERENT dsts
+#   (d000=3730 -> $6E60 vs 3600 -> $6C00) - per-unit UIBs! Unit 2's UIB may still be MFM/256
+#   during the READ -> count 4 x 256 = 1KB CONSISTENT -> the real remaining gap = the fw's
+#   256B-sector read on the FM track = THE ZONE: the read belongs at CYL 1 (the partition
+#   base from the label). NEXT: dump $6E60 during the READ; then the cyl-1 seek.
+
+===== cont.229 (2026-07-18): the block-pair cycle confirmed; the advance step = the last cell =====
+# READ-UIBS: both READs under the FM/128 UIB ($6E60, [$799A]); $6C00 = HD UIB (per-unit ✓).
+# MARKSTATE: [$7ABC]=4 blocks, [$7956]=4 CYCLES (0 after truck 4 -> [$7968] hunt), [$79A8]=8
+#   sectors => ONE CYCLE = ONE 256B BLOCK = TWO SECTORS. Dave's back-to-back = the pair.
+# S-gate expects the NATURAL layout: VOL1 at +0x300 (sector 7 of the count-8 read) = desc+0x369.
+# STORAGER_PAIR: 256B trucks, even-ordinal deposits at +0x80 - but the fw pair-advance still
+#   +0x80 -> overlap. NEXT: read $3E80-$3EA0 (the advance math source); align; then the label,
+#   READ#2, the cyl-1 seek (JIT ready), 0x10B, fe44e5.
+
+===== cont.230 (2026-07-18): the scatter lookup; the cadence = chunk completions =====
+# $3E8A-$3E96: kick host addr = $77F8[chunk.sector x4].l - THE PER-SECTOR SCATTER LIST (op 58).
+#   No advance step; +0x80 spacing correct. $3E80: launch src = chunk SRAM addr ($7696+0 >>1).
+# CADENCE: [$7956] decrements per CHUNK COMPLETION; ours complete per sector (4 = half);
+#   real HW per BLOCK (2 captures/chunk) -> 4 kicks, 8 stakes, 4 decrements - counts reconcile.
+# LAST CELL: the $32E0 chunk-complete poster's trigger - read $32C0-$32E0 next.
+# $32AC = THE POP: [$7B0E]<-0x80 (cont.127 unified), pop $74AC head, mark +2<-0x80. Cadence
+#   originates at the $74AC appends (per data-ISR round). PER-BLOCK fix: deliver both sectors
+#   into ONE chunk with ONE completion round (suppress the odd sector's completion side under
+#   PAIR; the even sector's round completes the chunk). One targeted change to Load.
+
+===== cont.231 (2026-07-18): IRQ5-halving refuted; chunk-full = the C800 TERMINAL COUNT =====
+# Odd-sector IRQ5 suppression: 0 trucks (the $7BA8/$7FEE ping-pong needs every instance).
+# The chunk-full signal = the C800 terminal count - ALREADY half-modeled: c800_w -> m_dma_term;
+#   ch_r F000 bit12 = terminal-reached. The fw's append/kick decision consumes it; terminal =
+#   chunk+256 -> per-block appends with per-sector rounds intact. NEXT: trace the fw's bit12
+#   (or E01E) poll in the $8044/$80C0 path; feed the terminal honestly under PAIR.
+
+===== cont.232 (2026-07-18): F000 bit6 found + modeled; [$796E] = the co-condition =====
+# $7F2C: btst #6,$F001 - per-cycle gate (polled 1x/round at pc-7F32); was unmodeled residue-0.
+# Modeled as chunk-mid-block under PAIR (m_blk_half). No cadence change: co-condition
+#   [$796E]<0 ($7F34 bge) doesn't hold. NEXT session's ONE decisive run: PAIR deposits +
+#   truck len 128, tape kicks vs [$7956] decrements vs stakes - decide per-sector-kick vs
+#   per-block-decrement before more modeling. Then $7F40-$7F5A + [$796E]'s writers.
+
+===== cont.233 (2026-07-18): the decisive count - SECTORS; the label-patch bootstrap chain =====
+# [$7956]: seed 4 (pc 6F62), decrement per SECTOR round (pc 7EC4, lockstep with trucks), 0 at
+#   truck 4, wraps negative in retries. FW transfers wire-count x 128B. Block theory retired.
+# THE MASTER KEY: the monitor patches its geometry FROM THE LABEL (fe36D0: label+0x30 ->
+#   geometry secsize). Real flow: count-8 pre-read -> label -> secsize 128 -> handler count 8
+#   -> 1KB -> VOL1 @+0x300 -> gate -> READ#2 -> cyl1 -> 0x10B. Ours: read-A 4/8 -> no patch.
+# EVERYTHING = READ-A's ROUND 5. Verify its seed (should be 8; if 4, the doorbell count copy
+#   is corrupt); then fix the round-5 stall. One round from the full cascade.
+
+===== cont.234 (2026-07-18): VOL1 AT +0x300 - the S-gate's cell holds the label =====
+# The seed-4 read = the HANDLER's count-4 (fw PERFECT); read-A (count 8) had NO delivery
+#   under JIT (v6 blanket-off). Fixes: v6 two-mode gate restored (!m_truck_seen); NATLAYOUT
+#   sec0=1 -> GBUF: 0FC3DD = "VOL1SINIX0" = desc+0x369 = THE GATE'S CELL. Regression: read-A
+#   hangs (claim cadence reordered). SPLIT: host offset natural / claim bookkeeping original.
+# Then: 8/8 -> geometry patch -> count 8 -> gate -> READ#2 -> cyl1 -> 0x10B -> fe44e5.
+
+===== cont.235 (2026-07-18): split maps deliver VOL1 to +0x300; the v6-completion bisect =====
+# Split maps STAND: host slot natural (sec0=1) / claim slot original (sec0=7) -> VOL1 at
+#   0FC3DD (=desc+0x369) every run. Read-A completion HANGS under the full stack (not warps,
+#   not claim cadence). BISECT next: v6+NATLAYOUT alone -> +JIT -> +PAIR (suspect: PAIR's
+#   even-ordinal +0x80 chunk offset corrupting the parsed chunk). Six runs max. Then the
+#   cascade: 8/8 -> geometry patch -> count 8 -> gate -> READ#2 -> cyl1 -> 0x10B -> fe44e5.
+
+===== cont.236 (2026-07-18): NATLAYOUT refuted; the PRE-FLOW PARSE-COPY = the missing link =====
+# Hang persists without JIT/PAIR + with the span clamp -> NATLAYOUT itself breaks the PRE-FLOW,
+#   which validates VOL1 AT +0 (sec0=7 correct; UIB+4=7 = the fw's logical origin, HLE comment
+#   vindicated). desc+0x369 = a THIRD buffer filled by the pre-flow's PARSE-COPY (fe3696 +
+#   fe36AE MOVSDs: label -> +0x369, +0x44 -> partitions, +0x30 -> geometry). In our baseline
+#   (VOL1 at +0 ✓) the parse-copy NEVER RUNS. NEXT: exec-tap fe3690-fe36F0 + fe35xx callers
+#   in the baseline, post-read-A; find the gate. Span clamp = keeper; PAIR offsets to revert.
+
+===== cont.237 (2026-07-18): desc+0x369 writerless; chk1 + the fe2C30 attempt table =====
+# W369 tap: ZERO post-init writes to desc+0x369 - chk2 unpassable on our path. fe3696 parse-copy
+#   = the SINIX-NATIVE label flow ('SINIX' at buffer+0; slots 0-2 probes; ANSI disks skip).
+# The auto-boot gate passes via CHK1 ('S' at READ1-buffer+0) -> the fe2C30 attempt table
+#   (auto attempt = index 3, fe4237) defines what READ1 actually reads. NEXT: dump fe2C30
+#   from cpuap_rev9_monitor.bin (offset 0x2C30), decode the attempt descriptors, feed the
+#   real attempt honestly -> gate -> partitions -> count 8 -> READ#2 -> cyl1 -> 0x10B -> fe44e5.
+# fe2C30 TABLE (binary): attempts = SPEC STRINGS {"(32,0)", "(0,0)", NULL} - the auto-boot runs
+#   the MANUAL spec parser (fe4364 spec-path = the auto attempt). "(32,0)" = type 2 unit 0
+#   offset 0 (floppy); "(0,0)" = harddisk fallback. NEXT: the type-2 static partition base
+#   (EXT(0x11)[2<<7] init) + what READ1 must return for chk1's 'S' at +0.
+
+===== cont.238 (2026-07-18): THE GATE RECONCILED - one buffer; partition base = 10 =====
+# desc+0x369 = READ1's OWN buffer+0x300 (same 1KB). chk2 = 'S' at content+0x304. No disk
+#   sector starts 'S' (full scan) -> chk1 = SINIX-native-only, fails ANSI by design. chk2
+#   passes iff READ1 +0x300 = VOL1 -> PARTITION BASE = 10 (logical 10..17, wrap 16=0=VOL1).
+# Our base = 0/unset (READ1 IOPB addr 0). The real monitor inits EXT(0x11)[2<<7]{size,base}.
+# NEXT: find the partition init writer + why ours is 0 = THE LAST CONSTANT. Then the cascade.
+# fe2B50/fe2BC8 static tables: geometry FM {80cyl,16spt,+40,128B} / MFM {+44,256B} CONFIRMED
+#   (the UIB 40 18/44 20 signatures); partitions {128,0},{96,32},{2336,128}. Unit0 base=0 ->
+#   base=10 hypothesis DEAD. Model runs REV9 (ROM_SYSTEM_BIOS 0 default) - the decode was right.
+# STANDING QUESTION: how rev9's gate passes on real HW with base 0 + VOL1 at +0 (chk1 'V' fail,
+#   +0x300=logical-6=zeros fail). Candidates: the VOL1+0x44 'M 1 1' TEXT fields parsed (not raw)
+#   into the partition table by a consumer we haven't found; a second label variant on real
+#   SINIX0 boot disks (our IMD = disk 1 of a set - maybe the BOOT disk differs!); or rev3 boots
+#   differently and the field-deployed machines ran rev3. NEXT: check the OTHER SINIX disks in
+#   the set for a SINIX-native label (chk1!); try -bios rev3.

@@ -1,0 +1,136 @@
+diff --git a/src/devices/bus/multibus/storager.cpp b/src/devices/bus/multibus/storager.cpp
+index f10dced4cc1..ac3254d9650 100644
+--- a/src/devices/bus/multibus/storager.cpp
++++ b/src/devices/bus/multibus/storager.cpp
+@@ -185,7 +185,7 @@ char const *storager_getenv(char const *name)
+ 		"STORAGER_PCHIST_END", "STORAGER_IOPBDUMP",
+ 		"STORAGER_CHAINTAP", "STORAGER_HD_IMAGE", "STORAGER_CPUAP_POLL",
+ 		"STORAGER_LASTC0", "STORAGER_REARM", "STORAGER_FWDONE",
+-		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP", "STORAGER_NOWALKSUBQ", "STORAGER_BULKRERUN", "STORAGER_SLOTGEO", "STORAGER_UNSTAKE", "STORAGER_DRAIN72D6", "STORAGER_A64CENSUS" };
++		"STORAGER_FMVFY", "STORAGER_C135PH", "STORAGER_SERVE", "STORAGER_STAKEV", "STORAGER_PERSEC", "STORAGER_AAFIX", "STORAGER_PLLVERIFY", "STORAGER_FILLMAP", "STORAGER_TR6", "STORAGER_DESCTRACE", "STORAGER_FAITHXFER", "STORAGER_PUMP836", "STORAGER_UNPARK", "STORAGER_LADWAIT", "STORAGER_REDISP", "STORAGER_OPTBIT4", "STORAGER_XFERDRAIN", "STORAGER_R7426", "STORAGER_IAM", "STORAGER_C0CENSUS", "STORAGER_ONEIRQ5", "STORAGER_SLOTMAP", "STORAGER_NOWALKSUBQ", "STORAGER_BULKRERUN", "STORAGER_SLOTGEO", "STORAGER_UNSTAKE", "STORAGER_DRAIN72D6", "STORAGER_A64CENSUS", "STORAGER_D3CENSUS", "STORAGER_MODECENSUS", "STORAGER_TAGCENSUS" };
+ 	for (auto const *n : hard_on)
+ 		if (!strcmp(name, n)) return "1";
+ 	for (auto const *n : passthrough)
+@@ -1404,7 +1404,121 @@ void multibus_storager_device::device_start()
+ 					logerror("A64 POLL $3dbc caller=%06x 7a64=%04x 7454=%04x 72d6=%04x 7956=%04x @%.6f\n",
+ 						xs.read_dword(sp) & 0xffffff, xs.read_word(0x7a64), xs.read_word(0x7454),
+ 						xs.read_word(0x72d6), xs.read_word(0x7956), machine().time().as_double()); } });
+-			logerror("A64CENSUS taps installed: write $7a64 + poll $3dbc\n");
++			// Companion: tap the actual UNPARK post site $3e30 (move.w #$c,($26,A0)) and the two
++			// EARLIER $3dbc gates ($3dc6 tst $7462, $3ddc tst [$74b4]-node) that precede the three
++			// verified gates. If $3e30 never fires while $3dbc-entry sees all three late gates open,
++			// an earlier gate blocks; if it fires but no boot, A0 (the posted node) is the wrong one.
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3dc6, 0x3dc7, "g_3dc6",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					logerror("GATE $3dc6 7462=%04x 74b4=%04x @%.6f\n", xs.read_word(0x7462), xs.read_word(0x74b4), machine().time().as_double()); } });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3dee, 0x3def, "g_3dee",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					logerror("GATE $3dee(reached-7a64test) 7a64=%04x @%.6f\n", xs.read_word(0x7a64), machine().time().as_double()); } });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3e30, 0x3e31, "post_3e30",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40){
++					u32 const a0=u32(m_cpu->state_int(M68K_A0)) & 0xffffff;
++					logerror("POST $3e30 UNPARK A0=%06x node+26<-c @%.6f\n", a0, machine().time().as_double()); } });
++			// $3efc: reached after $3e50 drains $74b4 -> tests [$7a64]!=0 then [$7958](l)==0 to reach
++			// the post via $3e08. $3f12: the [$7958]!=0 branch that RE-STAMPS [$72d6]=$ffff (un-drains
++			// the watch record). Tap both to prove whether [$7958] is the gate keeping the queue path
++			// from posting and re-arming [$72d6].
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3efc, 0x3efd, "drain_3efc",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					logerror("DRAIN $3efc(74b4-empty) 7a64=%04x 7958=%08x 72d6=%04x @%.6f\n",
++						xs.read_word(0x7a64), xs.read_dword(0x7958), xs.read_word(0x72d6), machine().time().as_double()); } });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3f12, 0x3f13, "restamp_3f12",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					logerror("RESTAMP $3f12 [$72d6]<-ffff 7958=%08x @%.6f\n", xs.read_dword(0x7958), machine().time().as_double()); } });
++			// $3e50 exits before draining $74b4: $3e6e (=[$71b2].0 clear, into mode check), $3f1e (mode
++			// bit11 bulk path -> marks node, no post), $4062 ([$71b2].0 set & [$7b0c]==0). Tap all three
++			// + $3ec4 (the mode word [[$799a]+$20]) to localize which exit the poll takes and whether
++			// bit11 (bulk) is set.
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3e6e, 0x3e6f, "x_3e6e",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<20){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					u32 const p=xs.read_word(0x799a)&0xffff; logerror("X $3e6e(modecheck) 799a=%04x mode[+20]=%04x @%.6f\n", p, xs.read_word((p+0x20)&0xffff), machine().time().as_double()); } });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3f1e, 0x3f1f, "x_3f1e",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<20){ logerror("X $3f1e(bulk-bit11 exit, no post) @%.6f\n", machine().time().as_double()); } });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x4062, 0x4063, "x_4062",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<20){ logerror("X $4062(7b0c==0 exit) @%.6f\n", machine().time().as_double()); } });
++			logerror("A64CENSUS taps installed: full ladder + $3e50 exits\n");
++		}
++		// cont.317 (STORAGER_D3CENSUS): $70a6 sets [$7a64] iff D3==[$7abc]==8, where D3 = count of
++		// POSITIVE-slot# bytes in the 8-byte window ledger[$7654+[$7954] .. +7] on the [$796a]!=0 path.
++		// Census the miss: pre-scan dump the window + [$7954](scan base) + [$796a](path select), then D3
++		// at the $70a0 subtract. Shows whether the loss is path-select ([$796a]==0 -> D3=0) or window
++		// misalignment ([$7954]!=1 -> offset-0 junk / offset-8 outside -> D3=7). READ-ONLY.
++		if (storager_getenv("STORAGER_D3CENSUS"))
++		{
++			m_cpu->space(AS_OPCODES).install_read_tap(0x6f74, 0x6f75, "d3_pre",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<300){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					u32 const b=0x7654 + (xs.read_word(0x7954) & 0xff); std::string led;
++					for(int i=-1;i<9;i++) led+=util::string_format("%02x ", xs.read_byte((b+i)&0xffff));
++					logerror("D3PRE 7954=%04x 796a=%04x 7abc=%04x win[$%04x, -1..+8]= %s@%.6f\n",
++						xs.read_word(0x7954), xs.read_word(0x796a), xs.read_word(0x7abc), b, led.c_str(), machine().time().as_double()); } });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x70a0, 0x70a1, "d3_sub",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<300){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					logerror("D3SUB D3=%04x 7956(pre-sub)=%04x 7954=%04x 796a=%04x @%.6f\n",
++						u16(m_cpu->state_int(M68K_D3)), xs.read_word(0x7956), xs.read_word(0x7954),
++						xs.read_word(0x796a), machine().time().as_double()); } });
++			logerror("D3CENSUS taps installed: $6f74 pre-scan + $70a0 D3\n");
++		}
++		// cont.318 (STORAGER_MODECENSUS): resolve cont.316 (per-sector $3790, no $40c2) vs cont.318 (bulk),
++		// AND find where the completion stops short of $19xx (the $1a54 0x80 stamp + $194a [$74b4] clear are
++		// the SAME region, and it never runs in the read window). Tap the mode sites + the IRQ4 completion
++		// path + the region entry, so ONE run says: which mode, and where the delivery->completion handoff
++		// dies. Run it BOTH with the bulk drivers ON and OFF to split firmware-native from model-forced.
++		if (storager_getenv("STORAGER_MODECENSUS"))
++		{
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3790, 0x3791, "mc_persec",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40) logerror("MC $3790 per-sector-builder cmd=%02x @%.6f\n", m_iopb_cmd, machine().time().as_double()); });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x40c2, 0x40c3, "mc_fork",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					u16 const uib=xs.read_word(0x799a); u16 const opt=xs.read_word((uib+0x20)&0xffff);
++					logerror("MC $40c2 mode-fork [799a]=%04x +20=%04x bit11=%d cmd=%02x @%.6f\n", uib, opt, (opt>>11)&1, m_iopb_cmd, machine().time().as_double()); } });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x4122, 0x4123, "mc_bulk",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40) logerror("MC $4122 bulk-arm cmd=%02x @%.6f\n", m_iopb_cmd, machine().time().as_double()); });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3bfe, 0x3bff, "mc_irq4",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<80) logerror("MC $3bfe IRQ4 cmd=%02x 743a=%04x 74b4=%04x @%.6f\n", m_iopb_cmd, m_cpu->space(AS_PROGRAM).read_word(0x743a), m_cpu->space(AS_PROGRAM).read_word(0x74b4), machine().time().as_double()); });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x194a, 0x194b, "mc_b4clr",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40) logerror("MC $194a completion-region (b4-clear+stamp80) cmd=%02x @%.6f\n", m_iopb_cmd, machine().time().as_double()); });
++			// $3bfe IRQ4 forks at $3c16 cmpa.w $7a14,A0 (A0=[$743a]). Equal -> $3c1c completion
++			// attempt (bsr $1310/$1348 = $13xx); not-equal -> $3c32 more channel processing.
++			// Tap both forks + $1310/$1348 to see which the native IRQ4 takes and whether it reaches
++			// the $13xx completion that should chain to $19xx/stamp80.
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3c1c, 0x3c1d, "mc_eq",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					logerror("MC $3c1c IRQ4-COMPLETE(743a==7a14) 743a=%04x 7a14=%04x 7a76=%04x @%.6f\n",
++						xs.read_word(0x743a), xs.read_word(0x7a14), xs.read_word(0x7a76), machine().time().as_double()); } });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x3c32, 0x3c33, "mc_ne",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					logerror("MC $3c32 IRQ4-MISMATCH(743a!=7a14) 743a=%04x 7a14=%04x @%.6f\n",
++						xs.read_word(0x743a), xs.read_word(0x7a14), machine().time().as_double()); } });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x1310, 0x1311, "mc_1310",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40) logerror("MC $1310 (IRQ4 completion sub A) cmd=%02x @%.6f\n", m_iopb_cmd, machine().time().as_double()); });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x1348, 0x1349, "mc_1348",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40) logerror("MC $1348 (IRQ4 completion sub B) cmd=%02x @%.6f\n", m_iopb_cmd, machine().time().as_double()); });
++			// THE 0x80 gate: $1310 -> $131a cmpi.b #$8f,(A0) [A0=[$7a06] status node] -> $1320 stamps
++			// [status+2]=0x80 ONLY if [status].b==0x8f, else stays 0x81 (monitor spins). Log the tag
++			// byte + status word at $1310 entry, and whether $1320 (the real stamp80) fires.
++			m_cpu->space(AS_OPCODES).install_read_tap(0x1310, 0x1311, "mc_tag",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<60){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					u16 const sn=xs.read_word(0x7a06); logerror("MC $1310 STATUS-NODE 7a06=%04x tag[sn].b=%02x stat[sn+2]=%04x cmd=%02x @%.6f\n",
++						sn, xs.read_byte(sn), xs.read_word((sn+2)&0xffff), m_iopb_cmd, machine().time().as_double()); } });
++			m_cpu->space(AS_OPCODES).install_read_tap(0x1320, 0x1321, "mc_stamp80",
++				[this](offs_t, u16 &, u16){ static int n=0; if(n++<40){ address_space &xs=m_cpu->space(AS_PROGRAM);
++					logerror("MC $1320 *** STAMP 0x80 *** 7a06=%04x cmd=%02x @%.6f\n", xs.read_word(0x7a06), m_iopb_cmd, machine().time().as_double()); } });
++			logerror("MODECENSUS taps installed: full + $1310/$1320 0x80-gate\n");
++		}
++		// cont.319 (STORAGER_TAGCENSUS): the WRITER complement to MODECENSUS's tag READ-taps. The local
++		// IOPB is at $71f0 (offset0=tag, count at +$a=$71fa), reused per command, so a write-tap here
++		// catches WHO writes 0x8f (pc) on a completing command vs leaving 0x95 for the bulk read - the
++		// exact instruction + the hardware state it checks is the ground-truth the model owes the fw.
++		if (storager_getenv("STORAGER_TAGCENSUS"))
++		{
++			m_cpu->space(AS_PROGRAM).install_write_tap(0x71f0, 0x71f1, "tag_wr",
++				[this](offs_t, u16 &data, u16){ static int n=0; if(n++<300)
++					logerror("TAG WR $71f0 <- %04x pc=%06x cmd=%02x @%.6f\n", data, m_cpu->pc(), m_iopb_cmd, machine().time().as_double()); });
++			logerror("TAGCENSUS tap installed: write $71f0 (0x8f writer-finder)\n");
+ 		}
+ 		// task#5: capture the read's requested sector COUNT (IOPB) at READ-START, non-invasively (opcode tap reads
+ 		// host IOPB via bs - a read, not a write-tap). The model pump feeds rotationally w/o count; the fix is a
