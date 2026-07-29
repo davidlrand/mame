@@ -508,7 +508,28 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
       RESETS the selector, $298C's bchg yields the same fork on the next IRQ6, and the STAKE arm is
       never taken.  The never-entered $92B4, the frozen C800[0] at $2380, and the 12-of-16 dropped
       records are ONE consequence, not three separate defects.
-  ★★★ RETRACTED cont.453 - the bit1 mechanism is refuted by the WORKING CONTROL: >
+  ★★★ THE DROP DOES NOT EXIST (cont.454) - the accounting closes exactly: >
+    The working control handed over the accounting.  $8022 (the per-record data-done arm) fires 12
+    times on FM, and the two FM reads commanded 8 and 4.  12 = 8 + 4: EVERY commanded record reaches
+    data-done, none dropped.  The record path is 100% when it works.
+    The MFM read's IOCB, read directly:
+      95 00 00 00 02 00 00 00 00 20 00 04 14 0f c0 dd
+                                    ^^    ^^
+                          block 32 (= cyl 1)  COUNT = 4
+    and $8022 fired 4 times on MFM.  So it is "4 of 4 delivered, 12 correctly ignored", NOT "12 of 16
+    dropped".  The 16 is what PER_ADDRESS_MARK presents - a whole track of marks - not what was
+    requested.  There was never a drop, on either density.
+    CONFIRMED end to end: the cylinder-1 MFM read completes with 0x80 (GO 8.30043 -> completion
+    8.50032), and every command in that window posts 0x80.
+    COST OF NOT CHECKING ONE VALUE: node+$b was raised several exchanges earlier and went unchecked.
+    Four hypotheses were built on a defect that did not exist - the $92B4/STAKE chase, the bit1
+    mechanism, the ten-byte record layout, and the AM-count $FF experiment.  The FM control would have
+    prevented all four.
+    ★ SO THE FAILURE IS ENTIRELY HOST-SIDE.  The storager delivers every commanded record, byte-exact,
+    to the right host addresses, and posts good status.  The firmware reads the label track, gets
+    VOL1SINIX0 correct at host $0FC3DD, reads 4 sectors from cylinder 1 successfully - and still says
+    "no sys-floppy" at 8.5s.  What the CPUAP does with correctly-delivered data is the frontier.
+  superseded_RETRACTED_cont453 - the bit1 mechanism refuted by the working control: >
     UIB+$12 bit1 is CLEAR on BOTH reads - $40 at cyl 0 (WORKS) and $44 at cyl 1 (drops 12 of 16).
     So $8A02's skip and $8A38's clr.w $7950 happen identically on the working read.  Neither can be
     what distinguishes them.  The cont.452 mechanism was built from the failing path alone, without
