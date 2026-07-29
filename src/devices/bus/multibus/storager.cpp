@@ -374,6 +374,7 @@ private:
 	void capture_track();          // synchronous full-revolution flux decode into m_track
 	bool m_read_active = false;     // a read window is open (records delivered until the firmware stops re-arming)
 	int  m_sec_count = 0;           // commanded sectors this operation ([$7abc])
+	int  m_am_presented = 0;   // EXPERIMENT cont.451: marks presented to the [$7a0c] AM-count
 	u32  m_held_len = 0;            // first field of a run, awaiting a chunk to land in
 	u8   m_held_data[1024] = {};
 	int  m_sec_index = 0;           // sector currently being delivered
@@ -729,6 +730,12 @@ void multibus_storager_device::advance_read()
 			for (int p = 0; p < 3; p++)
 				cs.write_byte((dst + k++) & 0xffff, 0xa1);   // +0..2  sync preamble
 			cs.write_byte((dst + k++) & 0xffff, 0xfe);       // +3  ID address mark
+			// REVERTED cont.451: presenting the AM-count signature ($FF at +4) for the first three
+			// marks and the ID layout thereafter took MFM C800 arms 4 -> 0 - the same failure as the
+			// ten-byte layout, and for the same reason: inserting a byte at +4 shifts C/H/R by one
+			// and breaks the compare path, which satisfying the count does not compensate for.
+			// So the signature and the ID field are NOT phase-separable by a simple mark counter.
+			// They genuinely conflict at +4 on one buffer, and the resolution is not in this routine.
 			cs.write_byte((dst + k++) & 0xffff, s.c);        // +4  C
 			cs.write_byte((dst + k++) & 0xffff, s.h);        // +5  H
 			cs.write_byte((dst + k++) & 0xffff, s.r);        // +6  R
@@ -1472,6 +1479,7 @@ void multibus_storager_device::host_win_w(offs_t offset, u16 data, u16 mem_mask)
 		// The firmware carries the STATUS/ERROR bytes back to the host IOPB itself, via its node->host
 		// bus-master DMA (run_channel_dma, E800 bit13); the model transcribes nothing here.
 		m_held_len = 0;   // no field carries across a command boundary
+		m_am_presented = 0;
 		m_ser_active = false; m_ser_clk = true;   // the serial ack does not carry across a command boundary
 		// Engagement must be decided HERE for a retained program.  With op18 skipped, nothing in the
 		// ladder (24 28 56 58 54 4A 42 36 00) writes E000, so the bit11 test below never evaluates and

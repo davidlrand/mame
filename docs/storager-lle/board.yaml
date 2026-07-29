@@ -508,9 +508,32 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
       RESETS the selector, $298C's bchg yields the same fork on the next IRQ6, and the STAKE arm is
       never taken.  The never-entered $92B4, the frozen C800[0] at $2380, and the 12-of-16 dropped
       records are ONE consequence, not three separate defects.
-    ★ FRONTIER, restated: what must the model PRESENT so the three-mark count at [$7a0c] is satisfied?
-      The pattern is bytes 0-2 OR'd == $A1, byte +3 == $FE, byte +4 == $FF, three times over.  Read
-      $8A9E's two arms before assuming the count is all that is owed.
+    ★★ FRONTIER RESTATED AGAIN (cont.451) - the model does NOT owe the pattern.  $8A9E's arms decide:
+        $8A9E tst.w $7a0c / bne $8AAE
+        $8AA4 movea.w $72de,A0 / clr.w (A0)      count EXHAUSTED -> clear a watch slot
+        $8AAE movea.w $71be,A0 / move.w #$2029,(A0)   NOT exhausted -> stamp ERROR $2029
+      $2029 is the error seen at the host all session as 0x82/0x29.  So the firmware is CORRECTLY
+      REPORTING A FAILURE: it hunts for its format signature after the seek, does not find three, and
+      says so.  The unsatisfied count IS the diagnosis, not a mechanism the model is starving.
+      The failure path is self-consistent with a search: $8A38 clr.w $7950 resets the alternator on
+      each miss (keep looking, do not advance to STAKE), and $8A40 bne $8AB8 goes to $88AC, the
+      teardown that clears the capture arm.
+      TESTED AND REVERTED: presenting $FF at +4 for the first three MFM marks (phase-separation
+      hypothesis) took MFM C800 arms 4 -> 0, the same failure as the ten-byte layout and for the same
+      reason - inserting a byte at +4 shifts C/H/R and breaks the compare path.  Baseline restored 4/1.
+      DOCTRINE: fabricating $FF would be LYING TO THE FIRMWARE about the format.  $FF at +4 is not a
+      cylinder value any normally-formatted track on this medium produces (cylinder 255 does not
+      exist), so the model cannot reach it by capturing more faithfully.  Same shape as the
+      rotational-start case, where rejects were supposed to happen and the model had been built to
+      prevent them.
+      ★ THE QUESTION IS NOW INVERTED: not "what must the model present", but WHY DOES A LEGITIMATE
+      300k MFM 16x256 TRACK - which the decoder reads correctly, 16 sectors, content byte-exact -
+      NOT MATCH THE SIGNATURE the firmware searches for after a seek to cylinder 1?
+      Candidates not yet separated: the signature belongs to a format this disk is not (so the search
+      SHOULD fail and the real defect is upstream, in which track the firmware seeks to or which
+      format it expects); or the GA is meant to supply +4 as status rather than recovered flux, in
+      which case the model owes it but only in the seek-verify phase and via a mechanism that does not
+      disturb the ID field.
     superseded_CONTRADICTION (cont.449), dissolved above:
       $8A2C cmpi.b #$ff,(A0) requires byte +4 of the record at $7DAC to be $FF.
       The live POSPTR puts the CYLINDER at +4.
