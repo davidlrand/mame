@@ -414,7 +414,23 @@ density_source:   # cont.439 - density comes from the field program, not E800 bi
     mandate rules out and that this campaign has spent months removing.  The field program is what
     the gate array is actually TOLD, so it is the correct source even while its semantics are
     undecoded.
-  TEST RESULT - inconclusive, and it exposed a different defect: >
+  MFM DECODER FIXED cont.440, and the density bit CONFIRMED from the second direction: >
+    Root cause: capture_track stored a data field WITHOUT requiring its own ID field to have preceded
+    it.  The sweep starts at an arbitrary rotational position, so it can begin mid-sector and meet a
+    data field whose ID already passed the head; that was stored carrying the STALE id[] (r=00) and
+    the stale size code (128 << 0 = 128 instead of 256).  Gated on a have_id flag, set when an ID is
+    recovered and cleared when its data field is consumed.
+    Invisible for the whole campaign because only FM was ever exercised, and the FM sweeps happened
+    to begin on an ID.
+    RESULT  cyl 69 (a known 16x256 MFM track): 17 sectors / first r=00 len=128  ->  16 sectors /
+    256 bytes / r=04..r=03 (rotational wrap, correct for an arbitrary start).
+    CONTENT VERIFIED, not merely structure: decoded R=1 first8 = 000000907c4e18a6, byte-exact against
+    the IMD.  FM unchanged at 16x128 - no regression.
+    This also CONFIRMS the density bit from the second direction, the test that was inconclusive at
+    cont.439: with a working MFM decoder, BIT(m_prog[0],7) selects a decode that yields a valid track.
+    The bit does real work.  Its two caveats stand - still underdetermined between bits 11/7/6, and
+    $02ad's provenance is still a post-failure state.
+  TEST RESULT at cont.439 - inconclusive, superseded by the above: >
     The switch WORKS: density now follows the program (FM at cyl 0/1, MFM at cyl 69).
     The confirmation FAILS: cylinder 69 is definitively a 300k MFM 16x256 track (IMD: cyls 0..79,
     160 tracks, cyl 0 both heads FM 16x128, cyl 1..79 MFM 16x256), and the model decodes it as

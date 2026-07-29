@@ -437,6 +437,12 @@ void multibus_storager_device::capture_track()
 	u32 shift = 0;
 	int state = 0, cells = 0, nb = 0, want = 0, n = 0;
 	u8 dam = 0, id[4] = {};
+	// A data field is only a sector if its OWN ID field preceded it.  The sweep starts at an arbitrary
+	// rotational position, so it can begin mid-sector and meet a data field whose ID already passed the
+	// head - storing that yields a phantom sector carrying the STALE id[] (r=00) and the stale size
+	// code (128 instead of 256).  Measured on cyl 69 (a 16x256 MFM track): 17 sectors, first r=00
+	// len=128.  This was invisible while only FM was exercised. (cont.440)
+	bool have_id = false;
 	u8 buf[1200];
 	while (m_track_n < 32)
 	{
@@ -473,9 +479,11 @@ void multibus_storager_device::capture_track()
 		{
 			id[0] = buf[0]; id[1] = buf[1]; id[2] = buf[2]; id[3] = buf[3];
 			n = buf[3] & 7;
+			have_id = true;
 		}
-		else              // data field recovered -> store this sector
+		else if (have_id)   // data field recovered, and its ID preceded it -> store this sector
 		{
+			have_id = false;                    // this ID belongs to exactly one data field
 			captured_sector &s = m_track[m_track_n++];
 			s.c = id[0]; s.h = id[1]; s.r = id[2]; s.nn = id[3]; s.dam = dam;
 			s.len = u16(want);
@@ -486,6 +494,17 @@ void multibus_storager_device::capture_track()
 	}
 	// TEMP cont.439: the MFM path is exercised for the first time (media is mixed - cyl 0 is 300k FM
 	// 16x128, cyl 1+ are 300k MFM 16x256).  Report what the gate array actually decoded.
+	// TEMP cont.440: content check - dump sector R=1's first 8 bytes so the decode can be compared
+	// against the media (cyl 69 head 0 R=1 is 000000907c4e18a6 in the IMD).
+	for (int i = 0; i < m_track_n; i++)
+		if (m_track[i].r == 1)
+		{
+			logerror("  R=1 first8: %02x%02x%02x%02x%02x%02x%02x%02x  (len=%d)\n",
+				m_track[i].data[0], m_track[i].data[1], m_track[i].data[2], m_track[i].data[3],
+				m_track[i].data[4], m_track[i].data[5], m_track[i].data[6], m_track[i].data[7],
+				m_track[i].len);
+			break;
+		}
 	logerror("capture_track: cyl=%d head=%d density=%s  sectors=%d  first: r=%02x len=%d  last: r=%02x len=%d\n",
 		m_floppy[0] && m_floppy[0]->get_device() ? m_floppy[0]->get_device()->get_cyl() : -1,
 		m_sel_head, flux_density_fm() ? "FM" : "MFM", m_track_n,
