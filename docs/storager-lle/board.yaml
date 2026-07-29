@@ -401,7 +401,34 @@ floppy_boot_status:   # cont.436 - the fundamental question, answered
   THE FAILURE IS UPSTREAM OF THE WHOLE COMPLETION CAMPAIGN: >
     The storager's reads COMPLETE in that window - the 87/89/95 preamble at 6.40-6.41 posts 0x80 -
     and the disk is still rejected.  None of the twelve commits of cont.426-435 bear on this.
-  VERIFIED GOOD (both were open caveats, now closed): >
+  ★ RETRACTED cont.438 - "payload byte order verified correct" was WORTHLESS: >
+    The cont.436 check read `cs.read_byte(ld + k)` - the storager's OWN RAM - and did so BEFORE the
+    copy loop.  It never touched the transform, so it could not have tested the swap.  Read past the
+    wire (`bs.read_byte(m_c000 + k)`, AFTER the copy) the host was receiving:
+      local "VOL1SINIX0"  ->  host "OV1LISIN0X"
+      local "HDR1 NSC Boot" -> host "DH1RN CSB oo t"
+    ALWAYS take an acceptance test on the far side of the transform being tested.
+  ★★ FAILURE OF THE RECORD, not of the reasoning - the first correct prior this campaign walked past: >
+    cont.406 ALREADY recorded, in this file, that the label buffer base is ODD ($0FC0DD) and that no
+    word-boundary swap can serve it, naming "OV1LISIN0X" as the signature of getting it wrong.
+    cont.426 inverted the data arm (swap = is_data ? 1 : 0) without answering that argument, and the
+    exact predicted signature came back.
+    LESSON: an entry that ARGUES AGAINST a change must be ANSWERED, not merely superseded.  This is
+    distinct from the measurement-flaw classes - the prior was correct, on file, and readable.
+    Also wrong in FORM: `m_c000 + (k ^ 1)` pairs bytes across the base, not within host words, and the
+    base is odd - so it transposed across the odd boundary.  Removed rather than corrected.
+  FIX cont.438 - swap = 0 EVERYWHERE, the compensation is gone: >
+    The SRAM byte-order correction (cont.426) SUBSUMES it.  Control blocks were already at 0 and
+    verified working (0x80 reaches host+3, the host accepts commands); data needs 0 too.  Both arms
+    zero, so the ternary is deleted rather than left always-yielding-zero.
+    VERIFIED PAST THE TRANSFORM: host $0FC3DD reads "VOL1SINIX0"; 11 clean 0x80 completions.
+    BEHAVIOURAL CHANGE - the label check now PASSES:
+      before: @8.3 no sys-floppy, going to harddisk
+      after:  @8.4 READ -compl-stat: 42 sensb: 12, Cyld = 1 Head= 0 Sect = 1, Log. Blocknr = 33
+              then no sys-floppy
+    The firmware accepts the label and proceeds to CYLINDER 1, which it never reached before.  The
+    failure moved from data integrity to a multi-track/seek read failure on cyl 1.
+  VERIFIED GOOD (the layout half only - the payload half is retracted above): >
     1. DATA PAYLOAD BYTE ORDER.  The host receives "VOL1SINIX0" and "HDR1 NSC Boot" reading
        correctly, not scrambled - so the cont.426 data-field swap inversion (swap = is_data ? 1 : 0)
        is CORRECT.  This was flagged unchecked since cont.426 and is now checked.

@@ -817,7 +817,13 @@ void multibus_storager_device::run_channel_dma()
 		// from a swap-control bit in the IOCB/UIB; that bit is not decoded yet, so key it on the field type.
 		// Under SRAM_BYTE_SWAPPED the local read_byte already returns the other half, so the
 		// compensation inverts - otherwise the host's view double-corrects back to raw big-endian.
-		u32 const swap = SRAM_BYTE_SWAPPED ? (is_data ? 1 : 0) : (is_data ? 0 : 1);
+		// NO byte swap, either direction.  The SRAM byte-order correction (cont.426) subsumes the
+		// compensation that used to live here: control blocks were already at 0 after it and verified
+		// working (the 0x80 completion reaches host+3 and the host accepts commands), and cont.438
+		// showed data needs 0 too - it was arriving transposed ("OV1LISIN0X" for "VOL1SINIX0").
+		// Note the old expression was also wrong in form: (m_c000 + (k ^ 1)) pairs bytes across the
+		// base rather than within host words, and $0FC0DD is ODD - so it transposed across the odd
+		// boundary.  Removed rather than corrected, since the right value is now zero.
 		// TEMP cont.436: is the DATA payload right after the cont.426 swap inversion?  The
 		// firmware says "no sys-floppy", so dump what the host actually receives.
 		if (to_host && is_data && len >= 16)
@@ -846,7 +852,21 @@ void multibus_storager_device::run_channel_dma()
 		for (u32 k = 0; k < len; k++)
 		{
 			if (to_local) cs.write_byte((ld + k) & 0xffff, bs.read_byte((m_c000 + k) & 0xffffff));
-			else          bs.write_byte((m_c000 + (k ^ swap)) & 0xffffff, cs.read_byte((ld + k) & 0xffff));
+			else          bs.write_byte((m_c000 + k) & 0xffffff, cs.read_byte((ld + k) & 0xffff));
+		}
+		// cont.438: read the HOST side AFTER the copy.  The cont.436 "payload byte-correct" check
+		// read cs.read_byte(ld+k) - the storager's OWN RAM - and BEFORE the copy, so it never
+		// tested the swap.  With swap=1 on data and an ODD host base ($0FC0DD), byte k lands at
+		// m_c000 + (k^1), pairing bytes across the odd boundary.
+		if (to_host && is_data && len >= 16)
+		{
+			char hst[17]; hst[16] = 0;
+			for (int k = 0; k < 16; k++)
+			{
+				u8 const c = bs.read_byte((m_c000 + k) & 0xffffff);
+				hst[k] = (c >= 0x20 && c < 0x7f) ? char(c) : '.';
+			}
+			logerror("HOSTSIDE %06x  first16: \"%s\"\n", m_c000, hst);
 		}
 	}
 	// The gate array bus-masters the transfer: it takes the local bus for the transfer's duration and the
