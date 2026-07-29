@@ -421,7 +421,27 @@ ladder_ownership:   # cont.433 - who runs the read's builder.  READ THE RETRACTI
     Both candidate descriptor bases are covered ($721C->$7222 and $7224->$722A); the only writes to
     $7224-$722E in the entire run are the RAM self-test walking patterns at t=0.12.  A null cannot be
     jsr'd, so the $2316/$233A/$2342 chain is not what transfers control to $5E64.
-  RELOCATED - $5E64 may be a MICRO-OP handler, not a builder: >
+  CONFIRMED cont.434 - $5E64 is a micro-op that WIPES the field program: >
+    Measured per command, tapped deep ($5E82 the ladder emit, $5EA0 the E000 loop body):
+      cmd 87 / 98:  emit 0, wipe 0,  E01E last value $0cbb   (a real program word)
+      cmd 95:       emit 1-2, wipe 17 or 34, E01E last value $023F, A6 = $7250
+    So $5E64 runs ONLY on reads.  It emits 1c/22/16 through A6 - and A6 is the ladder buffer $7250,
+    which survives because the walker's $15AC `movem.w A0-A2,-(A7)` preserves only A0-A2, so a
+    micro-op inherits the dispatcher's A6 ($2338 movea.w D0,A6) and rewrites the ladder MID-WALK.
+    No install path and no bsr/jsr $5E64 are needed or exist.
+    $5E98-$5EA4 writes SIXTEEN words of $023F across E000-E01E.  $023F is the idle/terminate step that
+    tails op18's block, so this CLEARS the field program - it does NOT load one.  An earlier note here
+    had that backwards ("$5E64's direct E000 load explains capture without op18") - RETRACTED.
+    Reads therefore never load a program; they wipe one.
+  MODEL DIVERGENCE - the wipe is read as a LOAD: >
+    ch_w treats a write to E000 offset 15, preceded by any offset>=1, as the load-complete edge: it
+    sets m_prog_loaded and calls start_field_program().  Sixteen sequential $023F writes satisfy that
+    exactly, so the model marks a program LOADED and OPENS THE READ WINDOW on the instruction sequence
+    that clears it.  Model and firmware then disagree about what the gate array is running, and every
+    downstream conclusion about capture is taken against the wrong state.
+    FIX SHAPE: the load-complete edge must not fire on a uniform $023F fill.  $023F is the idle step,
+    so a block whose every word is $023F is a wipe: it should clear m_prog_loaded, not set it.
+  superseded_RELOCATED: >
     From the table dump, $194 holds $5E64 - and $192 is the MICRO-OP JUMP TABLE base (the walker's
     `$15B4 move.w (A0,D0.w),D0` / `$15BA jsr (A1)`), not a command table.  $194 = $192+2.  If $5E64 is
     an op handler rather than an intake builder, then the writes at $7250 that were read as "the
