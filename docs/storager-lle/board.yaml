@@ -415,7 +415,23 @@ ladder_ownership:   # cont.433 - who runs the read's builder.  READ THE RETRACTI
     So $5E64 running for a read is most likely 0x87's builder still sitting in [$721a]+$6 - 0x87 is
     the command immediately before every read in the preamble - and `1c 22 16 00` is then 0x87's
     ladder, emitted CORRECTLY by the wrong builder.  Nothing is corrupt.
-  next: >
+  HYPOTHESIS REFUTED cont.433b: >
+    [$721a]+$6 is NOT the source.  Measured across a full run: ZERO builder-address writes anywhere
+    in $7200-$724F, and the slot reads 0000 at every command boundary with [$721a]=7224 throughout.
+    Both candidate descriptor bases are covered ($721C->$7222 and $7224->$722A); the only writes to
+    $7224-$722E in the entire run are the RAM self-test walking patterns at t=0.12.  A null cannot be
+    jsr'd, so the $2316/$233A/$2342 chain is not what transfers control to $5E64.
+  RELOCATED - $5E64 may be a MICRO-OP handler, not a builder: >
+    From the table dump, $194 holds $5E64 - and $192 is the MICRO-OP JUMP TABLE base (the walker's
+    `$15B4 move.w (A0,D0.w),D0` / `$15BA jsr (A1)`), not a command table.  $194 = $192+2.  If $5E64 is
+    an op handler rather than an intake builder, then the writes at $7250 that were read as "the
+    builder emitting" are a micro-op REWRITING THE LADDER BUFFER MID-WALK - which would also explain
+    why no intake path installs it and why no bsr/jsr $5E64 exists in the ROM.
+    TEST: does $5E64 execute with the walker's dispatch registers live (A0 = the list pointer cell,
+    A1 = $5E64 itself), and does the $7250 write burst fall between a walker dispatch and its return?
+    Both are answerable from one trace with a tap deep inside $5E64 (NOT its entry word - entry taps
+    have been prefetch artifacts four times in this campaign).
+  superseded_next: >
     Write tap on [$721a]+$6 across the 87/89/95 sequence: does a per-command install fire, and what
     value does it write?  Four candidate writers in the ROM - $0AA6, $27EE, $2AA4, $34BC - one of
     which should be the per-command install.  If nothing fires between the 0x87 and the 0x95, that is
