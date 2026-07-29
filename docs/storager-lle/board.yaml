@@ -453,7 +453,19 @@ ladder_ownership:   # cont.433 - who runs the read's builder.  READ THE RETRACTI
     and ZERO builder addresses are written anywhere in $7100-$72FF.  The cont.433b refutation watched
     [$721a]+$6 believing it a different cell from [$71c2]+$6; it is the same address, so its
     conclusion held for the wrong reason.
-    STILL OPEN: what performs the INITIAL builder dispatch.  The descriptor +6 slot is never written
+    $2342 NEVER RUNS (cont.435c, measured at the site - a register read, no binning):
+      $231A gate reached 17609 times | $233A slot load 0 | $2342 jsr 0
+    The gate `$231A cmpi.b #$ff,($4,A1)` takes `bne $2352` every time, so ($6,A1) is never even READ -
+    the unwritten +$6 slot is a consequence, not a cause.  $2342 is NOT the dispatch path.
+    THE GATE VARIABLE IS THE "NOISE": descriptor+$4 is $7224+4 = $7228, the cell measured taking
+    25572 writes of $00FE per run and excluded from the ladder probe as noise.  The gate wants BYTE
+    $FF; the cell holds WORD $00FE, whose halves are $00 and $FE.  Neither is $FF, so this gate fails
+    under EITHER byte order - it did NOT change state as a side effect of the byte-order fix, and the
+    byte/word pairing here ($231A/$254A test bytes, $0AA2/$0AB6/$15C0/$27F4 write words) is a red
+    herring for once.
+    NEXT: who writes $00FE to $7228, and what would write $00FF.  One value, one cell, and the
+    write is already known to be hot (25572/run) so it cannot hide.
+  superseded_STILL_OPEN: what performs the INITIAL builder dispatch.  The descriptor +6 slot is never written
     by anything, so $2342 `jsr (a1)` through ($6,a1) cannot be it, and the $92 table is not it either.
   superseded_DISPATCH_gap: >
     Something invokes the builder and neither candidate route is accounted for:
