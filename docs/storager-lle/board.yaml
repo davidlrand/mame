@@ -390,7 +390,39 @@ watch_pump:   # cont.421 - the read's completion architecture, traced end to end
 # ============================================================================================
 # ============================================================================================
 # ============================================================================================
-density_source:   # cont.439 - density comes from the field program, not E800 bit10
+density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers here were wrong.
+  ANSWER: >
+    Density is UIB+$12 bit2.  Measured against the media, which is mixed (cyl 0 FM 16x128, cyl 1+
+    MFM 16x256), from the UIB the gate array itself fetches from host $0FE948 per operation:
+      cyl  0  UIB+12=$40  bit1=0 bit2=0   media FM    (host block: 02 10 80 00 07 07 ... 40 18)
+      cyl  1  UIB+12=$44  bit1=0 bit2=1   media MFM   (host block: 02 10 00 01 0d 0d ... 44 20)
+      cyl 69  UIB+12=$37  bit1=1 bit2=1   media MFM
+      cyl 83  UIB+12=$2f  bit1=1 bit2=1   media MFM
+    Byte 3 of the fetched block is the cylinder (00 then 01), so the first two are unambiguously the
+    cyl-0 and cyl-1 reads.  bit2 tracks the media EXACTLY; bit1 does not.
+    Not a firmware-RAM snoop: the UIB is a HOST-SUPPLIED control block the gate array DMAs in itself.
+  ★ TWO WRONG ANSWERS BEFORE IT, and the second is the instructive one: >
+    cont.439 took density from E800 bit10 - the firmware never sets it for this purpose.  Correctly
+    rejected.
+    cont.441 then took it from the field program's bit7 and called it CONFIRMED on five samples of
+    "program bit7 == UIB+$12 bit1".  That correlated two signals against EACH OTHER and never against
+    the media.  They agreed perfectly while both were wrong at cylinder 1, where bit1 is clear on an
+    MFM track.  A self-consistent loop that never touched ground truth.
+    LESSON, distinct from the measurement-flaw classes already on file: a correlation between two
+    derived signals is not confirmation.  Anchor to the MEDIA (or whatever the external truth is),
+    not to another part of the same system.
+  RESULT: >
+    Every capture is now correct - FM 16x128 at cyl 0, MFM 16x256 at cyl 1 and beyond - and the
+    cylinder-1 read no longer errors (the "READ -compl-stat: 42 sensb: 12" line is gone).
+  NEW FRONTIER - the MFM RECORD path: >
+    The verdict is still "no sys-floppy", now for a different reason: on the MFM read the firmware
+    never advances the chunk pointer.  All 16 fields land in chunk $4700 and only ~4 transfers reach
+    the host.  The capture is right (c=01 h=00, r=01..10, 256 bytes); the per-record handling stalls.
+    That is the firmware's MFM branch - $89F2's A1/A1/A1/FE verify and $9884's MFM ID compare -
+    running for the FIRST time.  This campaign recorded those as "legitimately unreachable, do not try
+    to make them run"; they are reachable now.
+
+superseded_density_source:   # cont.439 - density comes from the field program, not E800 bit10
   finding: >
     The model took density from E800 bit10 (flux_density_fm = !BIT(m_ch[E800],10)).  The firmware
     NEVER sets that bit for this purpose - measured: set once during the boot self-test at t=0.20,

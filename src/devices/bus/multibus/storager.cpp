@@ -409,9 +409,22 @@ private:
 // gate array is actually TOLD, so it is the correct source even while its semantics are undecoded.
 bool multibus_storager_device::flux_density_fm() const
 {
-	if (m_prog_loaded)
-		return !BIT(m_prog[0], 7);
-	return !BIT(m_ch[(0xe800 - 0xe000) / 2], 10);   // no program yet: fall back
+	// cont.443: density is UIB+$12 BIT 2, not the program's bit7 and not UIB+$12 bit1.
+	// Measured against the media, which is mixed (cyl 0 FM 16x128, cyl 1+ MFM 16x256):
+	//   cyl  0  UIB+12=$40  bit1=0 bit2=0  media FM
+	//   cyl  1  UIB+12=$44  bit1=0 bit2=1  media MFM
+	//   cyl 69  UIB+12=$37  bit1=1 bit2=1  media MFM
+	//   cyl 83  UIB+12=$2f  bit1=1 bit2=1  media MFM
+	// bit2 tracks the media exactly; bit1 does not (it is clear for the MFM cylinder-1 read).
+	// The earlier reading - program bit7 == UIB+$12 bit1 == density - correlated two signals against
+	// each other and never against the media; they agreed while both were wrong at cylinder 1.
+	// The UIB is a HOST-SUPPLIED control block the gate array itself DMAs in (measured: fetched from
+	// host $0FE948 per operation), so reading it is not a firmware-RAM snoop - these bytes pass
+	// through the gate array's own channel.
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	if (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
+		return !BIT(cs.read_byte((m_uib_base + 0x12) & 0xffff), 2);
+	return !BIT(m_ch[(0xe800 - 0xe000) / 2], 10);   // no UIB yet: fall back
 }
 
 // Detection-is-capture: sweep the whole track's flux once (the gate array is continuously reading the
@@ -908,6 +921,16 @@ void multibus_storager_device::run_channel_dma()
 				st2, stv, stv, st2,
 				st2 == 0x80 ? "*** COMPLETION (0x80) ***" : (stv == 0x81 ? "busy" : "other"),
 				machine().time().as_double());
+		}
+		// TEMP cont.443: the UIB fetch.  It is re-fetched per operation here and carries FM
+		// (bit1 clear at +$12) for a cylinder-1 read that is MFM by construction.  Log the SOURCE
+		// address and what the host actually holds, to test whether the right block is fetched.
+		if (to_local && !is_data && ld == m_uib_base && len >= 0x14)
+		{
+			char h[0x14 * 3 + 1]; h[0] = 0;
+			for (u32 k = 0; k < 0x14; k++)
+				sprintf(h + k * 3, "%02x ", bs.read_byte((m_c000 + k) & 0xffffff));
+			logerror("UIB FETCH host %06x -> local %04x len=%d: %s\n", m_c000, ld, len, h);
 		}
 		for (u32 k = 0; k < len; k++)
 		{
