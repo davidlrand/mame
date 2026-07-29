@@ -508,7 +508,29 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
       RESETS the selector, $298C's bchg yields the same fork on the next IRQ6, and the STAKE arm is
       never taken.  The never-entered $92B4, the frozen C800[0] at $2380, and the 12-of-16 dropped
       records are ONE consequence, not three separate defects.
-  ★★★ THE MFM DROP MECHANISM, found (cont.452) - it is the bit1/bit2 divergence: >
+  ★★★ RETRACTED cont.453 - the bit1 mechanism is refuted by the WORKING CONTROL: >
+    UIB+$12 bit1 is CLEAR on BOTH reads - $40 at cyl 0 (WORKS) and $44 at cyl 1 (drops 12 of 16).
+    So $8A02's skip and $8A38's clr.w $7950 happen identically on the working read.  Neither can be
+    what distinguishes them.  The cont.452 mechanism was built from the failing path alone, without
+    a reference for what the same code does when it succeeds - the error this campaign has now made
+    in several forms.
+    THE WORKING CONTROL, finally run: $8A38 fires 58-145 times across the run and cylinder 0 reads
+    fine.  $92B4 fires 0-1 times ACROSS THE WHOLE RUN - both reads.  $8022 totals 16, which matches
+    the independently measured 12 FM + 4 MFM from armsites.lua, so the aggregates corroborate.
+    THEREFORE: $92B4 NEVER RUNS ON EITHER PATH.  "The STAKE arm is never taken" was never a defect -
+    it is not taken when the read WORKS either.  Everything built on $298C's alternator being pinned
+    by $8A38 is void, including the "three symptoms, one cause" collapse at cont.450.
+    [$7950] has 31 writers (13 bchg at $28E0/$290C/$2928/$2970/$297E/$298C/$299A/$29A4/$29B2/$29C0/
+    $29CE/$29DC/$29EA plus 18 explicit set/clears), and the disassembly header notes bit0 is SHARED
+    between the IRQ6 and IRQ5 forks - so attributing it to $8A38 was never safe.
+    WHAT ACTUALLY DIFFERS between working and failing: only the $8022 count, 12 vs 4.  $8022 is in
+    the data-done handler, so the question is unchanged and unglamorous: why do only 4 of 16 MFM
+    records reach data-done?
+    INSTRUMENT NOTE: the per-cylinder labelling failed twice - first SILENTLY (a pcall on a wrong
+    device path left cyl at 0 and lumped every count into one row, which looked like a clean cyl-0
+    result), then visibly as -1 once the fallback was made loud.  A silent default in a labelling
+    path produces a plausible table with meaningless rows.  Make label failures visible.
+  superseded_MFM_DROP_cont452: >
     Re-took the verify-body count with DEEP taps ($8A20 and $8A26, past the three or.b's) after the
     $8A14 count was suspected of prefetch shadow ($8A14 sits two bytes after $8A12 bra $8a38):
       $89FA gate: 58 | $8A14: 18 | $8A20 DEEP: 18 | $8A26 DEEP: 18 | $8AB2: 0

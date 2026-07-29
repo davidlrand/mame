@@ -1,0 +1,66 @@
+-- control0.lua - THE WORKING CONTROL.  Run the failing-path tap set on cylinder 0 as well.
+--
+-- This campaign has repeatedly reasoned about the failing path with no reference for what the same
+-- code does when it succeeds.  cyl 0 works (8 sectors, label readable, C800 armed); cyl 1 drops 12
+-- of 16.  UIB+$12 bit1 is CLEAR on BOTH, so the $8A02 skip and the $8A38 clr.w $7950 happen on the
+-- working read too - which means neither can be what pins the alternator.
+--
+-- [$7950] has 31 writers: 13 bchg sites ($28E0 $290C $2928 $2970 $297E $298C $299A $29A4 $29B2
+-- $29C0 $29CE $29DC $29EA) and 18 explicit set/clears.  $8A38 is one of many.
+--
+-- PREDICTION (stated first): $8A38 fires on cylinder 0 too, $92B4 fires anyway, so $8A38 alone does
+-- not pin the alternator.
+--
+-- Labelled by the DRIVE'S CYLINDER - media ground truth, not a firmware cell - cached in the
+-- periodic so no SRAM is read inside a tap.
+--
+-- USAGE: SDL_VIDEODRIVER=dummy CPUAP_RTCFIX=1 ./mame pcmx2 -video none -nothrottle -oslog \
+--   -autoboot_script docs/storager-lle/control0.lua -flop siemens/set1/mx2-001.imd
+
+local SC, STOP = ":slot1:storager:cpu", 22.0
+local cpu, sp, osp, fdd, armed = nil, nil, nil, nil, false
+local taps = {}
+local cyl = 0
+local C = {}   -- C[cyl] = { a38, b4, arm, irq6 }
+
+local function now() local ok,t = pcall(function() return manager.machine.time:as_double() end); return ok and t or 0 end
+local function bump(k)
+  C[cyl] = C[cyl] or { a38 = 0, b4 = 0, arm = 0, irq6 = 0 }
+  C[cyl][k] = C[cyl][k] + 1
+end
+
+local function arm()
+  if armed then return true end
+  local ok, d = pcall(function() return manager.machine.devices[SC] end)
+  if not ok or not d then return false end
+  armed = true; cpu = d; sp = d.spaces["program"]
+  osp = d.spaces["decrypted_opcodes"] or d.spaces["opcodes"] or sp
+  local ok2, fc = pcall(function() return manager.machine.devices[":slot1:storager:fdc0"] end)
+  taps[#taps+1] = osp:install_read_tap(0x8a38, 0x8a39, "a38", function() bump("a38") end)
+  taps[#taps+1] = osp:install_read_tap(0x92b8, 0x92b9, "b4",  function() bump("b4")  end)  -- deep in $92B4
+  taps[#taps+1] = osp:install_read_tap(0x8022, 0x8023, "arm", function() bump("arm") end)  -- the live C800 arm
+  taps[#taps+1] = osp:install_read_tap(0x2990, 0x2991, "irq6", function() bump("irq6") end) -- past $298C's bchg
+  print("control0 armed"); io.flush(); return true
+end
+
+emu.register_periodic(function()
+  if not arm() then return end
+  local f = m_fdd
+  local ok, c = pcall(function()
+    return manager.machine.devices[":slot1:storager:floppy0"]:get_device():get_cyl()
+  end)
+  if ok and c then cyl = c else cyl = -1 end   -- -1 makes a bad device path VISIBLE, not silent
+  if now() >= STOP then
+    print("=== working control: cylinder 0 vs cylinder 1, same taps ===")
+    print("  cyl   $8A38   $92B4(deep)   $8022 arm   IRQ6 fork")
+    local ks = {}
+    for k in pairs(C) do ks[#ks+1] = k end
+    table.sort(ks)
+    for _, k in ipairs(ks) do
+      local r = C[k]
+      print(string.format("  %3d  %6d  %10d  %10d  %9d", k, r.a38, r.b4, r.arm, r.irq6))
+    end
+    print("  cyl 0 = FM, works.  cyl 1 = MFM, drops 12 of 16.")
+    io.flush(); manager.machine:exit()
+  end
+end)
