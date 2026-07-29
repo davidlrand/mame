@@ -377,6 +377,47 @@ watch_pump:   # cont.421 - the read's completion architecture, traced end to end
 
 # ============================================================================================
 # ============================================================================================
+# ============================================================================================
+frontier_read_ladder_not_built:   # cont.431 - the named corruption, with a two-line test in front
+  finding: >
+    A cmd 0x95 posts 0x80 in 70ms having executed NO read ops.  The walker's list at $7250 holds
+    `001c 0022 0016 0000 | 0018 0054 004a 0042` where a working command (cmd 0x87) holds
+    `0024 0028 0056 0058 | 0018 0054 004a 0042`.  The walker takes the op00 path on that zero
+    ($158C move.w (A1),D0 / $158E bne - op00 is detected by (A1) reading ZERO, NOT by position),
+    stamps node+$26 = $000C and exits, leaving op18/op54/op4A/op42 unexecuted in the list behind it.
+    The runaway capture follows: the RETAINED field program is still armed with no ladder managing it.
+  the_head_is_another_command: >
+    `1c 22 16 00` are NOT truncated read ops - $5FC0 emits 24 28 56 58 [1A] 18 54 4A 42 36 00 and none
+    of 1c/22/16 is in that set.  They are valid ops ($1C->$355C, $22->$9018, $16->$2BD6) properly
+    terminated with 00, i.e. a DIFFERENT command's ladder, intact.  The tail (18 54 4a 42) is
+    byte-identical to the working command's, so only the head differs.
+  most_likely_cause: >
+    The read's builder never emitted anything, leaving the PREVIOUS command's list in the buffer.
+    $5FC0 has exactly that exit, two instructions in (verified from ROM):
+      $5FC4 movea.w $71bc,a2 / $5FC8 move.b ($a,a2),d0 / $5FCC or.b ($b,a2),d0
+      $5FD0 bne $5FDA        <- both zero FALLS THROUGH:
+      $5FD2 move.w #$6a,d0 / $5FD6 bra $60F6   (error $6A, nothing emitted)
+    If node+$a and node+$b are both zero the builder bails before writing a single word.
+  cheapest_test: >
+    ONE WORD: node+$a / node+$b at the read's builder entry, and whether $5FDA is reached at all.
+    If the builder bails, no write tap on $7250 is needed - nothing wrote the zero, it was always
+    there, and the "builder defect vs stray write" two-way test collapses to one answer.
+  ruled_out: >
+    Wrong channel ([$721a] measured 7224 on EVERY op00 stamp, both commands, and both walk base
+    $7250, so build and walk agree).  Allocator exhaustion (free-list healthy at exit on all reads).
+    The $7B1C watchdog as the timebase (zero arms).  A retry loop ([$79aa] 0 at both ends).  Any
+    fixed-duration timeout (2.7s / 12.2s / 18.3s for the same command is a 6.8x spread).
+  also_seen: >
+    Two op00 stamps during cmd 0x95 have A1 OUTSIDE the ladder - $7664 (inside the ledger) and $79F6
+    (the E802 shadow) - both with A0=$71F0 (the node) rather than A0=$7224 (the descriptor).  That is
+    a DISTINCT condition from the truncated-ladder stamps, not the same pointer wandering.
+  instrument_notes: >
+    node+$26's $000A state lasts ONE walker pass ($15A0 writes it, $15A4 advances), so a polling
+    sample cannot see it - it needs a WRITE tap with the base from [$71bc].  An earlier "parks=0" was
+    that artifact and is WITHDRAWN.  Also: overlapping write taps on one space do not both fire - a
+    build-side tap on $7220-$7270 recorded nothing because a $7100-$72FF tap already covered it.
+  conf: "V (the corruption and its effect) / ? (whether the builder bailed)"
+
 frontier_cmd95_18s:   # cont.430 - the named frontier, with its test already defined
   state: >
     Under program retention the boot reaches 13 commands / 10 clean 0x80 and then loops: a cmd 0x95
