@@ -942,6 +942,25 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		if (offset == std::size(m_prog) - 1 && m_prog_loading)
 		{
 			m_prog_loading = false;
+			// A block whose every word is $023F is a WIPE, not a load.  $023F is the idle/terminate
+			// step that tails op18's own program, and $5E64 ($5E98 lea $e000,a1 / $5EA0 move.w
+			// #$23f,(a1)+ / dbra, sixteen times) uses exactly that to CLEAR the field program - it runs
+			// on every read, emitting through the inherited A6 and wiping E000 as it goes.  Treating
+			// that as a load-complete edge marked a program loaded and opened the read window on the
+			// very sequence that clears it, so the model and the firmware disagreed about what the
+			// gate array was running. (cont.434)
+			bool wipe = true;
+			for (u16 w : m_prog)
+				if (w != 0x023f) { wipe = false; break; }
+			if (wipe)
+			{
+				if (m_prog_loaded)
+					logerror("GA field program WIPED (16x $023f) during cmd=%02x - was loaded, now cleared t=%.5f\n",
+						m_iopb_cmd, machine().time().as_double());
+				m_prog_loaded = false;
+				m_read_window = false;   // nothing left to run
+				return;
+			}
 			m_prog_loaded = true;      // a fresh load REPLACES a retained one
 			start_field_program();
 		}

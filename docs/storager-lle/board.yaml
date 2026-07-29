@@ -421,11 +421,38 @@ ladder_ownership:   # cont.433 - who runs the read's builder.  READ THE RETRACTI
     Both candidate descriptor bases are covered ($721C->$7222 and $7224->$722A); the only writes to
     $7224-$722E in the entire run are the RAM self-test walking patterns at t=0.12.  A null cannot be
     jsr'd, so the $2316/$233A/$2342 chain is not what transfers control to $5E64.
-  CONFIRMED cont.434 - $5E64 is a micro-op that WIPES the field program: >
+  ATTRIBUTION CORRECTED cont.435 - the wipe belongs to cmd 0x87, NOT to reads: >
+    cont.434 recorded "$5E64 runs ONLY on reads" from $5E82/$5EA0 counts binned per command.  WRONG.
+    Reported model-side at the wipe site, with no sampling: `WIPED (16x $023f) during cmd=87`, twice
+    per run, and the HOST GO log (same clock, no sampling) puts both wipes 0.7ms after an 0x87 GO.
+    0x87 is the command immediately preceding every read in the preamble.
+    WHY BOTH PROBES AGREED AND BOTH WERE WRONG: they binned by periodically sampling the node command
+    byte, so they were not independent instruments - they were ONE instrument run twice, and the
+    node byte lags the GO across a sub-millisecond boundary.  See [[probes-sharing-a-method]].
+    WHAT DOES NOT SURVIVE: "$5E64 runs only on reads", and with it the reading that the read's ladder
+    is rewritten MID-WALK by a micro-op.  Whether $5E64 runs during reads at all is now UNMEASURED.
+    WHAT SURVIVES: A6 = $7250 at the emit (a register read at the tap, no binning); the wipe itself;
+    and the model divergence, which never depended on which command $5E64 runs under.
+    The `1c 22 16 00` in the buffer is now most simply 0x87's ladder, emitted by 0x87, still there
+    when the read walks - the INHERITANCE reading, not the mid-walk rewrite.
+  DISPATCH PATH UNACCOUNTED FOR - the gap under the inheritance reading: >
+    Something invokes the builder and neither candidate route is accounted for:
+      - $2342 jsr (A1) with A1 from ($6,A1): that slot measured as NEVER written, reading 0000, which
+        would fault rather than dispatch (cont.433b).
+      - the $192 table as op $02: requires an 02 in a ladder, and `1c 22 16 00` contains none.
+    $0DE4 `move.w (A1)+,D7` loads the handler word and no `move.w D7,` store was found in the
+    following 95 instructions - but that is NOT the same as unused: a movea from D7, or a jsr through
+    a register D7 was transferred into, would not match that grep.
+    NEXT: follow D7 to its USE with a search covering transfers and indirect calls, not just stores.
+    If D7 reaches a jsr, the $92 table IS the dispatch source and the question becomes why 0x95 lands
+    on 0x87's entry.  If it genuinely dies at $0DE6, the table's first word is only a validity marker
+    and the real dispatch is somewhere none of us has looked.  Inheritance without this is a
+    description of the symptom, not a mechanism.
+  CONFIRMED cont.434 - $5E64 WIPES the field program (attribution corrected above): >
     Measured per command, tapped deep ($5E82 the ladder emit, $5EA0 the E000 loop body):
       cmd 87 / 98:  emit 0, wipe 0,  E01E last value $0cbb   (a real program word)
       cmd 95:       emit 1-2, wipe 17 or 34, E01E last value $023F, A6 = $7250
-    So $5E64 runs ONLY on reads.  It emits 1c/22/16 through A6 - and A6 is the ladder buffer $7250,
+    It emits 1c/22/16 through A6 - and A6 is the ladder buffer $7250,
     which survives because the walker's $15AC `movem.w A0-A2,-(A7)` preserves only A0-A2, so a
     micro-op inherits the dispatcher's A6 ($2338 movea.w D0,A6) and rewrites the ladder MID-WALK.
     No install path and no bsr/jsr $5E64 are needed or exist.
