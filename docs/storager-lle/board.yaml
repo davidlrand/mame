@@ -500,10 +500,25 @@ ladder_ownership:   # cont.433 - who runs the read's builder.  READ THE RETRACTI
       ROM" hits are data.
       MEASURED (prediction's testable half, all zero as predicted): op $46 body 0, $8F6E return 0,
       $7228 writes with low byte $FF: 0.
-      BOUND: zero executions confirm the PREDICTION, not the MECHANISM.  That $8F62-$8F72 is op $46's
-      tail is still a routine-boundary inference; zero runs cannot separate "op $46 returns $FFFF"
-      from "that tail belongs to another routine".  Both halves light up together only on a
-      multi-chunk command, which this workload never issues.
+      BOUND NARROWED cont.435f - the tail IS op $46's, confirmed statically:
+        returns/epilogues anywhere in $8AC8-$8F62 (1178 bytes): ZERO.  A routine boundary requires a
+        preceding return, so $8F72 is the FIRST return reachable from $8AC8 and "the tail belongs to
+        another routine" is eliminated without needing a run.
+        Shared-tail alternative also eliminated: the only references to $8F62/$8F6E/$8F72 anywhere are
+        $8F48 bne and $8F4E beq, both INSIDE the span, and there are no data-word references.
+      NUANCE: those two branches go to $8F6E, PAST the $FFFF load at $8F62.  So op $46 has return
+      paths that skip it and return whatever D0 held - it returns $FF on ONE path, not unconditionally.
+      What still needs a run is only whether the $FF path is the one continuation takes.
+  CONSTRUCTING THE MULTI-CHUNK COMMAND (the test that exercises all four halves at once): >
+    The clamp is $7372 cmp.l D1,D2 / $7374 bcc $738C:
+      $7362 move.b ($1,A6),D2   - D2 = UIB+$1, sectors per track (measured $10 = 16)
+      $736A btst #$1,D0         - density; bit1 CLEAR = FM
+      $7370 addq.w #1,D2        - THE FM LEG ADDS ONE, so D2 = 17 for our media
+      D2 >= D1 -> $738C clr.l $7abe (single chunk).  D1 > D2 -> $7376 continuation.
+    So continuation needs D1 > 17, NOT ">= 16" - the FM increment raises the threshold by one.
+    One such IOCB would exercise $9412's install, $2342's dispatch, op $46's $FF verdict and
+    [$7958]'s role simultaneously, and would settle by EXECUTION which of op $46's return paths
+    continuation takes.
     superseded_NEXT: who writes $00FE to $7228, and what would write $00FF.  One value, one cell, and the
     write is already known to be hot (25572/run) so it cannot hide.
   superseded_STILL_OPEN: what performs the INITIAL builder dispatch.  The descriptor +6 slot is never written
