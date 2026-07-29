@@ -506,7 +506,8 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
     WITH its alternative ("if $8A02 falls through instead, the layout is the reject").  Both halves of
     the primary prediction were wrong; a single-branch prediction would have refuted and left nothing.
     Pair predictions with their alternative as a habit, not as luck.
-  superseded_FRONTIER: why 12 of 16 MFM records are dropped BEFORE data-done - which points at the record
+  superseded_FRONTIER: >
+    why 12 of 16 MFM records are dropped BEFORE data-done - which points at the record
     verify / MFM ID compare ($89F2, $9884), the code this campaign long recorded as unreachable.
     CAVEAT on the instrument: the FM/MFM labelling read UIB+$12 ($6E72) from inside a tap callback,
     within the model's own $4000-$7FFF snoop range - the hazard in storager-measurement-discipline.
