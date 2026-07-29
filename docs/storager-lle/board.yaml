@@ -8,7 +8,16 @@
 #           "?" = provisional / open frontier.
 
 meta:
-  as_of: "cont.420 (2026-07-25)"
+  as_of: "cont.432 (2026-07-28)"
+  BASELINE: >
+    cont.426 (the SRAM byte-order correction) is THE BASELINE for all RE.  Anything measured before
+    it that touched byte granularity was taken through an inverted mapping - see sram_byte_order,
+    including its re_derive_not_correct clause.  Do not cite a pre-426 byte-level finding without
+    re-deriving it.
+    ARCHIVAL ONLY, removed from the source at cont.432 and not to be reintroduced without reading
+    their entries first: the Q3b $AA end-marker (end_marker_experiments), Q2_PRESERVE_KICK_ARM, the
+    three counted-disarm variants and the VARIANT enum (counted_stop_open, converged_read), and
+    EXP_EARLY_CAPTURE.  Each was a real experiment that closed a dead end; none is live behaviour.
   sources: ["DESIGN.md (append-only log)", "siemens/disasm/storager/storager_v260.asm (commented disasm)", "storager.cpp (the clean-rebuild model)", "storager_3030.webp (Plamen's board photo)"]
   synthesis_note: >
     The cont.353 clean rebuild re-authored storager.cpp from the gate-array spec with ALL HLE

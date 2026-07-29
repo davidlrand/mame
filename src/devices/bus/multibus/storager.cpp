@@ -157,21 +157,12 @@ constexpr bool Q3B_END_MARKER = false;
 //                     Branch A so this should be a no-op for op42 - control experiment)
 //   V3 STOP+IRQ4    - V1, then one channel-done IRQ4 after the last data field (program-complete
 //                     interrupt, no RAM deposit).  Tests whether IRQ4 alone unblocks the drain.
-enum { VAR_BASELINE = 0, VAR_COUNTED_STOP = 1, VAR_PIT2_OUT = 2, VAR_STOP_IRQ4 = 3 };
-constexpr int VARIANT = VAR_STOP_IRQ4;
 
 // Q2 hypothesis test (TEMP): $70d4 `move.w #$1,$7a30` zeros the HIGH byte that $6042's
 // `bset #0,$7a30` armed for the done-tail kick.  If that clobber is accidental, preserving
 // high-byte bit0 through the word write lets $833c actually bsr $3dbc.  false = stock firmware
 // behaviour; true = rewrite the $70d4 store to $0101 (low=1 soft flag + high bit0 kick arm).
 // This is a temporary CPU-side patch of one store, not a GA SRAM deposit.
-constexpr bool Q2_PRESERVE_KICK_ARM = false;   // RETIRED cont.426 - $70D4 ARMS the kick; the patch was an artifact
-// EXPERIMENT (temporary): start the capture at E804 drive-select rather than at op18's program load.
-// op18 -> op4A is only ~50us, far too short for a complete record (IRQ6 -> IRQ5 setup -> IRQ5 done ->
-// $8018, which is what writes [$74b4] at $81F8/$81FC).  drive-select -> op4A is ~1.67ms, enough for one.
-// CRITERION: [$74b4] != 0 with [$791a] == 0 at $6ED2 means $70F4 launches with no patch, regardless of
-// whether the read survives afterwards.  Still zero, with records delivered beforehand, kills the lever.
-constexpr bool EXP_EARLY_CAPTURE = false;
 // The $4000-$7FFF SRAM's byte order (cont.426).  Three independent sites have the SAME signature -
 // the firmware writes a WORD and then tests that value as a BYTE at the identical effective address,
 // expecting the word's LOW half:
@@ -182,11 +173,6 @@ constexpr bool EXP_EARLY_CAPTURE = false;
 // node+$26 deposit and Q2 exist to paper over.  If byte accesses resolve to the other half, all three
 // resolve at once with no patch.  Word accesses are unaffected by construction.
 constexpr bool SRAM_BYTE_SWAPPED = true;
-// cont.428: does the gate array self-disarm at all?  Every counted variant needs a count the GA
-// cannot legitimately have - a raw mark count starves the read (rejected records count toward it),
-// and a stake tally is a firmware-RAM snoop.  The firmware already stops the records by ceasing to
-// re-arm E802 bit11, which IS a gate-array-visible signal.  Test: no self-disarm at all.
-constexpr bool NO_COUNTED_DISARM = true;
 
 // Q3 hypothesis test (TEMP): end-marker after a ledger stake, using only the write address.
 // When firmware stakes $c0 ($8120), if the NEXT ledger byte is NOT still a want ($ff), deposit
@@ -322,7 +308,7 @@ private:
 	bool m_ser_clk = true;       // last E802 bit0 seen
 	bool m_ser_active = false;   // a serial transaction has driven the clock this command
 	bool m_settle_out = true;    // PIT0 ctr1 mode-5 one-shot OUT; F000 bit1 seek/settle busy = !OUT
-	bool m_pit2_out = false;     // PIT1 ctr2 OUT (VARIANT 2/3 experiment surface)
+	bool m_pit2_out = false;     // PIT1 ctr2 OUT (recorded, not surfaced on F000)
 	bool m_r0_busy = false;      // R0 status bit1: latched at host GO, cleared at the firmware's DONE stamp
 	bool m_r0_doneint = false;   // R0 status bit2: OPER-DONE-INT, set at DONE, cleared by CLR-INT
 	bool m_gate0 = false;        // E800 bit9 -> PIT1 ctr0 gate
@@ -588,27 +574,13 @@ void multibus_storager_device::advance_read()
 	// against 14 real stakes - so the disarm fired at ~40% of the commanded sectors, stopping the marks
 	// while a chunk was armed with [$741c]=1, which is exactly the state $7B1C's 1.305s watchdog exists
 	// to catch: over-count -> early disarm -> armed chunk never fills -> $201C -> host 0x82/$1C.)
-	int const prog_n = m_prog_count > 0 ? m_prog_count : m_sec_count;
-	if (!NO_COUNTED_DISARM
-		&& (VARIANT == VAR_COUNTED_STOP || VARIANT == VAR_STOP_IRQ4)
-		&& m_data_done_n >= prog_n && prog_n > 0)
-	{
-		logerror("GA disarm: delivered=%d prog_count=%d (accepted tally was %d, unused) t=%.5f\n",
-			m_data_done_n, prog_n, m_accepted_n, machine().time().as_double());
-		// V3: the counted program is COMPLETE - the commanded number of sectors has been accepted.
-		// Signal it the way a channel does, with one channel-done IRQ4 and no firmware-RAM write.
-		// This must hang off the ACCEPTED count, not the delivered one: delivered includes the
-		// records the firmware rejected ($7DA2 -> $88AC), so arming on it fires while sectors are
-		// still outstanding.
-		if (VARIANT == VAR_STOP_IRQ4 && !m_prog_done_irq4)
-		{
-			m_prog_done_irq4 = true;
-			m_dma_done->adjust(attotime::from_usec(50));
-			logerror("GA program-done IRQ4 armed t=%.5f\n", machine().time().as_double());
-		}
-		m_read_active = false;
-		return;
-	}
+	// NO self-disarm.  Every counted stop needed a number the gate array cannot legitimately have:
+	// a stake tally is a firmware-RAM snoop, a raw delivered count starves the read (delivered includes
+	// records the firmware REJECTED at $7DA2 -> $88AC), and op18 is count-invariant anyway - its program
+	// describes the TRACK FORMAT, not the transfer, so there is nothing to count down.  The gate array
+	// raises marks as the disk turns; the firmware stops them by ceasing to re-arm E802 bit11.
+	// The three counted variants and their measurements are archival - see board.yaml counted_stop_open
+	// and the cont.428 commit.  Do not reintroduce one without reading those first.
 	if (PER_ADDRESS_MARK)
 	{
 		// The disk keeps turning and every address mark that passes the head raises a record.  The gate
@@ -690,13 +662,14 @@ void multibus_storager_device::advance_read()
 		{
 			// COUNT EXHAUST (model observation only).  Do NOT write firmware RAM here.
 			// A prior experiment OR'd UIB+$12 bit7 (op42 guard bypass at $6C32) and deposited a
-			// phase byte at node+$26 from the pump - both are unproven "GA writes firmware RAM"
-			// hypotheses.  cont.414c: even when op42 times out the host still never sees 0x80, so
-			// short-circuiting op42 is not the real completion path.  Probe with these deposits
-			// GATED OFF so the log reflects firmware-only state.
+			// phase byte at node+$26 from the pump.  Both are RETIRED (cont.426): with the SRAM byte
+			// order corrected the firmware's own word writes satisfy those gates, and the read
+			// completes and posts 0x80 with neither deposit.  The old note here - "even when op42
+			// times out the host still never sees 0x80" - was measured through the inverted byte
+			// mapping and is FALSE; op42 completes in 0.5ms and the host sees 0x80.
 			m_status_armed = true;
-			logerror("GA count-exhaust n=%d var=%d t=%.4f (no UIB+12 / node+26 deposit)\n",
-				m_data_done_n, VARIANT, machine().time().as_double());
+			logerror("GA count-exhaust n=%d t=%.4f\n",
+				m_data_done_n, machine().time().as_double());
 
 		}
 	}
@@ -936,10 +909,7 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 			d = (d & ~0x0002) | (m_settle_out ? 0 : 0x0002);  // bit1 = seek/settle busy (PIT ctr1 one-shot, low = busy)
 		// V2: surface PIT1 ctr2 OUT on bit8 (suspected op42 Branch-B busy/fault).  Baseline leaves
 		// bit8 clear.  Read path is Branch A so a change here should not move op42 by itself.
-		if (VARIANT == VAR_PIT2_OUT)
-			d = (d & ~0x0100) | (m_pit2_out ? 0x0100 : 0);
-		else
-			d &= ~0x0100;
+		d &= ~0x0100;                                    // bit8 unmodeled; keep clear
 		d &= ~0x0200;                                    // bit9 unmodeled; keep clear
 		d &= ~0x0009;                                    // bits 0/3 = drive faults (errors $10 / $1B); a healthy unit reports none
 	}
@@ -1025,11 +995,6 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		// ONE'S-COMPLEMENTED, so head 0 presents as $F (the observed $BF78 = head 0, the cyl0 label).
 		m_sel_head = u8(~(data >> 8) & 0x0f);
 		m_sel_drive = u8(data & 0xff);
-		if (EXP_EARLY_CAPTURE && m_iopb_cmd == 0x95 && !m_read_active)
-		{
-			logerror("EXP: early capture arm at E804 drive-select t=%.5f\n", machine().time().as_double());
-			start_field_program();
-		}
 	}
 	else if (a == 0xe802)
 	{
@@ -1200,6 +1165,14 @@ void multibus_storager_device::host_win_w(offs_t offset, u16 data, u16 mem_mask)
 		if (dst < 0x4000 || dst >= 0x7e00)
 			dst = 0x71f0;
 		address_space &bs = m_bus->space(AS_PROGRAM);
+		// FIFTH model<->SRAM byte boundary (cont.432), made explicit: cs.write_byte goes through the
+		// swapped local mapping, bs.read_byte does not.  Node BYTE reads therefore round-trip
+		// correctly - which is why the command byte and $5FC0's node+$a/$b guard inputs are faithful -
+		// but any host-supplied field the firmware reads as a WORD would see swapped halves.  Swept
+		// against the disassembly: zero such reads exist (0 word reads at displacement <$18 off any
+		// register loaded from $71bc/$7b20/$7a06, 39 load sites), consistent with a byte-oriented
+		// IOPB.  That sweep does not follow node pointers passed across calls, so if a word read of a
+		// host field is ever found, THIS is the copy that has to swap.
 		for (u32 k = 0; k < 0x18; k++)
 			cs.write_byte((dst + k) & 0xffff, bs.read_byte((dbi + k) & 0xffffff));
 		// Capture the fetched-IOPB pointer so the firmware knows where its work IOPB is: [$7B20] is the
@@ -1320,7 +1293,7 @@ void multibus_storager_device::timer0_out(int state)
 void multibus_storager_device::timer2_out(int state)
 {
 	// PIT1 ctr2 is programmed by the firmware (op28/$684C, op42/$6CC2 control $9A).  Capture OUT
-	// so VARIANT 2 can surface it; baseline ignores it.
+	// recorded but not surfaced on F000 bit8 (see cont.428).
 	bool const rising = state && !m_pit2_out;
 	m_pit2_out = bool(state);
 	if (rising)
@@ -1413,13 +1386,6 @@ void multibus_storager_device::device_reset()
 		// (queue non-empty) -> $3E50 -> $4062 -> $4122 -> $414C launch, and does the rest of the chain
 		// then complete?  The $3E08 SR fork is only on the EMPTY path, so an interrupt-context call
 		// launches just as a mainline one would.
-		if (Q2_PRESERVE_KICK_ARM)
-			cs.install_write_tap(0x7a30, 0x7a31, "q2_kick",
-				[](offs_t, u16 &data, u16 mem_mask)
-				{
-					if (mem_mask == 0xffff && (data & 0xff00) == 0)
-						data |= 0x0100;      // keep the high-byte kick bit through the word store
-				});
 		cs.install_write_tap(0x7654, 0x76bf, "accept_count",
 			[this](offs_t offset, u16 &data, u16 mem_mask)
 			{
@@ -1487,8 +1453,7 @@ void multibus_storager_device::device_reset()
 	m_status_armed = false;
 	m_read_active = false;
 	spin_drives();
-	logerror("GA VARIANT=%d (0=base 1=count-stop 2=pit2 3=stop+irq4) Q2_KICK=%d\n",
-		VARIANT, int(Q2_PRESERVE_KICK_ARM));
+	logerror("GA model: SRAM byte-swapped, no self-disarm, field program retained across commands\n");
 }
 
 void multibus_storager_device::floppy_formats(format_registration &fr)
