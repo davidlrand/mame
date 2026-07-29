@@ -411,7 +411,26 @@ floppy_boot_status:   # cont.436 - the fundamental question, answered
          MFM : C=$7DB0 H=$7DB1 S=$7DB2 X=$7DC0   = +4/+5/+6/+20
        The model writes FE,C,H,R,N (FM) and A1,A1,A1,FE,C,H,R,N (MFM), so R lands at +3 and +6
        respectively.  BOTH MATCH.  No clobber: UIB+$CE never holds anything but those two values.
-  THE SYMPTOM, unexplained: >
+  STORAGER EXONERATED FOR THIS REJECTION (cont.437): >
+    Sectors are placed BY IDENTITY and correctly - pos = r-1 - verified three independent ways:
+      the IOCB requests 8 blocks from the start into host buffer $0FC0DD (95 00 00 00 02 00 00 00
+        00 00 00 08 14 0f c0 dd);
+      the IMD has VOL1SINIX0 genuinely in sector R=7 (track0 mode=1 nsec=16 size=128, map 1..16,
+        R=7 and R=8 are the only type=1 records, everything else uniform fill);
+      the model delivers R=7 to host position 6 = $0FC3DD, exactly where a run starting at sector 1
+        puts it.
+    RETRACTED with it: "sectors are placed by ARRIVAL, not identity", and the reading of the 0x300
+    offset as evidence of a defect.  That offset is CORRECT.
+    So the payload is byte-correct, the placement is correct, the label is where the firmware expects
+    it - and the firmware still says "no sys-floppy".  The rejection is being made by the HOST on data
+    that was delivered correctly.  This failure is not the storager's.
+  THE REMAINING LEAD IS HOST-SIDE: >
+    The verdict does not follow the 8-sector read (completes 6.41) but a SECOND read - 4 sectors to
+    the SAME buffer $0FC0DD at 8.13 - with "no sys-floppy" at 8.3.  Four sectors from the start, into
+    a buffer where the label has already been found, immediately before the verdict, reads like
+    PARSING rather than fetching.  What the CPUAP does between reading "HDR1 NSC Boot" and concluding
+    there is no system floppy is a different subsystem from this campaign.
+  THE SYMPTOM, as originally recorded (superseded by the above): >
     The host buffer fills sequentially from $0FC0DD, but the label arrives at $0FC3DD - 0x300, six
     128-byte sectors late.  So sectors are placed by ARRIVAL rather than by identity, the firmware
     inspects $0FC0DD, finds no VOL1SINIX0, and reports "no sys-floppy".
@@ -1113,7 +1132,15 @@ open_frontier:
       So op42-gate-is-798e is the one to solve first; this may resolve with it.
     next: "solve op42-gate-is-798e first, then re-measure whether bit14 is still unset"
     conf: "?"
-  - id: am2147-purpose   # cont.420 - reopened
+  - id: am2147-purpose   # cont.420 - reopened; FIRST behavioural evidence cont.437
+    evidence_cont437: >
+      The first data field of every run had NO destination: the firmware arms C800[0] only in RESPONSE
+      to a data-done, so field 1 arrives before any arm and the model discarded it (host position 0
+      then received stale SRAM on every read).  Detection and destination are INDEPENDENT events - the
+      gate array deserialises the field as it passes the head, and the chunk address tells it where to
+      put it - so a recovered field must survive the gap between them.  Holding the data and flushing
+      it when the chunk arms is exactly what a bit buffer does, and it FAVOURS THE BUFFER READING over
+      the program-store reading.  This is the first behavioural evidence bearing on this frontier.
     state: >
       The "serial bit buffer for ~one sector" reading is weak. (a) It is 4096 BITS = 512 bytes, not a
       sector for the ESDI path (1024B). (b) Recovered data is OBSERVED landing in the main SRAM chunk

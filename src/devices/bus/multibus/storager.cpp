@@ -374,6 +374,8 @@ private:
 	void capture_track();          // synchronous full-revolution flux decode into m_track
 	bool m_read_active = false;     // a read window is open (records delivered until the firmware stops re-arming)
 	int  m_sec_count = 0;           // commanded sectors this operation ([$7abc])
+	u32  m_held_len = 0;            // first field of a run, awaiting a chunk to land in
+	u8   m_held_data[1024] = {};
 	int  m_sec_index = 0;           // sector currently being delivered
 	int  m_sec_phase = 0;           // 0 = ID (IRQ6) next, 1 = data (IRQ5) next
 	attotime m_next_rec = attotime::never;   // when the next field has physically passed the head
@@ -653,9 +655,28 @@ void multibus_storager_device::advance_read()
 		// RESPONSE to the data-done record ($8018), so field 0 can have no destination, and withholding
 		// its record to wait for one deadlocks (measured: 9293 attempts, never armed).  The field is
 		// genuinely lost - it arms the pipeline - and the wanted data must be caught on a later pass.
+		// TEMP cont.437: does the firmware choose the chunk by the recovered sector IDENTITY or by
+		// arrival order?  Log R against the chunk it commanded; the host address is logged at the
+		// channel DMA, so R -> chunk -> host can be matched end to end.
+		logerror("FIELD r=%02x c=%02x h=%02x -> chunk %04x  (sec_index=%d, done_n=%d)\n",
+			s.r, s.c, s.h, dst, m_sec_index, m_data_done_n);
 		if (dst >= 0x4000 && dst + s.len <= 0x8000)
+		{
 			for (int k = 0; k < s.len; k++)
 				cs.write_byte((dst + k) & 0xffff, s.data[k]);
+		}
+		else
+		{
+			// The FIRST field of a run has no destination yet: the firmware arms C800[0] in RESPONSE
+			// to a data-done, so field 1 arrives before any arm.  Discarding it loses sector 1 - the
+			// firmware has already armed a chunk for it and ships that chunk empty, so host position 0
+			// receives stale content while sectors 2..8 land correctly at positions 1..7.
+			// Do not withhold the RECORD (that deadlocks - the arm never comes); hold the DATA and
+			// flush it as soon as a chunk is armed. (cont.437)
+			m_held_len = s.len;
+			std::copy_n(s.data, s.len, m_held_data);
+			logerror("FIELD r=%02x held - no chunk armed yet\n", s.r);
+		}
 		m_mark_pending = 5;                     // data field captured (IRQ5 #2 -> $8018 done)
 		m_sec_phase = 0;
 		m_sec_index++;                          // one sector completed after its data-done record
@@ -807,7 +828,7 @@ void multibus_storager_device::run_channel_dma()
 				u8 const c = cs.read_byte((ld + k) & 0xffff);
 				t[k] = (c >= 0x20 && c < 0x7f) ? char(c) : '.';
 			}
-			logerror("DATA->host %06x len=%d swap=%d  first16: \"%s\"\n", m_c000, len, swap, t);
+			logerror("DATA->host %06x <- chunk %04x len=%d  first16: \"%s\"\n", m_c000, ld, len, t);
 		}
 		// TEMP: the host's completion verdict is node+3, which the swap lands at host+2.
 		if (to_host && !is_data && len > 3)
@@ -1097,6 +1118,21 @@ void multibus_storager_device::c800_w(offs_t offset, u16 data, u16 mem_mask)
 {
 	COMBINE_DATA(&m_c800[offset & 0xff]);
 
+	// A held first field flushes as soon as the firmware arms a chunk: the arm is what gives it a
+	// destination, and until then it has none. (cont.437)
+	if ((offset & 0xff) == 0 && m_held_len)
+	{
+		u32 const dst = u32(m_c800[0]) << 1;
+		if (dst >= 0x4000 && dst + m_held_len <= 0x8000)
+		{
+			address_space &cs = m_cpu->space(AS_PROGRAM);
+			for (u32 k = 0; k < m_held_len; k++)
+				cs.write_byte((dst + k) & 0xffff, m_held_data[k]);
+			logerror("held field flushed into chunk %04x t=%.5f\n", dst, machine().time().as_double());
+			m_held_len = 0;
+		}
+	}
+
 	// C800 is a set of write PORTS into the field sequencer, not a 256-cell file: op18 pushes a
 	// descriptor stream through three offsets, writing the SAME port repeatedly (cell 0 six times over,
 	// cell $3F eight times) - as storage all but the last would be lost, so each write is a push.  A
@@ -1218,6 +1254,15 @@ void multibus_storager_device::host_win_w(offs_t offset, u16 data, u16 mem_mask)
 		// swapped halves while node BYTE reads round-trip correctly.  Check the $5FC0 guard's inputs
 		// (node+$a/$b, both BYTE reads) against the host's own bytes - the IOCB is known good from the
 		// HLE, so a mismatch is ours.
+		{
+			// TEMP cont.437: the whole IOCB, so the REQUESTED starting sector is visible.  The label
+			// lives in sector R=7 on this media; if the request starts at 7 the label belongs at host
+			// position 0, and delivering a run from r=01 is the defect.
+			char h[3 * 0x18 + 1]; h[0] = 0;
+			for (u32 k = 0; k < 0x18; k++)
+				sprintf(h + k * 3, "%02x ", cs.read_byte((dst + k) & 0xffff));
+			logerror("IOCB cmd=%02x: %s\n", m_iopb_cmd, h);
+		}
 		logerror("IOPB->node cmd=%02x  node+a=%02x node+b=%02x  host+a=%02x host+b=%02x  guard=%s"
 			"  node+20 word=%04x (bit14=%d)\n",
 			m_iopb_cmd,
@@ -1241,6 +1286,7 @@ void multibus_storager_device::host_win_w(offs_t offset, u16 data, u16 mem_mask)
 		m_desc_n = 0;   // the descriptor capture buffer is per-load, but the LOADED program persists
 		// The firmware carries the STATUS/ERROR bytes back to the host IOPB itself, via its node->host
 		// bus-master DMA (run_channel_dma, E800 bit13); the model transcribes nothing here.
+		m_held_len = 0;   // no field carries across a command boundary
 		m_ser_active = false; m_ser_clk = true;   // the serial ack does not carry across a command boundary
 		// Engagement must be decided HERE for a retained program.  With op18 skipped, nothing in the
 		// ladder (24 28 56 58 54 4A 42 36 00) writes E000, so the bit11 test below never evaluates and
