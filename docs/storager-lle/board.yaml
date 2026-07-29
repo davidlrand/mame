@@ -463,7 +463,25 @@ ladder_ownership:   # cont.433 - who runs the read's builder.  READ THE RETRACTI
     under EITHER byte order - it did NOT change state as a side effect of the byte-order fix, and the
     byte/word pairing here ($231A/$254A test bytes, $0AA2/$0AB6/$15C0/$27F4 write words) is a red
     herring for once.
-    NEXT: who writes $00FE to $7228, and what would write $00FF.  One value, one cell, and the
+    WRITER IDENTIFIED (cont.435d): $15C0 `move.w D0,($4,A0)` - the WALKER stores every micro-op's
+    return value at descriptor+$4.  A0=$7224 was already measured at the op00 stamps, so the store
+    lands on $7228.  The 25572 $00FE writes are op42 returning $FE (WAIT) on every walker pass; the
+    gate at $231A is reading the LAST OP'S VERDICT.
+    So $FE/$FD/$FF are all WAIT to the walker ($15C8/$15CE/$15D4 all branch to $15FC), but only $FF
+    satisfies $231A and lets $2342 dispatch a builder: $FE/$FD mean "re-enter me next pass", $FF means
+    "re-enter me AND re-run the builder".
+    BYTE ORDER, both true and pointing opposite ways: for the $00FE actually present the gate fails
+    under EITHER order (halves $00/$FE, neither is $FF) - so today's failure is not a byte-order
+    effect.  But for $00FF it differs: pre-fix byte[$7228] is the HIGH half ($00) and the gate could
+    NEVER pass; post-fix it is $FF and the gate CAN.  This dispatch path is only satisfiable at all
+    after cont.426.
+    NEXT: which handler returns $FF, and why is it not reached?  Greppable rather than measurable.
+    First pass: the ONLY immediate $FF into D0 in the ROM is $07A6 `moveq #-$1,D0`, and it heads a
+    register-fill (D0->D1->..->A2 all $FFFFFFFF) in an init/self-test routine, NOT a handler.  BOUND:
+    that grep covered `70ff` and `303c00ff` only - a computed return, `103c00ff`, or D0 loaded from
+    memory would not match, so this is "no immediate-form $FF return exists", not "no handler can
+    return $FF".  If none can, $2342 is vestigial or belongs to a command class not exercised here.
+    superseded_NEXT: who writes $00FE to $7228, and what would write $00FF.  One value, one cell, and the
     write is already known to be hot (25572/run) so it cannot hide.
   superseded_STILL_OPEN: what performs the INITIAL builder dispatch.  The descriptor +6 slot is never written
     by anything, so $2342 `jsr (a1)` through ($6,a1) cannot be it, and the $92 table is not it either.
