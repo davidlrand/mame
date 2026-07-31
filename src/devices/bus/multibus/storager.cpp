@@ -276,7 +276,7 @@ constexpr bool SRAM_BYTE_SWAPPED = true;
 // they are per-record and per-write, and the timing they perturb is the timing under study.
 // NOTE the dma_snoop taps are NOT in this set - those are FUNCTIONAL (m_term_bit0 / m_last_bw).
 // STRIP before any upstream submission.
-constexpr bool TRACE_CHUNK_PATH = true;
+constexpr bool TRACE_CHUNK_PATH = false;
 
 // Q3 hypothesis test (TEMP): end-marker after a ledger stake, using only the write address.
 // When firmware stakes $c0 ($8120), if the NEXT ledger byte is NOT still a want ($ff), deposit
@@ -621,23 +621,9 @@ u8 multibus_storager_device::logical_r(u8 phys) const
 	// (node+8/+9 read as 00 20 for block 32), so a wider presented index is needed before anything
 	// beyond cylinder 7 can be recognised.  Sufficient for the label + boot-file path; NOT sufficient
 	// for a full install.
-	if (false)   // SECTOR_ID_LINEAR - REFUTED, see above
-	{
-		if (m_uib_base < 0x4000 || m_uib_base >= 0x8000) return phys;
-		floppy_image_device *const fd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
-		if (!fd) return phys;
-		address_space &cs2 = m_cpu->space(AS_PROGRAM);
-		u8 const heads = cs2.read_byte((m_uib_base + 0) & 0xffff);
-		u8 const spt   = cs2.read_byte((m_uib_base + 1) & 0xffff);
-		if (heads == 0 || spt == 0 || phys < 1 || phys > spt) return phys;
-		// 1-BASED, and that is now MEASURED rather than assumed: under identity R=7 landed at slot 6,
-		// so the firmware places at (presented - 1).  Using (phys - 1) here made the index 0-based and
-		// shifted every record down one slot - VOL1 moved from buffer+0x300 to +0x280, caught by rung 1
-		// of the acceptance ladder.  On cylinder 0 this expression reduces to exactly `phys`, which is
-		// why identity worked there and why the two spaces agree only on that track.
-		u32 const idx = (u32(fd->get_cyl()) * heads + (m_walk_head & 1)) * spt + phys;
-		return u8(idx & 0xff);
-	}
+	// SECTOR_ID_LINEAR - REFUTED, see above - body removed; the code is preserved verbatim in commit bebdc9428d9
+	// (pre-cleanup checkpoint).  Kept as a comment so the verdict survives without
+	// dead machinery that reads as live code.
 	if (true)    // SECTOR_ID_REMAP - REFUTED, see above
 		return phys;
 	if (m_uib_base < 0x4000 || m_uib_base >= 0x8000)
@@ -1197,23 +1183,9 @@ void multibus_storager_device::advance_read()
 		// The firmware divides the table's +0 by two into [$741e] ($007AFC asr.w #1), so +0 is a
 		// byte address and C800[0] is a word address - hence the <<1 above and none here.
 		u32 dep = dst;
-		if (false)   // DEPOSIT_BY_CLAIM - REFUTED
-		{
-			u16 const want = logical_r(s.r);
-			for (u32 e = 0x7696; e < 0x76f6; e += 6)
-			{
-				if (cs.read_word(e + 2) != want)
-					continue;
-				u32 const claimed = cs.read_word(e);
-				if (claimed >= 0x4000 && claimed + s.len <= 0x8000 && claimed != dst)
-				{
-					logerror("DEPOSIT-BY-CLAIM r=%02x presented=%u: published %04x -> claimed %04x t=%.5f\n",
-						s.r, want, dst, claimed, machine().time().as_double());
-					dep = claimed;
-				}
-				break;
-			}
-		}
+		// DEPOSIT_BY_CLAIM - REFUTED - body removed; the code is preserved verbatim in commit bebdc9428d9
+		// (pre-cleanup checkpoint).  Kept as a comment so the verdict survives without
+		// dead machinery that reads as live code.
 		// cont.517: a chunk is only OURS once the firmware has armed C800[0] for THIS command.  Until
 		// then it still holds the previous command's last chunk - valid, in range, and wrong.  Holding
 		// on "out of range" alone works on the FM read (C800[0] genuinely unset) and fails on the MFM
@@ -1231,12 +1203,10 @@ void multibus_storager_device::advance_read()
 		// A skipped record is NOT a completed sector and must not count toward the run.
 		bool const fresh_arm = true;   // FLUSH_ON_CLAIM - REFUTED
 		bool deposited = false;
-		if (false)
-		{
-			logerror("FIELD r=%02x skipped - chunk %04x not re-armed; next revolution t=%.5f\n",
-				s.r, dep, machine().time().as_double());
-		}
-		else if (fresh_arm && dep >= 0x4000 && dep + s.len <= 0x8000)
+		// DEPOSIT_BY_CLAIM - REFUTED.  Body removed; preserved verbatim in commit bebdc9428d9
+		// (pre-cleanup checkpoint).  It was the `if` arm of this if/else, so the surviving arm
+		// below is now the unconditional path.
+		if (fresh_arm && dep >= 0x4000 && dep + s.len <= 0x8000)
 		{
 			for (int k = 0; k < s.len; k++)
 				cs.write_byte((dep + k) & 0xffff, s.data[k]);
@@ -1257,8 +1227,7 @@ void multibus_storager_device::advance_read()
 			std::copy_n(s.data, s.len, m_held_data);
 			// The claim may ALREADY be in the table when the record arrives (it is not always
 			// written afterwards), so try immediately as well as on a later claim write.
-			if (false)   // FLUSH_ON_CLAIM - REFUTED
-				flush_held_on_claim();
+			// FLUSH_ON_CLAIM - REFUTED (called flush_held_on_claim() here); see bebdc9428d9
 			logerror("FIELD r=%02x held - no chunk armed yet t=%.5f\n",
 				s.r, machine().time().as_double());
 		}
@@ -1296,8 +1265,7 @@ void multibus_storager_device::advance_read()
 			}
 		}
 		m_next_rec = machine().time() + sector_period() * 15 / 100;   // trailing gap -> next ID
-		if (false)   // WAIT_FOR_FRESH_ARM - REFUTED
-			m_data_done_n--;   // skipped: let it come round again
+		// WAIT_FOR_FRESH_ARM - REFUTED (decremented m_data_done_n here); see bebdc9428d9
 		if (++m_data_done_n == m_sec_count)
 		{
 			// COUNT EXHAUST (model observation only).  Do NOT write firmware RAM here.
@@ -1935,18 +1903,9 @@ void multibus_storager_device::c800_w(offs_t offset, u16 data, u16 mem_mask)
 		// +2 claimed sector index), which is what the host DMA sources from - so flush THERE.  At
 		// deposit time the claim did not exist yet (measured: written ~7us after the deposit), which
 		// is why a deposit-time lookup cannot work and the hold is what makes this reachable.
-		if (false)   // HOLD_UNTIL_ARMED - REFUTED
-		{
-			for (u32 e = 0x7696; e < 0x76f6; e += 6)
-			{
-				if (cs.read_word(e + 2) != m_held_r)
-					continue;
-				u32 const claimed = cs.read_word(e);
-				if (claimed >= 0x4000 && claimed + m_held_len <= 0x8000)
-					dst = claimed;
-				break;
-			}
-		}
+		// HOLD_UNTIL_ARMED - REFUTED - body removed; the code is preserved verbatim in commit bebdc9428d9
+		// (pre-cleanup checkpoint).  Kept as a comment so the verdict survives without
+		// dead machinery that reads as live code.
 		if (dst >= 0x4000 && dst + m_held_len <= 0x8000)
 		{
 			for (u32 k = 0; k < m_held_len; k++)
