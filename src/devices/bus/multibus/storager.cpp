@@ -146,7 +146,6 @@ constexpr bool PER_ADDRESS_MARK = true;
 // same interrupt to set [$7968].  Measured A/B with the accepted-sector disarm: marker OFF gives
 // 8 records / 8 data-done / [$7968]=1; marker ON gives 8 / 8 / [$7968]=0.  The marker's only effect
 // is to suppress the bootstrap.  Kept behind the flag as a disproved hypothesis, not a fix.
-constexpr bool Q3B_END_MARKER = false;
 
 // TEMP (STRIP): stimulus/response experiment matrix.  Firmware drives; the model only changes how
 // the gate array *responds* to programmed arms + disk rotation.  No free-form writes into firmware
@@ -210,7 +209,6 @@ constexpr bool SRAM_BYTE_SWAPPED = true;
 // buffer+0x44) are mutually unsatisfiable if the buffer receives the raw VOL1 record.  Either the
 // buffer is meant to receive a structure assembled elsewhere, or this medium lacks what the monitor
 // wants - note it also reports "sasiopen: no label SINIX found" on the hard-disk path.
-constexpr bool LABEL_BODY_SKIP = false;
 
 // SECTOR_ID_REMAP - does the controller renumber sector IDs at all?
 //
@@ -231,8 +229,6 @@ constexpr bool LABEL_BODY_SKIP = false;
 // to buffer byte 0 defeats BOTH tests at once - byte 0 is not a descriptor, and buffer+0x304 no
 // longer holds the volume identifier.  The campaign's original 0x300 "displacement" was never an
 // error; it was the ROM's expected layout.
-constexpr bool SECTOR_ID_REMAP = false;
-constexpr bool SECTOR_ID_LINEAR = false;   // present a linear block index (see logical_r)
 
 // cont.516: deposit each data field at the chunk the firmware's own claim table ($7696) names for
 // that sector, rather than at the chunk C800[0] happens to hold.  Only the FIRST wanted record of a
@@ -244,23 +240,19 @@ constexpr bool SECTOR_ID_LINEAR = false;   // present a linear block index (see 
 // already correct - while never firing for r=01, the broken one.  Measured: STEP2 unchanged at
 // A0 A0 A0 A0, console unchanged.  A deposit-time lookup cannot work; the record has to be HELD
 // until its claim exists, which is the hold mechanism with a corrected trigger.
-constexpr bool DEPOSIT_BY_CLAIM = false;
 
 // cont.517: hold a data field until the firmware has armed C800[0] for THIS command, not merely
 // until C800[0] is in range.  Between commands C800[0] retains the previous command's last chunk,
 // so the first wanted record of every run after the first is deposited into a chunk the host DMA
 // never reads.  Latched at command start (m_c800_cmd_start); the held field flushes on the next arm.
-constexpr bool HOLD_UNTIL_ARMED = false;
 
 // cont.518 (Dave): the medium is continuous - a sector arriving before its arm returns next
 // revolution, so it never needs rescuing.  Deposit only into a freshly-armed chunk.
-constexpr bool WAIT_FOR_FRESH_ARM = false;
 
 // cont.519: flush a held field ON THE CLAIM WRITE.  Measured ordering for cyl1 R=1 (the boot
 // header): record t=8.46075, claim written ~8.46082, host DMA reads that chunk t=8.46098.  The
 // claim is the only moment the destination exists, and the next C800[0] arm fires BEFORE it
 // (8.46077), which is why an arm-triggered flush read a stale entry and resolved R=1 to 4000.
-constexpr bool FLUSH_ON_CLAIM = false;
 
 // cont.521 (Dave's argument): the ISR is MEASURED not to compare sector numbers - only head ($7436)
 // and cylinder ($7438).  Something must reject non-matching sectors, so it is the gate array, and
@@ -270,15 +262,12 @@ constexpr bool FLUSH_ON_CLAIM = false;
 // for the probe on a different unit - density-independent, tracking the sector rather than the block.
 // Delivering every record instead drives the firmware's arm pipeline with sectors nobody asked for,
 // which is why the first WANTED record arrives with the arm still on the previous command's chunk.
-constexpr bool GA_SECTOR_MATCH = true;
-constexpr bool CMD_RECORD_BOUND = true;   // TEMP cont.526: step (2) alone
 // cont.525: multi-track continuation.  IMPLEMENTED AND MECHANICALLY CORRECT - it walks head 0 -> 1
 // at the track boundary (measured: one WALK event at t=8.83280, head=1 cyl=1, 42 blocks left).
 // But it does NOT fix the blocker and it changes the completion sense 29 -> 1C (short transfer),
 // so it is OFF.  Reason: the failure is at BLOCK 41, which is on the FIRST track (head 0 covers
 // blocks 36-47) - it happens BEFORE the boundary is reached, so continuation fires after the fact.
 // Do not enable until the first-track failure is understood; it cannot be a multi-track problem.
-constexpr bool MULTITRACK_WALK = true;   // TEMP cont.526: step (3) - all three on  // cont.522: correct in principle, mis-fed - see the bound site
 
 // cont.494: the chunk-path instruments (claim gate, ownership map, stride table, arm source,
 // ID compare, firmware status/decide).  Each answered a specific question this campaign - the
@@ -632,7 +621,7 @@ u8 multibus_storager_device::logical_r(u8 phys) const
 	// (node+8/+9 read as 00 20 for block 32), so a wider presented index is needed before anything
 	// beyond cylinder 7 can be recognised.  Sufficient for the label + boot-file path; NOT sufficient
 	// for a full install.
-	if (SECTOR_ID_LINEAR)
+	if (false)   // SECTOR_ID_LINEAR - REFUTED, see above
 	{
 		if (m_uib_base < 0x4000 || m_uib_base >= 0x8000) return phys;
 		floppy_image_device *const fd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
@@ -649,7 +638,7 @@ u8 multibus_storager_device::logical_r(u8 phys) const
 		u32 const idx = (u32(fd->get_cyl()) * heads + (m_walk_head & 1)) * spt + phys;
 		return u8(idx & 0xff);
 	}
-	if (!SECTOR_ID_REMAP)
+	if (true)    // SECTOR_ID_REMAP - REFUTED, see above
 		return phys;
 	if (m_uib_base < 0x4000 || m_uib_base >= 0x8000)
 		return phys;
@@ -927,7 +916,7 @@ void multibus_storager_device::start_field_program()
 			if (m_desc_n)
 			{
 				m_want_r = 0;
-				for (int i = 2; GA_SECTOR_MATCH && i < m_desc_n; i++)
+				for (int i = 2; i < m_desc_n; i++)
 					if (m_desc_val[i-2] >= 0x3e && m_desc_val[i-1] >= 0x3e && m_desc_val[i] > 0 && m_desc_val[i] < 0x3e)
 					{ m_want_r = m_desc_val[i]; break; }
 			}
@@ -1040,7 +1029,7 @@ void multibus_storager_device::advance_read()
 	// and the firmware gets to 41.  **Re-enable only once the model handles MULTI-TRACK
 	// CONTINUATION** (seek to the next track and carry on); a per-track bound cannot serve a
 	// multi-track command.  The bound and the latch are both correct in isolation.
-	if (CMD_RECORD_BOUND && m_sec_count > 0 && m_cmd_records >= m_sec_count)
+	if (m_sec_count > 0 && m_cmd_records >= m_sec_count)
 	{
 		m_read_active = false;
 		return;
@@ -1053,7 +1042,7 @@ void multibus_storager_device::advance_read()
 	// sectors nobody requested, so the first WANTED record arrives with the arm still pointing at
 	// the previous command's chunk.  The disk keeps turning; skip to the next field and let the
 	// wanted one come round.
-	if (GA_SECTOR_MATCH && m_want_r && logical_r(s.r) != m_want_r)
+	if (m_want_r && logical_r(s.r) != m_want_r)
 	{
 		m_sec_index++;
 		if (m_sec_index >= m_track_n) m_sec_index = 0;
@@ -1208,7 +1197,7 @@ void multibus_storager_device::advance_read()
 		// The firmware divides the table's +0 by two into [$741e] ($007AFC asr.w #1), so +0 is a
 		// byte address and C800[0] is a word address - hence the <<1 above and none here.
 		u32 dep = dst;
-		if (DEPOSIT_BY_CLAIM)
+		if (false)   // DEPOSIT_BY_CLAIM - REFUTED
 		{
 			u16 const want = logical_r(s.r);
 			for (u32 e = 0x7696; e < 0x76f6; e += 6)
@@ -1240,7 +1229,7 @@ void multibus_storager_device::advance_read()
 		// So deposit ONLY into a chunk armed since the last deposit; otherwise let the record pass
 		// - the firmware still sees it and arms from it - and take the sector on the next pass.
 		// A skipped record is NOT a completed sector and must not count toward the run.
-		bool const fresh_arm = (dep != m_cur_last_chunk) || !FLUSH_ON_CLAIM;
+		bool const fresh_arm = true;   // FLUSH_ON_CLAIM - REFUTED
 		bool deposited = false;
 		if (false)
 		{
@@ -1268,7 +1257,7 @@ void multibus_storager_device::advance_read()
 			std::copy_n(s.data, s.len, m_held_data);
 			// The claim may ALREADY be in the table when the record arrives (it is not always
 			// written afterwards), so try immediately as well as on a later claim write.
-			if (FLUSH_ON_CLAIM)
+			if (false)   // FLUSH_ON_CLAIM - REFUTED
 				flush_held_on_claim();
 			logerror("FIELD r=%02x held - no chunk armed yet t=%.5f\n",
 				s.r, machine().time().as_double());
@@ -1283,12 +1272,12 @@ void multibus_storager_device::advance_read()
 			m_cmd_records++;
 		if (m_blocks_left > 0) m_blocks_left--;   // cont.525: one block of the linear run
 		m_sec_index++;                          // one sector completed after its data-done record
-		if (GA_SECTOR_MATCH && m_want_r)        // hunt the next sector in the run
+		if (m_want_r)        // hunt the next sector in the run
 		{
 			m_want_r = u16(m_want_r % std::max(1, m_track_n) + 1);
 			// cont.525: wrapping to sector 1 IS the track boundary.  The firmware does not seek here
 			// (measured), so the gate array walks: head 0 -> head 1 -> step to the next cylinder.
-			if (MULTITRACK_WALK && m_want_r == 1 && m_blocks_left > 0)
+			if (m_want_r == 1 && m_blocks_left > 0)
 			{
 				floppy_image_device *const fw = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
 				if (fw)
@@ -1307,7 +1296,7 @@ void multibus_storager_device::advance_read()
 			}
 		}
 		m_next_rec = machine().time() + sector_period() * 15 / 100;   // trailing gap -> next ID
-		if (WAIT_FOR_FRESH_ARM && !deposited)
+		if (false)   // WAIT_FOR_FRESH_ARM - REFUTED
 			m_data_done_n--;   // skipped: let it come round again
 		if (++m_data_done_n == m_sec_count)
 		{
@@ -1339,7 +1328,7 @@ TIMER_CALLBACK_MEMBER(multibus_storager_device::pump_tick)
 	// device's own context: currently_executing() is not the local CPU, so the model's $4000-$7FFF snoop
 	// taps ignore it and m_term_bit0 / m_last_bw stay clean.  From the next record onward the firmware
 	// tests it at $7E9A (the [$7968]!=0 arm) and terminates via $7ED8.
-	if (Q3B_END_MARKER && m_aa_armed && m_aa_cell >= 0x7654 && m_aa_cell <= 0x76bf)
+	if (false && m_aa_armed && m_aa_cell >= 0x7654 && m_aa_cell <= 0x76bf)
 	{
 		address_space &cs2 = m_cpu->space(AS_PROGRAM);
 		if (!m_aa_done)
@@ -1583,7 +1572,7 @@ void multibus_storager_device::run_channel_dma()
 		// fields, and the run continuing past VOL1 into the HDR1 sector).  dest = m_c000 - 4 + k
 		// uniformly; the first chunk starts at k=4, which lands exactly on m_c000, so the next
 		// chunk continues at +0x7C.  See the flag comment: this is an experiment.
-		bool const body_skip = LABEL_BODY_SKIP && to_host && is_data && m_iopb_cmd == 0x95
+		bool const body_skip = false && to_host && is_data && m_iopb_cmd == 0x95
 			&& m_floppy[0] && m_floppy[0]->get_device()
 			&& m_floppy[0]->get_device()->get_cyl() == 0 && (m_sel_head & 1) == 0
 			&& flux_density_fm();
@@ -1946,7 +1935,7 @@ void multibus_storager_device::c800_w(offs_t offset, u16 data, u16 mem_mask)
 		// +2 claimed sector index), which is what the host DMA sources from - so flush THERE.  At
 		// deposit time the claim did not exist yet (measured: written ~7us after the deposit), which
 		// is why a deposit-time lookup cannot work and the hold is what makes this reachable.
-		if (HOLD_UNTIL_ARMED)
+		if (false)   // HOLD_UNTIL_ARMED - REFUTED
 		{
 			for (u32 e = 0x7696; e < 0x76f6; e += 6)
 			{
@@ -2656,7 +2645,7 @@ void multibus_storager_device::device_reset()
 				// address it just saw on the bus, and the count from its op18 program's port-$3F
 				// pushes.  Record only; the pump deposits it as a bus-master cycle.
 				int const n = m_prog_count > 0 ? m_prog_count : m_sec_count;
-				if (Q3B_END_MARKER && n > 1 && m_accepted_n == n - 1 && !m_aa_done)
+				if (false && n > 1 && m_accepted_n == n - 1 && !m_aa_done)
 				{
 					u32 const addr = (mem_mask == 0x00ff) ? (offset + 1) : offset;
 					u32 const cell = addr + 2;
@@ -2769,7 +2758,7 @@ void multibus_storager_device::lram_w(offs_t offset, u16 data, u16 mem_mask)
 	// +2 claimed sector) is the moment a held field's destination becomes known.  Read and write
 	// m_lram DIRECTLY here - going through the address space from inside a write handler fires the
 	// device's own dma_snoop read tap and clobbers m_term_bit0 (the class this campaign hit twice).
-	if (!FLUSH_ON_CLAIM || !m_held_len)
+	if (true)   // FLUSH_ON_CLAIM - REFUTED
 		return;
 	u32 const wa = 0x4000 + (offset << 1);
 	if (wa < 0x7696 || wa >= 0x76f6)
