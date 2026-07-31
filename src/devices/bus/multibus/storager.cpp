@@ -1373,7 +1373,14 @@ void multibus_storager_device::run_channel_dma()
 	// FM/MFM density at UIB+$12); the IOPB node ($71F0) is 0x18 bytes.
 	u32 const ld = u32(m_d000) << 1;
 	bool const to_local = BIT(e800, 14);
-	bool const to_host  = !BIT(e800, 14) && BIT(e800, 13);
+	// cont.535: bit 13 REMOVED from the direction test.  Measured, two kicked transfers:
+	//     working host xfer  e800=3a5d  0011 1010 0101 1101
+	//     kernel read        e800=1a0d  0001 1010 0000 1101   -> bit14 CLEAR in both
+	// Bit 14 alone is consistent with direction; requiring bit 13 as well is what rejected the
+	// kernel transfers as "neither direction", so nothing shipped.  Bit 13 is the CONTROL-BLOCK TYPE
+	// (node 0x18 vs UIB 0x20, used at the length line) and has no business qualifying direction -
+	// the model was reading one bit two ways.
+	bool const to_host  = !BIT(e800, 14);
 	// A read data transfer sources the captured SRAM chunk ($8018 sets C800[0]=[$741e] = the chunk word
 	// pointer), distinguishing it from the IOPB/UIB control blocks (which source the node work area).
 	// Length comes from the sector ACTUALLY IN FLIGHT, not from index 0 of the last capture.  The old
