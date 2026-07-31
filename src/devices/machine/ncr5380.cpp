@@ -38,11 +38,12 @@ ncr5380_device::ncr5380_device(machine_config const &mconfig, device_type type, 
 	, m_irq_handler(*this)
 	, m_drq_handler(*this)
 	, m_has_lbs(has_lbs)
+	, m_rst_self_irq(true)
 {
 }
 
 ncr5380_device::ncr5380_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
-	: ncr5380_device(mconfig, NCR5380, tag, owner, clock)
+	: ncr5380_device(mconfig, NCR5380, tag, owner, clock, false)
 {
 }
 
@@ -59,6 +60,9 @@ cxd1180_device::cxd1180_device(machine_config const &mconfig, char const *tag, d
 dp8490_device::dp8490_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
 	: ncr5380_device(mconfig, DP8490, tag, owner, clock, true)
 {
+	// EASI divergence: no interrupt for a self-issued bus reset (see
+	// scsi_ctrl_changed; base-5380 behavior per SP-1051 8.3 is to interrupt)
+	m_rst_self_irq = false;
 }
 
 void ncr5380_device::map(address_map &map)
@@ -79,6 +83,8 @@ void ncr5380_device::device_start()
 	// does not compare with uninitialized
 	m_irq_state = false;
 	m_drq_state = false;
+	m_rst_out = false;
+	m_rst_state = false;
 
 	m_state_timer = timer_alloc(FUNC(ncr5380_device::state_timer), this);
 
@@ -95,6 +101,8 @@ void ncr5380_device::device_start()
 	save_item(NAME(m_scsi_ctrl));
 	save_item(NAME(m_irq_state));
 	save_item(NAME(m_drq_state));
+	save_item(NAME(m_rst_out));
+	save_item(NAME(m_rst_state));
 }
 
 void ncr5380_device::device_reset()
@@ -144,12 +152,36 @@ void ncr5380_device::scsi_ctrl_changed()
 
 	m_bas &= ~BAS_BUSYERROR;
 
+	// initiator data-bus drivers follow the phase lines: with ICR "assert data
+	// bus" set the drivers tri-state as soon as the bus leaves the OUT phase
+	// matching the target-command register (e.g. the target switches DATA OUT
+	// -> STATUS).  Without this the last data byte stays wire-OR'd over the
+	// target's STATUS/DATA-IN bytes.  Release-only: the drivers re-enable via
+	// the normal odata_w/ic_write paths, never spontaneously here.
+	if (!(m_mode & MODE_TARGET) && (m_icmd & IC_DBUS) && !(ctrl & S_RST)
+		&& ((ctrl & S_INP) || (ctrl & S_PHASE_MASK) != (m_tcmd & S_PHASE_MASK)))
+		m_scsi_bus->data_w(m_scsi_refid, 0);
+
 	if (ctrl & S_RST)
 	{
-		LOG("scsi reset received\n");
-		device_reset();
+		// SCSI bus reset is edge-triggered: the chip resets and interrupts when
+		// R̅S̅T̅ transitions to true (NCR5380 SP-1051 8.3 / DP8490 6.3), not while
+		// the line merely stays low.  A device already holding R̅S̅T̅ when another
+		// asserts it sees no new transition and must not reset again.
+		if (!m_rst_state)
+		{
+			m_rst_state = true;
+			LOG("scsi reset received\n");
+			bool const self_reset = m_rst_out;
+			device_reset();
 
-		set_irq(true);
+			// External R̅S̅T̅ always interrupts (SP-1051 9.2 / DP8490 6.3).  A
+			// self-issued reset interrupts on the base NCR5380/53C80 (SP-1051
+			// 8.3/9.3) but the DP8490 EASI does a chip reset with no interrupt
+			// (DP8490 6.4 -> 6.2); m_rst_self_irq encodes the split.
+			if (!self_reset || m_rst_self_irq)
+				set_irq(true);
+		}
 	}
 	else if (!(m_mode & MODE_TARGET) && (m_scsi_ctrl & S_BSY) && !(ctrl & S_BSY))
 	{
@@ -197,7 +229,18 @@ void ncr5380_device::scsi_ctrl_changed()
 				m_state = IDLE;
 				m_state_timer->enable(false);
 
-				set_drq(true);
+				// A bus phase mismatch ends the DMA transfer and interrupts
+				// (SP-1051 8.5).  Direction matters for DRQ: after a SEND the
+				// chip has already requested the next byte, and that request
+				// survives the mismatch (6.7: DRQ "does not reset when a phase
+				// mismatch interrupt occurs"); the host completes the transfer
+				// by cycling DACK once more so ACK can release (10.5.2, 10.3).
+				// The Mac Plus SCSI Manager blocks on that final DRQ.  A
+				// RECEIVE has no pending request -- the last byte was already
+				// DACKed -- so DRQ stays low (a spurious raise feeds pseudo-DMA
+				// read loops a garbage byte).
+				if (!(m_tcmd & TC_IO))
+					set_drq(true);
 				set_irq(true);
 			}
 		}
@@ -223,6 +266,7 @@ void ncr5380_device::scsi_ctrl_changed()
 		set_irq(true);
 	}
 
+	m_rst_state = (ctrl & S_RST) != 0; // track the R̅S̅T̅ level for edge detection
 	m_scsi_ctrl = ctrl;
 }
 
@@ -258,6 +302,8 @@ void ncr5380_device::icmd_w(u8 data)
 
 	if (!(data & IC_RST))
 	{
+		m_rst_out = false;
+
 		// drive scsi data
 		if ((data ^ m_icmd) & IC_DBUS)
 			scsi_data_w((data & IC_DBUS) ? m_odata : 0);
@@ -284,12 +330,28 @@ void ncr5380_device::icmd_w(u8 data)
 	else
 	{
 		LOG("scsi reset issued\n");
-		device_reset();
+		// SCSI bus reset is edge-triggered (NCR5380 SP-1051 8.3/9.3, DP8490
+		// 6.4): driving R̅S̅T̅ performs the chip reset only when it transitions the
+		// line to true.  If another device already holds R̅S̅T̅ we just add our
+		// open-drain assertion -- no new edge, so no second reset or interrupt.
+		bool const edge = !(m_scsi_bus->ctrl_r() & S_RST);
+		if (edge)
+			device_reset();
+		m_rst_out = true;
+		m_rst_state = true; // block a re-entrant scsi_ctrl_changed from re-firing
 		m_scsi_bus->ctrl_w(m_scsi_refid, S_RST, S_RST);
-
-		set_irq(true);
+		// The nscsi bus does not reflect a device's own R̅S̅T̅ back to it, so
+		// scsi_ctrl_changed() is not re-entered for the self edge: the base
+		// NCR5380/53C80 interrupts on its own reset (SP-1051 8.3), raised here;
+		// the DP8490 EASI does the chip reset with no interrupt (DP8490 6.4 ->
+		// 6.2, m_rst_self_irq == false), leaving the NetBSD/pc532 monitor --
+		// which asserts R̅S̅T̅ then aborts on a spurious IRQ -- unaffected.
+		if (edge && m_rst_self_irq)
+			set_irq(true);
 	}
 
+	// track the bus R̅S̅T̅ level for edge detection after any self-driven change
+	m_rst_state = (m_scsi_bus->ctrl_r() & S_RST) != 0;
 	m_icmd = (m_icmd & ~IC_WRITE) | (data & IC_WRITE);
 }
 
@@ -480,6 +542,7 @@ void ncr5380_device::sdir_w(u8 data)
 void ncr5380_device::state_timer(s32 param)
 {
 	// step state machine
+	int const prev_state = m_state;
 	int const delay = state_step();
 
 	// check for data stall
@@ -488,7 +551,18 @@ void ncr5380_device::state_timer(s32 param)
 
 	// repeat until idle
 	if (m_state != IDLE)
-		m_state_timer->adjust(attotime::from_nsec(delay));
+	{
+		// A DMA wait-state that made no progress and asked for no delay is
+		// polling the SCSI bus for a REQ/phase change.  Re-arming at zero would
+		// spin with emulated time frozen, so the target could never change the
+		// bus -- hanging the whole emulation (observed booting Minix 1.3/pc532,
+		// whose root-mount read polls REQ in a window NetBSD's timing skipped).
+		// Poll at the SCSI REQ/ACK period instead so time advances and the
+		// target can respond.  (An event-driven resume via scsi_ctrl_changed
+		// would be faster but mis-steps the monitor's SCSI read -> busy error.)
+		unsigned const ns = (m_state == prev_state && delay == 0) ? 100 : unsigned(delay);
+		m_state_timer->adjust(attotime::from_nsec(ns));
+	}
 }
 
 int ncr5380_device::state_step()
