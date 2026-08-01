@@ -343,7 +343,9 @@ private:
 	// (get_next_transition) and the gate array deserialises it, doing address-mark detect and filling the
 	// gate array's capture cells + raising IRQ5/IRQ6 per field boundary.
 	bool flux_density_fm() const;
-	u8   logical_r(u8 phys) const;   // physical sector ID -> FIRMWARE sector index (1-based, base UIB[4])
+	u8   logical_r(u8 phys) const;
+	u16  ioreg_r(offs_t offset);
+	void ioreg_w(offs_t offset, u16 data, u16 mem_mask);   // physical sector ID -> FIRMWARE sector index (1-based, base UIB[4])
 	attotime sector_period() const; // one sector's rotation at 300 rpm
 	void start_field_program();     // the loaded op18 program begins running: open the read window
 	void advance_read();            // stage + deliver the next record while the window is armed (IRQ6 then IRQ5)
@@ -426,6 +428,15 @@ private:
 	// gate array holds this until the firmware changes it; the read path uses the latched head to pick
 	// the side, rather than reading the firmware's own copy out of its work area.
 	u8 m_sel_head = 0;           // 0-15, decoded from E804 bits 8-11
+	// cont.536: the OS DRIVER's command channel, Multibus I/O 0x0800-0x0807.  Distinct from the boot
+	// monitor's doorbell+IOCB at 0x7200-0x73ff: the monitor loads the kernel through that, then the
+	// loaded SINIX driver talks HERE.  Dropped in the LLE rebuild, which is why the kernel's writes
+	// (measured: unmapped bus I/O 0x0804/0x0806 from pc 008928) vanished and its poll read garbage -
+	// the recorded "post-Boot: stall".  Register file: cmd byte at [0] written LAST, bit7 read back
+	// = controller DONE.  Pointer lanes per the kernel's sacmd @0x9504:
+	//     dev-blk = regs [4],[5],[7]   req-blk = regs [2],[3],[6]     (reg[6] is NOT dev-blk's byte 3)
+	u8   m_ioreg[8] = {};
+	bool m_ioreg_done = false;
 	u8 m_sel_drive = 0;          // E804 low byte: drive select + motor/write-current/precomp controls
 
 	// cont.525: MULTI-TRACK CONTINUATION.  The IOCB is LINEAR-addressed (`cyl=0 head=0 start=36
@@ -1052,15 +1063,7 @@ void multibus_storager_device::advance_read()
 		// requires $FE at byte 3 and takes the cylinder from byte 4(+5), gated on UIB+$12 bit2; the FM
 		// reader $7C7A instead expects $FE at byte 0, because FM HAS NO $A1 SYNC BYTES.
 		bool const fm = flux_density_fm();
-		{   // TEMP cont.529: which UIB decides the header layout for this record?
-			address_space &us = m_cpu->space(AS_PROGRAM);
-			u8 const u12 = (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
-				? us.read_byte((m_uib_base + 0x12) & 0xffff) : 0xff;
-			logerror("HDRFMT r=%02x %s uib=%04x uib+12=%02x bit2=%d cyl=%d t=%.5f\n",
-				s.r, fm ? "FM " : "MFM", m_uib_base, u12, BIT(u12, 2),
-				m_floppy[0] && m_floppy[0]->get_device() ? m_floppy[0]->get_device()->get_cyl() : -1,
-				machine().time().as_double());
-		}
+
 		u32 dst = u32(m_d800) << 1;
 		if (dst < 0x4000 || dst + (fm ? 5 : 8) > 0x8000)
 			dst = 0x7dac;                       // not yet latched (first record of a command)
@@ -1868,12 +1871,7 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		{
 			fdd->dir_w(BIT(data, 13) ? 0 : 1);
 			fdd->stp_w(BIT(data, 0));
-			// TEMP cont.532: is the FIRMWARE stepping too?  The walk trail (cyl1h0, cyl1h1, cyl2h1,
-			// cyl3h0) is impossible from the model's own advance, which always clears the head before
-			// stepping - so something else is moving the cylinder.
-			if (BIT(data, 0))
-				logerror("FWSTEP dir=%d cyl=%d walk_head=%d t=%.5f\n", BIT(data, 13) ? 0 : 1,
-					fdd->get_cyl(), m_walk_head, machine().time().as_double());
+
 			m_pit[0]->write_gate1(BIT(data, 0));
 		}
 	}
@@ -1889,6 +1887,74 @@ void multibus_storager_device::c000_w(offs_t offset, u16 data, u16 mem_mask)
 
 // C800-C9FF: the field-boundary offset file (spec §3.4).  Cell 0 doubles as the live SRAM chunk
 // pointer in the per-record capture cycle.  A write while DMA is active latches the transfer terminal.
+// The OS driver's command channel (see m_ioreg).  OBSERVE ONLY for now: latch the registers and
+// report what the driver sends.  No dispatch until the real command stream has been seen - writing
+// a decoder against the HLE's guesses would be building on prior art rather than measurement.
+u16 multibus_storager_device::ioreg_r(offs_t offset)
+{
+	u16 v = u16(m_ioreg[offset * 2]) | (u16(m_ioreg[offset * 2 + 1]) << 8);
+	if (offset == 0 && m_ioreg_done)
+		v |= 0x80;                      // cmd byte bit7 = controller DONE, which the driver polls
+	return v;
+}
+
+void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	if (ACCESSING_BITS_0_7)  m_ioreg[offset * 2]     = data & 0xff;
+	if (ACCESSING_BITS_8_15) m_ioreg[offset * 2 + 1] = data >> 8;
+	if (offset == 0 && ACCESSING_BITS_0_7)
+	{
+		m_ioreg_done = false;           // new command: DONE drops until it completes
+		u32 const dev = u32(m_ioreg[4]) | (u32(m_ioreg[5]) << 8) | (u32(m_ioreg[7]) << 16);
+		u32 const req = u32(m_ioreg[2]) | (u32(m_ioreg[3]) << 8) | (u32(m_ioreg[6]) << 16);
+		address_space &bs = m_bus->space(AS_PROGRAM);
+		std::string db, rb;
+		for (u32 k = 0; k < 0x18; k++) db += util::string_format(" %02x", bs.read_byte((dev + k) & 0xffffff));
+		if (req) for (u32 k = 0; k < 0x18; k++) rb += util::string_format(" %02x", bs.read_byte((req + k) & 0xffffff));
+		logerror("IOREG CMD=%02x dev=%06x req=%06x regs=%02x %02x %02x %02x %02x %02x %02x %02x |%s t=%.5f\n",
+			data & 0xff, dev, req, m_ioreg[0], m_ioreg[1], m_ioreg[2], m_ioreg[3],
+			m_ioreg[4], m_ioreg[5], m_ioreg[6], m_ioreg[7], db.c_str(), machine().time().as_double());
+		if (req) logerror("IOREG   req-blk@%06x:%s\n", req, rb.c_str());
+		// cont.538 HYPOTHESIS UNDER TEST: the request block is TWO BIG-ENDIAN DWORDS -
+		//     req+0 = host buffer address, req+4 = LBA
+		// `00 02 4f 12 | 00 00 01 80` -> buffer 0x00024F12, LBA 384.
+		// The whole-word LBA reading failed the range test (151,314 > 147,456 blocks) because it was
+		// never an LBA: as an ADDRESS 0x24F12 is 151,314 into the CPUAP's 1 MB, above the kernel image
+		// (ends 0xB898) and clear of the driver's own structures at 0xB4EC/0xBD74 - i.e. free memory,
+		// where a sector buffer belongs.  384 is comfortably within the disk's 147,456 blocks.
+		// DECISIVE because a marker is already planted at LBA 384 (0x30000): a wrong buffer leaves it
+		// where the driver never looks, a wrong LBA delivers zeros instead of a tag.  Neither fakes
+		// success.  Held as a hypothesis until the marker is observed.
+		if (req)
+		{
+			u32 const hbuf = (u32(bs.read_byte((req + 0) & 0xffffff)) << 24) | (u32(bs.read_byte((req + 1) & 0xffffff)) << 16)
+			               | (u32(bs.read_byte((req + 2) & 0xffffff)) << 8)  |  u32(bs.read_byte((req + 3) & 0xffffff));
+			u32 const lba  = (u32(bs.read_byte((req + 4) & 0xffffff)) << 24) | (u32(bs.read_byte((req + 5) & 0xffffff)) << 16)
+			               | (u32(bs.read_byte((req + 6) & 0xffffff)) << 8)  |  u32(bs.read_byte((req + 7) & 0xffffff));
+			if (m_hd[0] && m_hd[0]->exists() && hbuf && hbuf < 0x100000)
+			{
+				u8 sec[512] = {};
+				m_hd[0]->img_read(u64(lba) * 512, sec, sizeof(sec));
+				for (u32 k = 0; k < sizeof(sec); k++)
+					bs.write_byte((hbuf + k) & 0xffffff, sec[k]);
+				std::string tag;
+				for (u32 k = 0; k < 16; k++)
+					tag += char(sec[k] >= 0x20 && sec[k] < 0x7f ? sec[k] : '.');
+				logerror("HDREAD lba=%u -> host %06x  first16: \"%s\" t=%.5f\n",
+					lba, hbuf, tag.c_str(), machine().time().as_double());
+				m_ioreg[1] = 0x00;                                   // status OK in the register file
+				bs.write_byte((dev + 1) & 0xffffff, 0x00);           // ...and in dev-blk+1, which the
+			}                                                        // driver actually polls (cont.537)
+		}
+		// cont.536: ACK so the driver advances.  Without DONE it retries the same command forever
+		// (measured: cmd 00 / 02 alternating every 5.28s, 27 times).  Acknowledging reveals the next
+		// command in the sequence, which is what a decoder has to be written against.  Status byte
+		// reg[1] is read back as (&3, 0 = OK) after DONE.
+		m_ioreg[1] = 0x00;
+		m_ioreg_done = true;
+	}
+}
+
 u16 multibus_storager_device::c800_r(offs_t offset)
 {
 	u16 const d = m_c800[offset & 0xff];
@@ -2248,6 +2314,9 @@ void multibus_storager_device::device_reset()
 			read16sm_delegate(*this, FUNC(multibus_storager_device::host_win_r)),
 			write16s_delegate(*this, FUNC(multibus_storager_device::host_win_w)));
 		// data aperture the host reads kernel blocks through (0xF00000 = bus I/O 0x0000).
+		m_bus->space(AS_IO).install_readwrite_handler(0x0800, 0x0807,
+			read16sm_delegate(*this, FUNC(multibus_storager_device::ioreg_r)),
+			write16s_delegate(*this, FUNC(multibus_storager_device::ioreg_w)));
 		m_bus->space(AS_IO).install_read_handler(0x0000, 0x00ff,
 			read16sm_delegate(*this, FUNC(multibus_storager_device::bus_data_r)));
 		// Snoop the local-bus buffer (0x4000-0x7FFF): the gate array's address comparator watches the

@@ -215,6 +215,15 @@ void cpuap_device::device_reset()
 		// reports System 734k / User 3362k = 4 MB). Not a normal Multibus memory - it maps directly
 		// into the CPUAP's NS32016 space.
 		m_cpu->space(AS_PROGRAM).install_ram(0x100000, 0x3fffff, m_ramext.get());
+		// The RAM-sizing probe at fe02b6 deliberately writes/reads ABOVE installed memory (0x4FFFFC
+		// etc.) to find the top of RAM - that is its job.  MAME logs every one of those as an
+		// unmapped access, which floods error.log (396k lines out of every 400k) and throttles a
+		// -oslog run to a few seconds of emulated time.  Logging only; no behavioural change.
+		// Suppress on EVERY space the CPU has, not just AS_PROGRAM: the NS32000 also drives an `iam`
+		// space, and the sizing probe floods that one too (196k of every 200k log lines).
+		for (int sp = 0; sp < 8; sp++)
+			if (m_cpu->has_space(sp))
+				m_cpu->space(sp).set_log_unmap(false);
 		// ...and, like the on-board RAM, the expansion must be visible in EVERY NS32k access
 		// status, not only status 0.  The NS32016 configures a separate space for status 4, and
 		// the NS32082 MMU's page-table walk / user (AS1) cycles use it.  Kernel page tables and

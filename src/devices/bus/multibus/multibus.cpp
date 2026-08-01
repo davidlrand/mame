@@ -41,6 +41,12 @@ device_memory_interface::space_config_vector multibus_device::memory_space_confi
 
 void multibus_device::device_start()
 {
+	// Unmapped-access logging only; no behavioural change.  The SINIX kernel probes Multibus I/O
+	// addresses no card claims (0x0804/0x0806 from pc 008928), and MAME logs every one - 296k of
+	// every 300k lines in a -oslog run, which throttles emulation to a few seconds.  See the same
+	// suppression in cpuap.cpp and serad.cpp.
+	space(AS_PROGRAM).set_log_unmap(false);
+	space(AS_IO).set_log_unmap(false);
 }
 
 void multibus_device::mem_map(address_map &map)
