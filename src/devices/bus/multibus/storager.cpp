@@ -272,6 +272,19 @@ constexpr bool SRAM_BYTE_SWAPPED = true;
 // Only IDs inside the commanded range produce marks.  Firmware counts marks, not matches;
 // post-mark skips stole sector counts while posting success.  Fixed.
 constexpr bool WR_SKIP_SILENT = true;
+
+// F000 bit1 on the FLOPPY path = "head position not confirmed at track 0", not the settle
+// one-shot's OUT.  MEASURED (cont.563-4): the firmware's restore gate at $6D94 tests bit1 and
+// treats CLEAR as "already home", zeroing the position cache with no step pulses; bit1 read 0 in
+// 104/104 polls, so every post-error seek then ran open-loop from a false zero and $2012 reported
+// the wrong track accurately.  A mode-5 one-shot cannot supply that level: OUT is high both idle
+// and while counting, dipping low for one CLK at TC, so neither polarity separates "home" from
+// "not home".  The one correct sample in the whole run is the tell - f000=$00A0, bit13 CLEAR (at
+// track 0) AND bit1 clear - while all 103 failing polls had bit13 SET.  Both firmware consumers
+// agree with a position-confidence latch: $6D94 SET -> recalibrate, and the $6E2C pulse loop
+// ($6E58 andi #$2) keeps stepping while SET, which terminates exactly when the head reaches
+// track 0.  The ESDI handshake use of bit1 is a separate branch and is untouched.
+constexpr bool FLOPPY_BIT1_NOT_HOME = true;
 // REQUEST SENSE (0x03): latch fw sense at HOST POST 0x82, serve 4-byte class-0, clean mailbox
 // 0x80 so the driver does not inherit the failed command's status.  Classifies $1c/$12; does
 // not cause REZERO (measured).  Diagnostic permanent.  Sense bytes 1-3 not fully validated.
@@ -2554,6 +2567,8 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		d = (d & ~0x0010) | (index ? 0x0010 : 0);         // bit4  = index pulse
 		if (m_ser_active)
 			d = (d & ~0x0002) | (m_ser_clk ? 0x0002 : 0);  // bit1 = ESDI transfer-acknowledge, follows the clock
+		else if (FLOPPY_BIT1_NOT_HOME)
+			d = (d & ~0x0002) | (trk0 ? 0 : 0x0002);   // bit1 = position not confirmed home
 		else
 			d = (d & ~0x0002) | (m_settle_out ? 0 : 0x0002);  // bit1 = seek/settle busy (PIT ctr1 one-shot, low = busy)
 		// bit2: sole ROM consumer $846a (batch-start).  See F000_BIT2_BATCH_RDY.
