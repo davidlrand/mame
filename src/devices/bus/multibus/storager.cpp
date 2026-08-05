@@ -622,6 +622,14 @@ private:
 	// locates then commits, a read captures then delivers, and conflating them would run
 	// capture-and-deliver logic on a write - worse than doing nothing honestly.
 	bool m_write_active = false;
+	// WRITE COMPLETION (three iterations):
+	//   v1 defer IRQ4 → pending stuck, no close (cycle never ran)
+	//   v2 IRQ4 at count-met then marks → host 0x80 then HANG (marks after completion)
+	//   v3 (this): after N commits, one more mark cycle FIRST, THEN IRQ4/close — no marks after 0x80.
+	// m_wr_final_pending = count met, one mark cycle still owed before channel-done.
+	// m_wr_complete      = IRQ4 raised; ignore further $0A6D for this command.
+	bool m_wr_final_pending = false;
+	bool m_wr_complete = false;
 	u32  m_wr_host_buf = 0;         // host source address for this write (firmware IOPB [0x0d-0x0f])
 	u32  m_wr_psec = 0;             // commanded block address, for deriving the wanted sector range
 	int  m_wr_done = 0;             // sectors COMMITTED this command
@@ -1193,6 +1201,28 @@ void multibus_storager_device::start_field_program()
 {
 	if (!cmd_armable())
 		return;
+	// Post-completion $0A6D re-arms must not re-open a finished write (endless transfer).  The
+	// firmware has no write-side count/done path; only the model stops answering.
+	if (cmd_is_write() && m_wr_complete)
+	{
+		logerror("WRREARM ignored (write already complete) cmd=%02x t=%.5f\n",
+			m_iopb_cmd, machine().time().as_double());
+		return;
+	}
+	// Final pre-IRQ4 cycle: firmware re-issues $0A6D; ensure we are armed so the mark pump
+	// actually runs (v1 failed here — pending set, never reached phase 3).
+	if (cmd_is_write() && m_write_active && m_wr_final_pending)
+	{
+		m_armed = true;
+		m_read_window = true;
+		m_next_rec = machine().time();
+		m_pump->adjust(attotime::from_usec(PHYSICAL_TIMING ? 100 : 200));
+		logerror("WRFINAL re-arm engage cmd=%02x done=%d/%d t=%.5f\n",
+			m_iopb_cmd, m_wr_done, m_sec_count, machine().time().as_double());
+		if (!PHYSICAL_TIMING)
+			advance_read();
+		return;
+	}
 	// The commanded sector count is carried by the program the firmware just loaded - one port-$3F
 	// push per sector - so the gate array has it without reading the IOCB or any firmware cell.
 	{
@@ -1238,6 +1268,8 @@ void multibus_storager_device::start_field_program()
 		capture_track();                     // the ID layout we must match against
 		m_wr_done = 0;
 		m_wr_walked = 0;
+		m_wr_final_pending = false;
+		m_wr_complete = false;
 		address_space &hs = m_bus->space(AS_PROGRAM);
 		u32 const iopb = m_iopb_addr;
 		m_wr_host_buf = (u32(hs.read_byte((iopb + 0x0d) & 0xffffff)) << 16)
@@ -1574,6 +1606,10 @@ void multibus_storager_device::advance_read()
 				machine().time().as_double());
 			m_mark_pending = 6;
 			m_sec_phase = 1;
+			// Final cycle: keep the arm live between phases so marks actually deliver (v1 stuck
+			// with pending and never reached phase 3 when bit11 did not arrive in time).
+			if (m_wr_final_pending)
+				m_armed = true;
 			m_next_rec = machine().time() + sector_period() * 15 / 100;
 			return;
 		}
@@ -1602,6 +1638,8 @@ void multibus_storager_device::advance_read()
 			// The read uses the same table at $29C0 with its own pair ($7BA8 setup / $8018 done).
 			m_mark_pending = 5;
 			m_sec_phase = 2;
+			if (m_wr_final_pending)
+				m_armed = true;
 			m_next_rec = machine().time() + sector_period() * 70 / 100;
 			return;
 		}
@@ -1618,6 +1656,8 @@ void multibus_storager_device::advance_read()
 				m_wr_done, m_sec_count, machine().time().as_double());
 			m_mark_pending = 5;
 			m_sec_phase = 3;
+			if (m_wr_final_pending)
+				m_armed = true;
 			m_next_rec = machine().time() + sector_period() * 15 / 100;
 			return;
 		}
@@ -1646,19 +1686,29 @@ void multibus_storager_device::advance_read()
 				u32 const last  = first + m_sec_count - 1;
 				if (tgt.r >= first && tgt.r <= last)
 				{
-					u32 const len = tgt.len ? tgt.len : 256;
-					u32 const idx = tgt.r - first;
-					u32 const off = m_wr_host_buf + idx * len;
-					std::vector<u8> src(len, 0);
-					address_space &hs = m_bus->space(AS_PROGRAM);
-					for (u32 k = 0; k < len; k++)
-						src[k] = hs.read_byte((off + k) & 0xffffff);
-					bool const ok = write_sector(tgt.r, src.data(), len);
-					if (ok) m_wr_done++;          // COMMITS, not walked sectors - see below
-					logerror("WRCOMMIT r=%02x (want %u..%u idx=%u) from host %06x len=%u -> %s "
-						"done=%d/%d t=%.5f\n",
-						tgt.r, first, last, idx, off, len, ok ? "OK" : "FAILED",
-						m_wr_done, m_sec_count, machine().time().as_double());
+					// Post-IRQ4 final cycle: marks only - do not re-commit (count already met).
+					if (m_wr_final_pending || (m_wr_done >= m_sec_count && m_sec_count > 0))
+					{
+						logerror("WRFINAL no-commit r=%02x (done=%d/%d final_pend=%d) t=%.5f\n",
+							tgt.r, m_wr_done, m_sec_count, m_wr_final_pending ? 1 : 0,
+							machine().time().as_double());
+					}
+					else
+					{
+						u32 const len = tgt.len ? tgt.len : 256;
+						u32 const idx = tgt.r - first;
+						u32 const off = m_wr_host_buf + idx * len;
+						std::vector<u8> src(len, 0);
+						address_space &hs = m_bus->space(AS_PROGRAM);
+						for (u32 k = 0; k < len; k++)
+							src[k] = hs.read_byte((off + k) & 0xffffff);
+						bool const ok = write_sector(tgt.r, src.data(), len);
+						if (ok) m_wr_done++;          // COMMITS, not walked sectors - see below
+						logerror("WRCOMMIT r=%02x (want %u..%u idx=%u) from host %06x len=%u -> %s "
+							"done=%d/%d t=%.5f\n",
+							tgt.r, first, last, idx, off, len, ok ? "OK" : "FAILED",
+							m_wr_done, m_sec_count, machine().time().as_double());
+					}
 				}
 				else
 					// UNREACHABLE with WR_SKIP_SILENT: phase 0 walks past non-matching records
@@ -1679,27 +1729,45 @@ void multibus_storager_device::advance_read()
 			// m_wr_done is now incremented only on a successful commit (above).
 			m_sec_index = (m_sec_index + 1) % std::max(1, m_track_n);
 			m_wr_walked++;
-			if (m_wr_done >= m_sec_count || m_wr_walked > m_track_n * 2)
+
+			// Close path v3: mark cycle before IRQ4 (never after — v2 hung the machine post-0x80).
+			//   1) count met → m_wr_final_pending, stay active, prime arm for one more cycle
+			//   2) that cycle's phase-3 → IRQ4 + m_wr_complete (host 0x80), no further marks
+			if (m_wr_final_pending)
 			{
-				// WHY DID THE WALK END?  done>=count is a normal finish; walked>2 revs is the model's
-				// own safety bound firing early and would be OUR bug, not the firmware's.
-				logerror("WRWALKEND done=%d/%d walked=%d/%d reason=%s t=%.5f\n",
-					m_wr_done, m_sec_count, m_wr_walked, m_track_n * 2,
-					(m_wr_done >= m_sec_count) ? "count-met" : "WALK-BOUND(model)",
-					machine().time().as_double());
-			}
-			if (m_wr_done >= m_sec_count || m_wr_walked > m_track_n * 2)
-			{
-				// OPERATION COMPLETE.  Mirror the read: on count exhaust the gate array raises the
-				// channel-done IRQ4 that op42 waits on (spec: "raises IRQ4 (channel/DMA done)"),
-				// and arms the status stamp.  Same engine, same completion - the direction of the
-				// bytes is the only thing that differed.
 				m_status_armed = true;
-				logerror("WRDONE %d/%d committed after %d walked - raising channel-done IRQ4 t=%.5f\n",
+				m_wr_complete = true;
+				m_wr_final_pending = false;
+				m_write_active = false;
+				logerror("WRDONE %d/%d committed after %d walked - final cycle done, IRQ4 t=%.5f\n",
 					m_wr_done, m_sec_count, m_wr_walked, machine().time().as_double());
 				if (m_dma_done)
 					m_dma_done->adjust(attotime::from_usec(10));
+			}
+			else if (m_wr_done >= m_sec_count && m_sec_count > 0)
+			{
+				m_wr_final_pending = true;
+				m_armed = true;
+				m_sec_phase = 0;
+				logerror("WRFINAL pending %d/%d walked=%d - one mark cycle then IRQ4 t=%.5f\n",
+					m_wr_done, m_sec_count, m_wr_walked, machine().time().as_double());
+				// Do not wait solely on firmware bit11; schedule the final locate promptly.
+				m_next_rec = machine().time() + sector_period() * 15 / 100;
+				m_pump->adjust(attotime::from_usec(PHYSICAL_TIMING ? 100 : 200));
+				return;
+			}
+			else if (m_wr_walked > m_track_n * 2)
+			{
+				logerror("WRWALKEND done=%d/%d walked=%d/%d reason=WALK-BOUND(model) t=%.5f\n",
+					m_wr_done, m_sec_count, m_wr_walked, m_track_n * 2,
+					machine().time().as_double());
+				m_status_armed = true;
+				m_wr_complete = true;
 				m_write_active = false;
+				if (m_dma_done)
+					m_dma_done->adjust(attotime::from_usec(10));
+				logerror("WRDONE %d/%d (walk-bound force) t=%.5f\n",
+					m_wr_done, m_sec_count, machine().time().as_double());
 			}
 			m_next_rec = machine().time() + sector_period() * 15 / 100;
 			return;
@@ -2733,8 +2801,11 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		// soft-vector handler, spec cont.370).  0x22F/0x23F = hunt the ID address mark (-> $9884 compare);
 		// 0x2AF/0x2FF = read the data field.  The low byte's arm nibble selects; the mark is delivered only
 		// while the corresponding command is armed, so interrupts arrive in the firmware's phase order.
+		// 0x0A6D = op18 word[0] re-issue (per-record re-arm third word @ $8936).  board.yaml noted the
+		// model decoded 022f/023f but not 0a6d as a *command*; bit11 below still opens the window.
+		// Name it here so ID-hunt state matches the locate head of the program.
 		u16 const code = data & 0x07ff;   // mask off bit11 (window) - the code may ride the same write
-		if ((code == 0x22f || code == 0x23f) && cmd_armable()) m_cmd = CMD_IDHUNT;
+		if ((code == 0x22f || code == 0x23f || code == 0x26d) && cmd_armable()) m_cmd = CMD_IDHUNT;
 		else if ((code == 0x2af || code == 0x2ff) && (m_iopb_cmd == 0x94 || m_iopb_cmd == 0x95)) m_cmd = CMD_DATA;
 
 		// The firmware's channel-engagement write (E000 bit11) opens the read window.  op18 has already
@@ -3769,6 +3840,7 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 	m_iopb_addr = dbi;
 	m_window_seen = false; m_term_fired = false; m_idx_prev = false; m_read_active = false; m_data_chunks = 0;   // per-command reset
 	m_write_active = false; m_wr_done = 0; m_wr_walked = 0;
+	m_wr_final_pending = false; m_wr_complete = false;
 	// The gate array RETAINS its field program across command boundaries - the firmware says so
 	// explicitly.  $5FF6 cmpi.w #$1,$793e / beq $6028 makes the builder emit NEITHER op1A NOR op18
 	// when the program already in the gate array is the one this command needs; op18 publishes the
