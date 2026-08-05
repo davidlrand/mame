@@ -8,7 +8,7 @@
 #           "?" = provisional / open frontier.
 
 meta:
-  as_of: "cont.432 (2026-07-28)"
+  as_of: "cont.494 (2026-07-30)"
   BASELINE: >
     cont.426 (the SRAM byte-order correction) is THE BASELINE for all RE.  Anything measured before
     it that touched byte granularity was taken through an inverted mapping - see sram_byte_order,
@@ -198,7 +198,7 @@ registers:
       over the control byte). op28's seek engine drives stepping through it.
     fields:
       "8-11": "HEAD, ONE'S-COMPLEMENTED -> head = ~(E804>>8) & $0F. The observed $BF78 = head 0, correct for the cyl0 label."
-      "0-7":  "drive select + control (bit4 motor/write-current, bit11 write-precomp). The unit-select encoding is NOT yet decoded - needed for HD boot."
+      "0-7":  "drive select + control (bit4 motor/write-current, bit11 write-precomp). DECODED (cont.565, conf: V): the low byte is copied VERBATIM from the selected unit's UIB+$DC, with bit4 toggled for motor/write-current; bits 5-7 of that byte are the DRIVE SELECT. The $7F diagnostic at $0D1E-$0D42 writes a direct unit->E804 table: unit0=$FF60, unit1=$FFC0, unit2=$FF80, unit3=$FF00 (low-byte high bits 011/110/100/000). Cross-check: every measured floppy E804 low byte in a boot is $C8/$D8 = the $C0 (110) entry plus the documented bit3/bit4 control bits, and those writes coincide 1:1 with head steps. CLOSED against the operational path: $651C loads D3 from UIB+$12 only to gate E802 bit2 at $655C, then RELOADS D3 from ($dc,A1) at $6576 and moves it into the low byte at $6588 - UIB+$12 never reaches E804.  Measured live: UIB+$dc=$bf68 -> E804 low $68/$78, UIB+$dc=$bfc8 -> low $c8/$d8 (the +$10 is the motor bit), i.e. low byte == UIB+$DC low byte exactly.  The two observed select fields 011 and 110 match the $7F table's unit-0 and unit-1 entries, so diagnostic and operational agree and the infinite-loop caveat is discharged.  The FLOPPY is the 110/$c8 select, established independently: those writes coincide 1:1 with head steps.  $6e60 is a per-unit UIB staging buffer - the same address holds different +$DC values as units are selected. WHY IT MATTERS BEYOND HD BOOT: E802 bit0 is dual-use (ESDI serial clock AND floppy STEP) and the model arms both unconditionally, so a floppy step is mis-latched as a serial ack and steals F000 bit1 from the restore-completion test at $6E70. Routing the shared line by drive select is the hardware-faithful demux; gating it on the CPU being inside $A118 would be an HLE shim (no such signal exists on the board)."
     model: "m_sel_head / m_sel_drive are latched as gate-array state; the read takes its side from m_sel_head. This REPLACED the old snoop of the firmware's [$7436] - the gate array has no visibility into firmware RAM."
     conf: V
   E806: {role: "target cylinder for seek/verify", conf: R}
@@ -508,7 +508,22 @@ density_source:   # cont.443 - density is UIB+$12 BIT 2.  Two earlier answers he
       RESETS the selector, $298C's bchg yields the same fork on the next IRQ6, and the STAKE arm is
       never taken.  The never-entered $92B4, the frozen C800[0] at $2380, and the 12-of-16 dropped
       records are ONE consequence, not three separate defects.
-  ★★★ sec0 - THE UIB CARRIES A STARTING SECTOR ID THE LLE HAD NO EQUIVALENT OF (cont.455): >
+  ★★★ sec0 - SUPERSEDED cont.447, READ THE BANNER BEFORE USING THIS SECTION: >
+    ✖ SUPERSEDED 2026-07-29 (cont.447). Kept for provenance; do NOT reason from it.
+    Two claims below are REFUTED by measurement:
+      1. "the host was correctly rejecting mis-based data" - NO. The label is delivered
+         byte-correct at the address the IOCB names (0x0FC0DD) and is STILL rejected. Placement,
+         ordering and sec0 are all exonerated.
+      2. "sec0 = the physical ID that LOGICAL sector 0 lives at", licensing a renumber - NO.
+         The CPUAP addresses the volume by SASI READ(6) CDB LBA and converts LBA->CHS ITSELF
+         (FE3B65). UIB[4] is the physical sector the VOLUME STARTS AT - a controller-side base,
+         not a renumbering. Same value, different role, no data moved.
+    The real gate is a label-CONTENT check needing the ECMA-13 volume identifier at buffer[0]
+    (fe3686 'I'@+0x6A, fe368e 'X'@+0x6D, fe448e 'S'@+0x69). An exhaustive scan of ALL 46 pcmx2
+    images (116,480 sectors) found ZERO sectors with SINIX0 at byte 0, so NO addressing on ANY
+    medium can satisfy it. Also: UIB[5] is NOT a duplicate of UIB[4] (HD reads +4=0d +5=13).
+    Current truth: memory [[storager-iocb-field-map]].
+    --- original text follows, superseded ---
     The HLE has `u8 m_unit_sec0[4]` - UIB[4], the physical ID that LOGICAL sector 0 lives at - and
     maps `secid = ((sec0 - 1 + sidx) % spt) + 1`.  The LLE had nothing corresponding.
     The host-supplied UIB, decoded with the HLE's field map (fetched per operation from $0FE948):

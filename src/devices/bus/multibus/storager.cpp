@@ -273,6 +273,19 @@ constexpr bool SRAM_BYTE_SWAPPED = true;
 // post-mark skips stole sector counts while posting success.  Fixed.
 constexpr bool WR_SKIP_SILENT = true;
 
+// E802 bit0 is a SHARED stimulus: it is the ESDI serial clock AND the floppy STEP line, and the
+// SELECTED drive is what responds.  DECODED (cont.565, board.yaml conf V): the E804 low byte is the
+// selected unit's UIB+$DC verbatim, bits 5-7 are the drive select, bit4 is motor/write-current, and
+// the floppy is select 110 ($c0 base) - established independently because those writes coincide 1:1
+// with head steps.  Without this gate the model armed the serial branch on EVERY bit0 edge, so a
+// floppy step was mis-latched as a serial ack and stole F000 bit1 from the restore-completion test
+// at $6E70 (measured: 61 latches in a boot, and $A118/$A1CE/$A17E executed ZERO times - there was no
+// serial transaction at all).  This is the SAFE half of the demux: it only asserts "floppy selected
+// -> never serial", and makes no claim that a non-floppy select implies a real serial transfer.
+// Deliberately NOT gated on the CPU being inside $A118: no board signal carries a program counter,
+// so that would be an HLE shim that fails silently on any other path driving the same line.
+constexpr bool E802B0_SELECT_KEYED = true;
+
 // F000 bit1 on the FLOPPY path = "head position not confirmed at track 0", not the settle
 // one-shot's OUT.  MEASURED (cont.563-4): the firmware's restore gate at $6D94 tests bit1 and
 // treats CLEAR as "already home", zeroing the position cache with no step pulses; bit1 read 0 in
@@ -459,8 +472,12 @@ private:
 	// in.  The drive follows the controller's clock: ack drops when the controller drops the clock and
 	// rises when it raises it, so the firmware's two-phase poll ($A17E waits ack low, $A1A2 waits ack
 	// high) completes without any timing model - it polls, so latency is absorbed.
-	// F000 bit1 is the floppy class's seek/settle busy, so the ack only takes over the bit once a
-	// serial transaction has actually clocked (m_ser_active), and that is reset per command.
+	// WRONG AS WRITTEN (cont.565): m_ser_active does NOT mean "a serial transaction has clocked".
+	// E802 bit0 is shared with the floppy STEP line and this model arms the serial branch on every
+	// edge, so a floppy seek hands F000 bit1 to the ack and destroys the position-confidence meaning
+	// the restore completion at $6E70 depends on.  The real discriminator is E804 drive select (who
+	// responds to the shared line), and that encoding is not yet decoded - see board.yaml.  Needs one
+	// ESDI $A118 window sampled together with sel_drive before this can be gated correctly.
 	bool m_ser_clk = true;       // last E802 bit0 seen
 	bool m_ser_active = false;   // a serial transaction has driven the clock this command
 	bool m_stepped_since_arm = false;  // head moved after the command armed -> re-decode on settle
@@ -492,6 +509,8 @@ private:
 	u8   m_last_sense = 0;          // firmware sense byte from the last 0x82 completion (node+3)
 	u8   m_last_sense_op = 0;       // firmware opcode that failed, for the sense reply
 	bool m_last_sense_valid = false;
+	double m_ser_last_t = 0.0;      // TEMP cont.565: time of the last serial clock edge
+	u32  m_mux_prints = 0;          // TEMP cont.565: bit1-ownership probe cap
 	bool m_step_bit0_prev = false, m_step_lvl_prev = false;
 	bool m_ioreg_done = false;
 	// OS-channel command submitted to the firmware via mailbox_submit, awaiting HOST POST.
@@ -2565,8 +2584,26 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		d = (d & ~0x2000) | (trk0 ? 0 : 0x2000);          // bit13 = track 0, active-low (fw 0x5de4 btst #$d)
 		d = (d & ~0x0400) | (wprot ? 0x0400 : 0);         // bit10 = write-protect
 		d = (d & ~0x0010) | (index ? 0x0010 : 0);         // bit4  = index pulse
-		if (m_ser_active)
+		bool const f000_floppy_sel = ((m_sel_drive & 0xe0) == 0xc0);
+		if (m_ser_active && !(E802B0_SELECT_KEYED && f000_floppy_sel))
+		{
+			// TEMP cont.565 (STRIP): WHO OWNS F000 bit1?  The restore completion at $6E70 waits for
+			// bit1 to clear once the head is home, but m_ser_active latches on the first serial
+			// clock edge and only clears at the COMMAND boundary, so it can still own the pin long
+			// after its handshake finished.  Log exactly the ambiguous case - drive AT track 0 while
+			// the serial branch is driving bit1 - with the age of the last clock edge, which
+			// separates "handshake is over, latch outlived it" from "genuinely overlapping".
+			if (trk0 && m_mux_prints < 40)
+			{
+				m_mux_prints++;
+				logerror("BIT1MUX at-trk0 but SER owns bit1: ser_clk=%d -> bit1=%d | last ser edge %.6fs ago"
+					" | cmd=%02x t=%.5f\n",
+					m_ser_clk ? 1 : 0, m_ser_clk ? 1 : 0,
+					machine().time().as_double() - m_ser_last_t,
+					m_iopb_cmd, machine().time().as_double());
+			}
 			d = (d & ~0x0002) | (m_ser_clk ? 0x0002 : 0);  // bit1 = ESDI transfer-acknowledge, follows the clock
+		}
 		else if (FLOPPY_BIT1_NOT_HOME)
 			d = (d & ~0x0002) | (trk0 ? 0 : 0x0002);   // bit1 = position not confirmed home
 		else
@@ -2743,6 +2780,20 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		// Drive / head select.  op24 writes it twice (the second write merges the head nibble back over
 		// the control byte); op28's seek engine drives stepping through it.  Bits 8-11 carry the head
 		// ONE'S-COMPLEMENTED, so head 0 presents as $F (the observed $BF78 = head 0, the cyl0 label).
+		// TEMP cont.565 (STRIP): the E804 low byte is copied verbatim from the SELECTED UNIT'S
+		// UIB at +$DC ($6576 reloads D3 from ($dc,A1), $6588 moves it into the low byte).  UIB+$12
+		// never reaches E804 - it only gates E802 bit2 at $655C.  Print both so "select byte ==
+		// active unit's +$DC" is confirmed rather than inferred, which is what lets the model tell
+		// which device the shared E802 bit0 pulse is addressed to.
+		if (m_uib_base && m_mux_prints < 24)
+		{
+			address_space &us = m_cpu->space(AS_PROGRAM);
+			m_mux_prints++;
+			logerror("E804W data=%04x low=%02x | uib=%04x UIB+$dc=%04x | cmd=%02x t=%.5f\n",
+				data, u8(data & 0xff), m_uib_base,
+				m_uib_base ? us.read_word((m_uib_base + 0xdc) & 0xffff) : 0xffff,
+				m_iopb_cmd, machine().time().as_double());
+		}
 		m_sel_head = u8(~(data >> 8) & 0x0f);
 		m_sel_drive = u8(data & 0xff);
 	}
@@ -2752,11 +2803,33 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		if (ACCESSING_BITS_0_7)
 		{
 			bool const clk = BIT(data, 0);
-			if (m_ser_clk && !clk)
+			bool const floppy_sel = ((m_sel_drive & 0xe0) == 0xc0);
+			if (m_ser_clk && !clk && !(E802B0_SELECT_KEYED && floppy_sel))
 			{
+				// DO NOT call this a serial ack.  E802 bit0 is DUAL-USE: it is the ESDI serial clock
+				// AND the floppy STEP line, and this handler arms both with no select gate.  Measured
+				// (cont.565): in a whole floppy boot the firmware's serial routines ($A118 send,
+				// $A1CE receive, $A17E wait-low) execute ZERO times while 61 of these edges fire, each
+				// one advancing the head a cylinder - so every latch here was a step misread as a
+				// clock.  The old wording ("SER: ack takes F000 bit1") was then cited back as evidence
+				// of a serial transaction that never happened.  Name the event, not the guess.
 				if (!m_ser_active)
-					logerror("SER: ack takes F000 bit1 (clock 1->0) cmd=%02x e802=%04x t=%.5f\n",
+					logerror("E802B0 low edge (DUAL-USE: floppy STEP and/or ESDI serial clock - "
+						"serial NOT confirmed without an $A118 window) cmd=%02x e802=%04x t=%.5f\n",
 						m_iopb_cmd, data, machine().time().as_double());
+				// TEMP cont.565 (STRIP): is this edge a SERIAL CLOCK or a FLOPPY STEP?  E802 bit0 is
+				// wired to both in this handler.  Log the drive-select byte and the head position so
+				// "the serial ack latched" and "the head stepped" can be told apart, and so any
+				// hardware discriminator (E804 drive select) shows itself.
+				if (m_mux_prints < 40)
+				{
+					floppy_image_device *const qf = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
+					m_mux_prints++;
+					logerror("E802B0 edge: sel_drive=%02x sel_head=%x cmd=%02x fdd_cyl=%d t=%.5f\n",
+						m_sel_drive, m_sel_head, m_iopb_cmd, qf ? qf->get_cyl() : -1,
+						machine().time().as_double());
+				}
+				m_ser_last_t = machine().time().as_double();
 				m_ser_active = true;    // a real transaction: the controller drove the clock low
 			}
 			m_ser_clk = clk;
