@@ -1265,6 +1265,23 @@ void multibus_storager_device::start_field_program()
 	// the ID phase reuses the read's mark delivery; nothing beyond it is assumed.
 	if (!m_write_active && cmd_is_write())
 	{
+		// SEED THE WALK SURFACE FROM THE SELECT LATCH - WRITE COMMAND ENTRY ONLY.
+		// MEASURED (cont.566): on every failing 2a write the staged ID head followed m_walk_head
+		// while the firmware's wanted head ([$7436], copied from [$7946]) followed the SELECT latch,
+		// and the two disagreed - #5 sel=1/walk=0 staged h=00 against want 01, #7 sel=0/walk=1 staged
+		// h=01 against want 00.  On every healthy write sel == walk.  So capture_track() swept the
+		// wrong surface and the ID it staged was internally consistent with the track we captured -
+		// we captured the wrong one.  The verify at $98F6 then fails and op $48 returns $202A.
+		// m_walk_head is the gate array's OWN position across a multi-track walk and is SUPPOSED to
+		// diverge from the select latch mid-command (the $1949 deferred flip crosses track
+		// boundaries), so this seeding belongs at COMMAND ENTRY and nowhere else.  cont.526 measured
+		// what happens if it is done in the program re-arm block instead: the re-arm re-seeded
+		// m_walk_head 14us after a legitimate crossing had advanced it (WALK -> head=1 at t=8.83315,
+		// re-seeded head=0 at t=8.83329) and threw the crossing away.  Walk state belongs to the
+		// COMMAND, not to a program re-arm.  Any pending boundary flip is prior-command residue here
+		// and would flip the surface out from under this write.
+		m_walk_head = m_sel_head & 1;
+		m_walk_pending = false;
 		capture_track();                     // the ID layout we must match against
 		m_wr_done = 0;
 		m_wr_walked = 0;
