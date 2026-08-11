@@ -3867,6 +3867,17 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 	// us to keep: the SECOND read emitted no op18, so no C800/E000 burst ever arrived, nothing was
 	// armed, and the read produced one record's worth of activity and then silence. (cont.429)
 	m_desc_n = 0;   // the descriptor capture buffer is per-load, but the LOADED program persists
+	// ...and so is the LOAD-IN-PROGRESS flag, which unlike m_prog_loaded must NOT survive a command
+	// boundary: a block copy into E000-E01E cannot physically be in flight across a HOST GO.  It is
+	// set by any write to offset >= 1 and cleared only by the write that completes the block, so an
+	// incomplete copy latches it true for good.  MEASURED (cont.567) as the sole cause of the write
+	// `1c` class: on every program-reusing write the firmware DOES issue the per-record engagement
+	// (E000 <= $0a6d, bit11 set, on a clean rising edge) and the model rejected all three, with
+	// loaded=1 armable=1 prev=0 and `loading=1` the only false conjunct.  Nothing then armed, no
+	// mark was ever presented, the command took zero IRQ5/IRQ6, and $9602's ID poll ran its D2
+	// countdown out to $983E ($201c).  This also retires the belief that a reusing write writes no
+	// E000 at all - it does; the model was not listening.
+	m_prog_loading = false;
 	// The firmware carries the STATUS/ERROR bytes back to the host IOPB itself, via its node->host
 	// bus-master DMA (run_channel_dma, E800 bit13); the model transcribes nothing here.
 	m_held_len = 0;   // no field carries across a command boundary
@@ -3877,6 +3888,18 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 	// start_field_program() would never re-trigger.  Both inputs are the gate array's own: it knows
 	// whether it still holds a program, and it has the command byte it just fetched.
 	m_read_window = false;
+	// READ ONLY, and cmd 0x96 must NOT be added here.  A program-reusing WRITE reaches the same
+	// dead end by the same route (no op18 -> no E000 write -> the bit11 test never runs -> nothing
+	// ever arms, so $9602's ID poll spins its D2 countdown to exhaustion and $983E returns $201c),
+	// so extending this test to 0x96 is the obvious fix and it is REFUTED.  Measured A/B on the
+	// reuse baseline (cont.567): it does not rescue a single reuse write and it BREAKS the loading
+	// write that passed - identical mark counts in both arms (L5=18, L6=9, [$7a68] set, 8 commits,
+	// no $983E hit) yet 82/1c instead of 80/00, after which the installer aborts.  Cause is the
+	// cont.523 ordering hazard: engaging at command entry runs the write first-arm (capture_track,
+	// stage_record, m_sec_count from [$7abc]) BEFORE the firmware has written its per-command
+	// values, and the real op18 load then re-enters this function with m_write_active already true
+	// and skips the genuine setup.  A write must engage LAZILY, once the firmware has demonstrably
+	// set up the operation - not at the command boundary, where the class cannot yet be known.
 	if (m_prog_loaded && m_iopb_cmd == 0x95)
 	{
 		// Engage NOW.  E802 bit11 cannot be the trigger: it is issued by the read ISR, which only
