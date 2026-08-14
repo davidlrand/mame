@@ -1,0 +1,28 @@
+# Soft-timer path around the spare-track write hang (inst6+).
+# CAPTURE VARIANT of dbg-softtimer.txt: printf -> logerror so the firmware-side data lands in
+# error.log instead of the debug console window (which a headless/unattended run cannot read).
+# Keep in sync with dbg-softtimer.txt; that one is for watching the console live.
+#   docs/storager-lle/cont560/dbg-run.sh docs/storager-lle/cont560/dbg-softtimer.txt
+#
+# Open defect: one write never self-completes; at close [$7986]=733c (live freelist) while
+# all healthy closes have [$7986]=0000.  $7986 is the soft-timer list head; $89E8 arms it;
+# $2B80 is the tick.  Compare arm/tick/clear around a healthy 16/16 close vs the stall.
+#
+# error.log (rebuild): WRCLOSE STALL lines carry freelist/node+2 without raising IRQ4.
+# TRAP: every action ends in g.  printf → debug console only.
+
+focus 0:slot1:storager:cpu
+
+# Arm site — what block is linked, what timeout/code
+bpset 89e8,1,{ logerror "ARM89E8 [7986]=%04X [74b8]=%04X D0=%04X D1=%04X A0=%04X A1=%04X cyc=%d\n", w@7986, w@74b8, d0, d1, a0, a1, cycles; g }
+
+# Tick — does it fire on the hang write?
+bpset 2b80,1,{ logerror "TICK2B80 [7986]=%04X head=%04X cyc=%d\n", w@7986, w@7986, cycles; g }
+
+# Completion stamp (healthy closes hit this; hang write must not, until the missing event)
+bpset 1a54,1,{ logerror "HIT1A54 node+2=%02X [7986]=%04X [7302]=%04X cyc=%d\n", b@71f2, w@7986, w@7302, cycles; g }
+
+# Derail — must stay at zero if we never raise close-path IRQ4 (v6)
+bpset 4626,1,{ logerror "HIT4626 node+2=%02X [7986]=%04X SR=%04X cyc=%d\n", b@71f2, w@7986, sr, cycles; g }
+
+g

@@ -1,0 +1,28 @@
+# Soft-timer / IRQ1 cut (inst7+).  Rebuild for WRCLOSE STALL queue dump + IRQ1 raise logs.
+#   docs/storager-lle/cont560/dbg-run.sh docs/storager-lle/cont560/dbg-softtimer.txt
+#
+# CRITICAL: $2B80 is NOT the system tick.  IRQ1 vector = $2B58.  Handler shape:
+#   $2B58 entry
+#   $2B70 A0 = [$736c]          ; ACTIVE timeout queue (not $7986)
+#   $2B7A subq.w #1,(A0)        ; per-tick decrement
+#   $2B7E bne  ...              ; still counting
+#   $2B80 expire path           ; ONLY when count hits 0  ← sparse is normal if most cancel
+#   $2BB6 pet E800 bit9 + reload PIT MSB $FF via (A5)
+#
+# $7986 = per-context cell (pointer to the block).  $89E8 reloads #$32/#$201C into that
+# block if the cell is non-zero — it does NOT by itself insert into $736c ($29F8 does).
+# Healthy write finals clear [$7986] to 0 before post; the hang leaves it live.
+#
+# Compare: IRQ1 entry rate (~26ms expected) vs expire rate vs whether hang block is on_q.
+
+focus 0:slot1:storager:cpu
+
+bpset 2b58,1,{ printf "IRQ1ENT [736c]=%04X [7986]=%04X cyc=%d\n", w@736c, w@7986, cycles; g }
+bpset 2b7a,1,{ printf "IRQ1DEC A0=%04X cnt_before=%04X [7986]=%04X cyc=%d\n", a0, w@(a0), w@7986, cycles; g }
+bpset 2b80,1,{ printf "EXPIRE  A0=%04X code=%04X [7986]=%04X cyc=%d\n", a0, w@(a0+2), w@7986, cycles; g }
+bpset 89e8,1,{ printf "RELOAD  [7986]=%04X A0=%04X cyc=%d\n", w@7986, a0, cycles; g }
+bpset 29f8,1,{ printf "ARM29F8 [736c]=%04X [7986]=%04X cyc=%d\n", w@736c, w@7986, cycles; g }
+bpset 2aba,1,{ printf "CANCEL  [736c]=%04X [7986]=%04X cyc=%d\n", w@736c, w@7986, cycles; g }
+bpset 1a54,1,{ printf "HIT1A54 node+2=%02X [7986]=%04X [736c]=%04X cyc=%d\n", b@71f2, w@7986, w@736c, cycles; g }
+
+g

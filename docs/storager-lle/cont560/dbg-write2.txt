@@ -1,0 +1,22 @@
+# Debugger script: write #1 vs write #2 completion (inst4 hang).
+#   docs/storager-lle/cont560/dbg-run.sh docs/storager-lle/cont560/dbg-write2.txt
+#
+# Prefers model logerror (rebuild storager.cpp first) — WRDATA2/WRDONE/WRIRQ4 dump
+# [$7986]/[7302]/node+2 on every write close.  These bps are the firmware-side A/B.
+#
+# Distinguishes:
+#   A  model IRQ4 derails firmware still in its completion path
+#      -> $4626 after WRIRQ4, node+2 still 81, no $1a54 this command
+#   B  firmware already lost before IRQ4
+#      -> no $1a54; [$7986]/[$7302] already wrong at final WRDATA2 (error.log)
+#
+# TRAP: every action ends in g.  printf goes to the debug console, not error.log.
+
+focus 0:slot1:storager:cpu
+
+bpset 1a54,1,{ printf "HIT1A54 pc=%06X node+2=%02X [7986]=%04X [7302]=%04X [7950]=%04X cyc=%d\n", pc, b@71f2, w@7986, w@7302, w@7950, cycles; g }
+bpset 4626,1,{ printf "HIT4626 pc=%06X node+2=%02X [7986]=%04X [7302]=%04X [7950]=%04X SR=%04X cyc=%d\n", pc, b@71f2, w@7986, w@7302, w@7950, sr, cycles; g }
+bpset 8584,1,{ printf "HIT8584 [7986]=%04X [74b8]=%04X cyc=%d\n", w@7986, w@74b8, cycles; g }
+bpset 89e8,1,{ printf "HIT89E8 [7986]=%04X cyc=%d\n", w@7986, cycles; g }
+
+g

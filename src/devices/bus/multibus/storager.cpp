@@ -656,6 +656,11 @@ private:
 	// m_wr_complete      = model closed the write window; ignore further $0A6D for this command.
 	bool m_wr_final_pending = false;
 	bool m_wr_complete = false;
+	// Post-STALL: sample the hang block's count word across successive IRQ1 raises (inst8 cut).
+	// cnt=ffff at STALL is either wrap-from-0 (subq of 0) or a live huge countdown; only a
+	// multi-tick sample separates them.  0 = inactive.
+	u16  m_wr_stall_watch_blk = 0;
+	int  m_wr_stall_watch_left = 0;
 	u32  m_wr_host_buf = 0;         // host source address for this write (firmware IOPB [0x0d-0x0f])
 	u32  m_wr_psec = 0;             // commanded block address, for deriving the wanted sector range
 	int  m_wr_done = 0;             // sectors COMMITTED this command
@@ -1313,6 +1318,8 @@ void multibus_storager_device::start_field_program()
 		m_wr_walked = 0;
 		m_wr_final_pending = false;
 		m_wr_complete = false;
+		m_wr_stall_watch_blk = 0;
+		m_wr_stall_watch_left = 0;
 		if (m_wr_close)
 			m_wr_close->adjust(attotime::never);   // cancel prior command's failsafe
 		address_space &hs = m_bus->space(AS_PROGRAM);
@@ -1466,6 +1473,21 @@ void multibus_storager_device::stage_record(captured_sector const &s)
 		logerror("STAGE dst=%04x (d800=%04x) sector r=%02x %s t=%.5f\n",
 			u32(m_d800) << 1, m_d800, s.r, flux_density_fm() ? "FM" : "MFM",
 			machine().time().as_double());
+	// cont.569 (TEMP): WHICH BUFFER DID WE STAGE INTO?  The 1.81s mid-command hang on the failing
+	// psec=2092 attempt showed `staged@7dac` on the FIRST record while every healthy record stages
+	// at `7d9e`.  $7DAC is the READ base (d800=3ed6); $7D9E is the write base (d800=3ecf), which
+	// the firmware only selects later at $97C8.  So a first record staged before that re-point
+	// lands in the read buffer and the firmware waits on a write buffer we never filled.  Log the
+	// buffer identity on every write stage so the fail/heal cases are separable in one run.
+	if (cmd_is_write())
+	{
+		u32 const d = u32(m_d800) << 1;
+		logerror("STAGEBUF dst=%04x d800=%04x %s r=%02x done=%d/%d pc=%06x t=%.5f\n",
+			d, m_d800,
+			(d == 0x7dac) ? "READ-BASE(wrong for write)" : (d == 0x7d9e) ? "write-base" : "other",
+			s.r, m_wr_done, m_sec_count, m_cpu->pcbase() & 0xffffff,
+			machine().time().as_double());
+	}
 		bool const fm = flux_density_fm();
 
 	u32 dst = u32(m_d800) << 1;
@@ -2208,6 +2230,41 @@ void multibus_storager_device::advance_read()
 // releases it once the firmware has armed and the CPU is unmasked.
 TIMER_CALLBACK_MEMBER(multibus_storager_device::pump_tick)
 {
+	// cont.569: PC sample inside the post-WRLOC wait.  phase==1 + mark_pending IRQ6 + !armed means
+	// the model has staged the next ID and is holding IRQ6 until a re-arm (bit11 or D800 same-
+	// value).  Cap samples so a healthy run stays quiet; the 1.81s gap produces many ticks.
+	{
+		static int s_gap_n = 0;
+		static double s_gap_t0 = -1.0;
+		bool const in_gap = (m_write_active && m_sec_phase == 1 && m_mark_pending == 6 && !m_armed);
+		if (in_gap)
+		{
+			double const t = machine().time().as_double();
+			if (s_gap_n == 0)
+				s_gap_t0 = t;
+			// ~every 50ms (pump is 200us) → every 250th tick, plus the first few
+			if (s_gap_n < 6 || (s_gap_n % 250) == 0)
+			{
+				address_space &cs = m_cpu->space(AS_PROGRAM);
+				logerror("WRGAP wait IRQ6 armed=0 phase=1 done=%d/%d pc=%06x IPL=%d "
+					"[7302]=%04x [7950]=%04x [$7986]=%04x d800=%04x dt=%.5f t=%.5f\n",
+					m_wr_done, m_sec_count, m_cpu->pcbase() & 0xffffff,
+					int((m_cpu->state_int(M68K_SR) >> 8) & 7),
+					cs.read_word(0x7302), cs.read_word(0x7950), cs.read_word(0x7986),
+					m_d800, t - s_gap_t0, t);
+			}
+			s_gap_n++;
+		}
+		else if (s_gap_n > 0)
+		{
+			logerror("WRGAP end after %d samples dt=%.5f done=%d/%d phase=%d pend=%d armed=%d t=%.5f\n",
+				s_gap_n, machine().time().as_double() - s_gap_t0,
+				m_wr_done, m_sec_count, m_sec_phase, m_mark_pending, m_armed ? 1 : 0,
+				machine().time().as_double());
+			s_gap_n = 0;
+			s_gap_t0 = -1.0;
+		}
+	}
 	deliver_mark();
 	if (m_read_window)
 		advance_read();
@@ -2698,6 +2755,17 @@ TIMER_CALLBACK_MEMBER(multibus_storager_device::wr_close_check)
 		cs.read_word(0x7302), cs.read_word(0x7950), freelist, qhead,
 		blk_cnt, blk_code, blk_next, on_queue ? 1 : 0,
 		m_cpu->pcbase() & 0xffffff, machine().time().as_double());
+	// Discriminator (cheap): if on_q and the block is in RAM, sample cnt across the next few
+	// IRQ1 raises.  ffff→fffe→fffd = live countdown (wrap or huge arm).  stuck ffff = not
+	// serviced despite on_q=1.  Do not conclude from a single STALL snapshot alone.
+	if (on_queue && freelist >= 0x4000 && freelist < 0x7f00)
+	{
+		m_wr_stall_watch_blk = freelist;
+		m_wr_stall_watch_left = 8;
+		logerror("WRSTALL WATCH arm blk=%04x cnt=%04x for %d IRQ1 samples t=%.5f\n",
+			m_wr_stall_watch_blk, blk_cnt, m_wr_stall_watch_left,
+			machine().time().as_double());
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3072,6 +3140,20 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 					data, BIT(data, 11), m_bit11_prev ? 1 : 0,
 					(b11 && !m_bit11_prev) ? 1 : 0, m_armed ? 1 : 0, m_mark_pending,
 					m_cpu->pcbase() & 0xffffff, machine().time().as_double());
+		}
+		// cont.569 write gap probe: after WRLOC the next mark needs a bit11 rising edge (or the
+		// D800 same-value re-arm).  Log every E802 write while a write is live so the 1.81s
+		// window shows A (no writes) vs B (writes, no edge) vs C (edges that don't arm).
+		if (cmd_is_write() && m_write_active)
+		{
+			static int n = 0;
+			if (++n <= 200)
+				logerror("E802W data=%04x b11=%d prev=%d edge=%d armed=%d pend=%d phase=%d "
+					"done=%d/%d pc=%06x t=%.5f\n",
+					data, BIT(data, 11), m_bit11_prev ? 1 : 0,
+					(b11 && !m_bit11_prev) ? 1 : 0, m_armed ? 1 : 0, m_mark_pending,
+					m_sec_phase, m_wr_done, m_sec_count, m_cpu->pcbase() & 0xffffff,
+					machine().time().as_double());
 		}
 		if (b11 && !m_bit11_prev)
 		{
@@ -3868,6 +3950,12 @@ void multibus_storager_device::d800_w(offs_t offset, u16 data, u16 mem_mask)
 		bool const value_changed = (m_d800 != was);
 		bool const will_restage = (m_write_active && value_changed && m_track_n > 0);
 		bool const same_rearm = (m_write_active && !value_changed && m_mark_pending != 0);
+		logerror("D800SEL %04x -> %04x (dst %04x -> %04x) write_active=%d restage=%d "
+			"same_rearm=%d pend=%d phase=%d armed=%d done=%d/%d pc=%06x t=%.5f\n",
+			was, m_d800, u32(was) << 1, u32(m_d800) << 1, m_write_active ? 1 : 0,
+			will_restage ? 1 : 0, same_rearm ? 1 : 0, m_mark_pending, m_sec_phase,
+			m_armed ? 1 : 0, m_wr_done, m_sec_count,
+			m_cpu->pcbase() & 0xffffff, machine().time().as_double());
 		if (will_restage)
 			stage_record(m_track[m_sec_index % m_track_n]);
 		if (same_rearm)
@@ -3989,6 +4077,7 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 	m_window_seen = false; m_term_fired = false; m_idx_prev = false; m_read_active = false; m_data_chunks = 0;   // per-command reset
 	m_write_active = false; m_wr_done = 0; m_wr_walked = 0;
 	m_wr_final_pending = false; m_wr_complete = false;
+	m_wr_stall_watch_blk = 0; m_wr_stall_watch_left = 0;
 	if (m_wr_close)
 		m_wr_close->adjust(attotime::never);
 	// The gate array RETAINS its field program across command boundaries - the firmware says so
@@ -4189,7 +4278,39 @@ void multibus_storager_device::timer0_out(int state)
 	bool const rising = state && !m_timer_out;
 	m_timer_out = bool(state);          // F000 bit11
 	if (rising && m_gate0)
+	{
+		// Cadence probe (inst7 soft-timer cut): how often does the model actually raise IRQ1?
+		// Expected ≈ 1/26ms.  A live freelist with count #$32 should expire in ~1.3s if these fire.
+		static int s_irq1_n = 0;
+		static double s_irq1_t0 = -1.0;
+		double const t = machine().time().as_double();
+		if (s_irq1_t0 < 0.0)
+			s_irq1_t0 = t;
+		s_irq1_n++;
+		if (s_irq1_n <= 5 || (s_irq1_n % 500) == 0)
+			logerror("IRQ1 raise #%d gate0=1 dt=%.5f (from first) t=%.5f\n",
+				s_irq1_n, t - s_irq1_t0, t);
+		// Sample BEFORE the handler runs: successive samples must drop by 1 if $2B7A services the block.
+		if (m_wr_stall_watch_left > 0 && m_wr_stall_watch_blk >= 0x4000 && m_wr_stall_watch_blk < 0x7f00)
+		{
+			address_space &cs = m_cpu->space(AS_PROGRAM);
+			u16 const cnt = cs.read_word(m_wr_stall_watch_blk);
+			u16 const qh  = cs.read_word(0x736c);
+			logerror("WRSTALL WATCH irq1#%d blk=%04x cnt=%04x [$736c]=%04x left=%d t=%.5f\n",
+				s_irq1_n, m_wr_stall_watch_blk, cnt, qh, m_wr_stall_watch_left, t);
+			m_wr_stall_watch_left--;
+			if (m_wr_stall_watch_left == 0)
+				logerror("WRSTALL WATCH done blk=%04x (ffff->fffe->… = live; stuck = not serviced) t=%.5f\n",
+					m_wr_stall_watch_blk, t);
+		}
 		m_cpu->set_input_line(M68K_IRQ_1, HOLD_LINE);
+	}
+	else if (rising && !m_gate0)
+	{
+		static int s_nongate = 0;
+		if (++s_nongate <= 8)
+			logerror("IRQ1 SUPPRESSED (OUT rise, gate0=0) t=%.5f\n", machine().time().as_double());
+	}
 }
 
 void multibus_storager_device::timer2_out(int state)
@@ -4692,6 +4813,28 @@ void multibus_storager_device::device_reset()
 		// full-word store of 0000/ffff in the freelist/block pool, plus #$32 (the normal arm) so
 		// the healthy path is the same-run control.  PC names $89E8 (reload #$32/#$201C) vs
 		// $29F8 (register from stack) vs anything else.
+		cs.install_write_tap(0x7300, 0x74ff, "tmrcnt",
+			[this, on_local_bus](offs_t offset, u16 &data, u16 mem_mask)
+			{
+				if (!on_local_bus()) return;
+				if (mem_mask != 0xffff) return;          // count is always a full word
+				u16 const v = data & 0xffff;
+				if (v != 0x0000 && v != 0xffff && v != 0x0032)
+					return;
+				// Prefer even addresses (block+0 = count); odd-byte halves of other fields are noise.
+				if (offset & 1) return;
+				address_space &ls = m_cpu->space(AS_PROGRAM);
+				u32 const pc = m_cpu->pcbase() & 0xffffff;
+				u16 const cell = ls.read_word(0x7986);
+				u16 const qh   = ls.read_word(0x736c);
+				// code field sits at block+2 when this is a real timer block
+				u16 const code = (offset + 2 <= 0x74ff) ? ls.read_word((offset + 2) & 0xffff) : 0xffff;
+				char const *tag = (v == 0x0000) ? "ZERO" : (v == 0xffff) ? "FFFF" : "n32 ";
+				logerror("TMRCNT %s [%04x]<=%04x pc=%06x code@+2=%04x [$7986]=%04x [$736c]=%04x "
+					"cmd=%02x t=%.5f\n",
+					tag, unsigned(offset), v, pc, code, cell, qh, m_iopb_cmd,
+					machine().time().as_double());
+			});
 		if (TRACE_CHUNK_PATH)
 			cs.install_read_tap(0x7654, 0x7695, "ownmap",
 			[this](offs_t offset, u16 &data, u16 mem_mask)
