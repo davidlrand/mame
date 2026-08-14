@@ -306,6 +306,13 @@ constexpr bool OS_REQUEST_SENSE = true;
 constexpr bool OS_ROUTE_SEEK = true;
 // Write-class field-program arm (ID-hunt + bit11).  Needed when OS_ROUTE_WRITE is on.
 constexpr bool ARM_WRITE_CLASS = true;
+// ESDI serial engine (17-bit frame, odd parity, inverted lines - decoded from $A118/$A1CE).  The
+// decode is believed correct but the ENGINE IS PARKED: measured (cont.570) that on the hard-disk
+// boot $A118 and $A1CE execute ZERO times while 14 E802 bit0 falling edges fire, so clocking the
+// engine from those edges deserialises STEP pulses into fake all-zero commands.  E802 bit0 is
+// dual-use and there is no hardware "serial window" signal to gate on; until the boot's real
+// failure (sense $30/$4b BEFORE any serial transaction) is found, this must stay off.
+constexpr bool ESDI_SERIAL_ENGINE = false;
 // F000 bit1 on a RIGID unit is seek/settle-busy, not the serial transfer-ack.  MEASURED
 // (cont.570) on the hard-disk boot: $6E70 waits for `F000 & D7` to clear with D7=$0002, and at the
 // 13.05s expiry ($1F4 ticks armed at $6E04, sense $30) F000=$2802 - bit1 stuck SET.  Cause: the
@@ -409,6 +416,8 @@ private:
 
 	// PIT outputs
 	void timer0_out(int state);   // PIT1 ctr0 = system tick -> IRQ1
+	void esdi_serial_beat(u16 e802);   // one beat of the 17-bit ESDI serial frame
+	void esdi_command(u16 cmd);        // a complete command word arrived from the controller
 	void timer2_out(int state);
 
 	void spin_drives();
@@ -501,6 +510,22 @@ private:
 	// ESDI $A118 window sampled together with sel_drive before this can be gated correctly.
 	bool m_ser_clk = true;       // last E802 bit0 seen
 	bool m_ser_active = false;   // a serial transaction has driven the clock this command
+	// ESDI SERIAL ENGINE (cont.570).  Decoded from the firmware's own halves, not from a textbook:
+	//   $A118 send    D2=$10 + dbra = 17 iterations; 1-16 shift D0 out MSB first, the 17th shifts
+	//                 D1 (a one-counter seeded at 1), so the frame always carries ODD parity.
+	//                 A data 1 CLEARS E802 bit1 ($a154) and a 0 SETS it - the line is INVERTED.
+	//   $A1CE recv    same 17 beats; samples F000 bit4 with `btst #4` and treats CLEAR as a 1
+	//                 (also inverted), then `lsr.w #1,D5 / bcs` REQUIRES odd parity or returns $201e.
+	// The drive is the responder: it acknowledges every beat on F000 bit1 (already modelled - that
+	// is why send-only commands complete) and drives F000 bit4 for the two commands that read back.
+	u16  m_esdi_shift = 0;       // command word being clocked IN from E802 bit1
+	u16  m_esdi_resp = 0;        // response word being clocked OUT on F000 bit4
+	int  m_esdi_beat = 0;        // 0..16 within the 17-beat frame
+	bool m_esdi_resp_phase = false;  // false = receiving a command, true = returning a response
+	bool m_esdi_out_bit = false;     // the bit currently presented on F000 bit4
+	u16  m_esdi_last_cmd = 0;
+	u16  m_esdi_cyl = 0;         // drive position as the serial interface last commanded it
+	u8   m_esdi_head = 0;
 	bool m_stepped_since_arm = false;  // head moved after the command armed -> re-decode on settle
 	bool m_settle_out = true;    // PIT0 ctr1 mode-5 one-shot OUT; F000 bit1 seek/settle busy = !OUT
 	bool m_pit2_out = false;     // PIT1 ctr2 OUT (recorded, not surfaced on F000)
@@ -2858,6 +2883,12 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		d = (d & ~0x2000) | (trk0 ? 0 : 0x2000);          // bit13 = track 0, active-low (fw 0x5de4 btst #$d)
 		d = (d & ~0x0400) | (wprot ? 0x0400 : 0);         // bit10 = write-protect
 		d = (d & ~0x0010) | (index ? 0x0010 : 0);         // bit4  = index pulse
+		// ...except on an ESDI unit mid-response, where bit4 is the drive's CONFIG/STATUS DATA line.
+		// Demux by drive select, the same hardware-faithful routing as the E802 bit0 clock/STEP
+		// split - an ESDI drive has no index line here and a floppy has no serial response.
+		// INVERTED: $A1CE treats `btst #4` CLEAR as a received 1.
+		if (ESDI_SERIAL_ENGINE && m_esdi_resp_phase && (m_sel_drive & 0xe0) != 0xc0)
+			d = (d & ~0x0010) | (m_esdi_out_bit ? 0 : 0x0010);
 		bool const f000_floppy_sel = ((m_sel_drive & 0xe0) == 0xc0);
 		if (HD_BIT1_SEEK_COMPLETE && !f000_floppy_sel)
 		{
@@ -3115,6 +3146,7 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 				}
 				m_ser_last_t = machine().time().as_double();
 				m_ser_active = true;    // a real transaction: the controller drove the clock low
+				if (ESDI_SERIAL_ENGINE) esdi_serial_beat(data);
 			}
 			m_ser_clk = clk;
 		}
@@ -4273,6 +4305,93 @@ void multibus_storager_device::bus_mem_w(offs_t offset, u16 data, u16 mem_mask)
 // (subq count hits 0).  Entry is $2B58; per-tick decrement is $2B7A.  Sparse $2B80 hits mean few
 // timers ran to completion (most are cancelled via $2ABA), not that IRQ1 is starved.
 // ---------------------------------------------------------------------------------------------
+// ESDI serial command/status interface.  One beat per E802 bit0 falling edge while an ESDI unit
+// is selected.  Frame = 17 beats: 16 data MSB-first plus one odd-parity bit, both directions,
+// both data lines INVERTED.  See the m_esdi_* declarations for the ROM evidence ($A118/$A1CE).
+void multibus_storager_device::esdi_serial_beat(u16 e802)
+{
+	if (m_esdi_resp_phase)
+	{
+		if (m_esdi_beat < 16)
+		{
+			m_esdi_out_bit = BIT(m_esdi_resp, 15 - m_esdi_beat);
+		}
+		else
+		{
+			// 17th beat: make the whole frame carry an ODD number of ones, which is what
+			// $A1CE's `lsr.w #1,D5 / bcs` demands - an even frame returns $201e.
+			int ones = 0;
+			for (int b = 0; b < 16; b++) if (BIT(m_esdi_resp, b)) ones++;
+			m_esdi_out_bit = ((ones & 1) == 0);
+		}
+		if (++m_esdi_beat >= 17)
+		{
+			m_esdi_beat = 0;
+			m_esdi_resp_phase = false;
+			m_esdi_out_bit = false;
+		}
+		return;
+	}
+	// Controller -> drive.  A data 1 CLEARS E802 bit1 ($a154 andi #$fffd), a 0 sets it ($a15e).
+	if (m_esdi_beat < 16)
+		m_esdi_shift = u16((m_esdi_shift << 1) | (BIT(e802, 1) ? 0 : 1));
+	// beat 16 is the controller's parity bit; the drive checks it, and a real one would fault on a
+	// mismatch.  Not enforced until we have seen a good frame - a false parity fault here would
+	// look exactly like the all-ones response this engine exists to replace.
+	if (++m_esdi_beat >= 17)
+	{
+		m_esdi_beat = 0;
+		esdi_command(m_esdi_shift);
+		m_esdi_shift = 0;
+	}
+}
+
+void multibus_storager_device::esdi_command(u16 cmd)
+{
+	m_esdi_last_cmd = cmd;
+	u16 const op = cmd >> 12;
+	char const *name = "?";
+	bool respond = false;
+	switch (op)
+	{
+	case 0x0:  // SEEK - cylinder in bits 11..0
+		name = "SEEK";
+		m_esdi_cyl = cmd & 0x0fff;
+		break;
+	case 0x1:  // RECALIBRATE
+		name = "RECAL";
+		m_esdi_cyl = 0;
+		break;
+	case 0x2:  // REQUEST STATUS -> 16-bit general status
+		name = "REQ-STATUS";
+		// bit4 SET is a fault: $6704 `btst #4,D1` maps it straight to sense $4B, which is the
+		// error the all-ones stub produced.  A healthy drive reports no faults.
+		m_esdi_resp = 0x0000;
+		respond = true;
+		break;
+	case 0x3:  // REQUEST CONFIGURATION -> stored big-endian into UIB+$0e/$0f by $a686
+		name = "REQ-CONFIG";
+		m_esdi_resp = 0x0000;   // PROVISIONAL: encoding not yet established - measure what the
+		                        // firmware does with UIB+$e/$f before inventing a value.
+		respond = true;
+		break;
+	case 0x4: name = "SELECT-HEAD"; m_esdi_head = cmd & 0x000f; break;
+	case 0x5: name = "CONTROL"; break;
+	default:  name = "UNDECODED"; break;
+	}
+	if (TRACE_ESDI)
+		logerror("ESDI cmd=%04x %-11s cyl=%u head=%u%s resp=%04x t=%.5f\n",
+			cmd, name, m_esdi_cyl, m_esdi_head,
+			respond ? " -> RESPOND" : "", respond ? m_esdi_resp : 0,
+			machine().time().as_double());
+	if (respond)
+	{
+		m_esdi_resp_phase = true;
+		m_esdi_beat = 0;
+		m_esdi_out_bit = BIT(m_esdi_resp, 15);
+	}
+}
+
 void multibus_storager_device::timer0_out(int state)
 {
 	bool const rising = state && !m_timer_out;
