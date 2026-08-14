@@ -306,14 +306,32 @@ constexpr bool OS_REQUEST_SENSE = true;
 constexpr bool OS_ROUTE_SEEK = true;
 // Write-class field-program arm (ID-hunt + bit11).  Needed when OS_ROUTE_WRITE is on.
 constexpr bool ARM_WRITE_CLASS = true;
+// F000 bit1 on a RIGID unit is seek/settle-busy, not the serial transfer-ack.  MEASURED
+// (cont.570) on the hard-disk boot: $6E70 waits for `F000 & D7` to clear with D7=$0002, and at the
+// 13.05s expiry ($1F4 ticks armed at $6E04, sense $30) F000=$2802 - bit1 stuck SET.  Cause: the
+// ack branch is gated on m_ser_active, which latches on the FIRST E802 bit0 falling edge, and on
+// this path those edges are the restore STEP train ($6E2C/$6E40), not a serial clock ($A118 runs
+// zero times).  The restore leaves the line high, so bit1 never cleared.  board.yaml has bit1 as
+// "seek/settle active (also ESDI handshake strobe)" - seek/settle is the primary meaning.
+constexpr bool HD_BIT1_SEEK_COMPLETE = true;
+// Settle after the last step edge before a rigid unit reports on-cylinder.
+constexpr double HD_SETTLE_S = 0.015;
+// Force-arm the prepared write mark instead of waiting for the firmware's E802 bit11 re-arm.
+// LOCATE is the site where the deadlock was MEASURED (WRLOC -> WRDATA arm gap of 1.81s, WRGAP
+// pend=6 armed=0, zero E802 writes in the window).  DATA covers the two data-phase IRQ5s, which
+// were extrapolated from it, not measured.  Split so the A/B can tell whether the narrow fix is
+// enough - forcing marks the firmware did not request is exactly the class of error that the v3
+// close-path IRQ4 turned out to be.
+constexpr bool WR_FORCE_ARM_LOCATE = true;   // MEASURED deadlock fix (WRGAP window); keep
+constexpr bool WR_FORCE_ARM_DATA   = false;  // A/B REFUTED: 6/48 posts vs 8/9; 37 x $201c
 // c0 sub-7 status fill (interim C++ until host-op->fw map).  See docs/FIRMWARE-DISPATCH-TABLE.
 constexpr bool OS_C0_STATUS_FILL = true;
 
 // --- Experiments (default OFF) ------------------------------------------------------------
 // Host 0x0a -> fw 0x96.  Incomplete for full install; scratch medium only.
-constexpr bool OS_ROUTE_WRITE = false;   // parked; re-enable only on scratch
+constexpr bool OS_ROUTE_WRITE = false;   // parked; ON only for install runs on scratch media
 // F000 bit2 batch-ready ($846a / $8acc).  Generator not established hardware meaning.
-constexpr bool F000_BIT2_BATCH_RDY = false;   // parked; re-enable only on scratch
+constexpr bool F000_BIT2_BATCH_RDY = false;  // parked; ON only for install runs (off = $201A retry storm)
 // Flux encoder self-test (writes a sector).  Never against archival media.
 constexpr bool WRSEC_SELFTEST = false;
 // Extra trailing record (refuted for latch clear).
@@ -419,6 +437,9 @@ private:
 	void run_channel_dma();
 	attotime dma_time(u32 len) const;  // bus-hold / transfer time for a len-byte bus-master DMA
 	TIMER_CALLBACK_MEMBER(dma_done);   // transfer end: release the bus hold, raise the channel-done IRQ4
+	// Write close-path deferred failsafe (v5): re-check node+2 after firmware's self-complete window.
+	TIMER_CALLBACK_MEMBER(wr_close_check);
+	void arm_wr_close_failsafe(char const *why);  // schedule re-check; never raises IRQ4 immediately
 
 	required_device<m68000_device> m_cpu;
 	required_device_array<pit8253_device, 2> m_pit;
@@ -601,7 +622,8 @@ private:
 	bool m_rec_latch = false;       // a data record is latched awaiting the firmware's E01E ack
 
 	emu_timer *m_pump = nullptr;    // gate-array field-boundary mark clock
-	emu_timer *m_dma_done = nullptr;   // async channel-done IRQ4
+	emu_timer *m_dma_done = nullptr;   // async channel-done IRQ4 (real DMA only)
+	emu_timer *m_wr_close = nullptr;  // deferred write-close failsafe re-check
 
 	// The gate array captures the whole track as it rotates (detection-is-capture) into m_track, then the
 	// the engine (advance_read) delivers a record per address mark, one IRQ6 + one IRQ5 each, for as long
@@ -622,12 +644,16 @@ private:
 	// locates then commits, a read captures then delivers, and conflating them would run
 	// capture-and-deliver logic on a write - worse than doing nothing honestly.
 	bool m_write_active = false;
-	// WRITE COMPLETION (three iterations):
-	//   v1 defer IRQ4 → pending stuck, no close (cycle never ran)
-	//   v2 IRQ4 at count-met then marks → host 0x80 then HANG (marks after completion)
-	//   v3 (this): after N commits, one more mark cycle FIRST, THEN IRQ4/close — no marks after 0x80.
+	// WRITE COMPLETION:
+	//   v1–v3: various immediate/deferred IRQ4 close attempts
+	//   v4: skip IRQ4 if node+2==80 or [$7986]!=0 — stopped write#2 stomp; one write never posts
+	//   v5: deferred re-check then raise IRQ4 if still 81 — MEASURED counterproductive (inst6):
+	//       $4626 derail is one-to-one with that raise while node+2=81; healthy closes never hit it
+	//   v6 (this): deferred re-check is OBSERVE-ONLY.  Cancel log if node+2==80; if still 81,
+	//       log the stall (with [$7986]) and do NOT raise IRQ4.  The open defect is the one write
+	//       that never self-completes with live freelist [$7986]=733c — not another IRQ4 variant.
 	// m_wr_final_pending = count met, one mark cycle still owed before channel-done.
-	// m_wr_complete      = IRQ4 raised; ignore further $0A6D for this command.
+	// m_wr_complete      = model closed the write window; ignore further $0A6D for this command.
 	bool m_wr_final_pending = false;
 	bool m_wr_complete = false;
 	u32  m_wr_host_buf = 0;         // host source address for this write (firmware IOPB [0x0d-0x0f])
@@ -1287,6 +1313,8 @@ void multibus_storager_device::start_field_program()
 		m_wr_walked = 0;
 		m_wr_final_pending = false;
 		m_wr_complete = false;
+		if (m_wr_close)
+			m_wr_close->adjust(attotime::never);   // cancel prior command's failsafe
 		address_space &hs = m_bus->space(AS_PROGRAM);
 		u32 const iopb = m_iopb_addr;
 		m_wr_host_buf = (u32(hs.read_byte((iopb + 0x0d) & 0xffffff)) << 16)
@@ -1623,10 +1651,13 @@ void multibus_storager_device::advance_read()
 				machine().time().as_double());
 			m_mark_pending = 6;
 			m_sec_phase = 1;
-			// Final cycle: keep the arm live between phases so marks actually deliver (v1 stuck
-			// with pending and never reached phase 3 when bit11 did not arrive in time).
-			if (m_wr_final_pending)
-				m_armed = true;
+			// cont.569 DEADLOCK (measured inst11 WRGAP): after first sector, WRLOC sets pend=6
+			// with armed=0 and then waits for E802 bit11.  During the 1.81s gap there are ZERO
+			// E802 writes; firmware spins at $15xx/$22xx IPL=0 waiting for the mark.  Each side
+			// waits for the other.  The read path gets a bit11 re-arm from the prior field's ISR
+			// before the next ID; the write's first post-commit ID does not.  Deliver the prepared
+			// mark - same as m_wr_final_pending force-arm, for every write locate.
+			if (WR_FORCE_ARM_LOCATE) m_armed = true;
 			m_next_rec = machine().time() + sector_period() * 15 / 100;
 			return;
 		}
@@ -1655,8 +1686,10 @@ void multibus_storager_device::advance_read()
 			// The read uses the same table at $29C0 with its own pair ($7BA8 setup / $8018 done).
 			m_mark_pending = 5;
 			m_sec_phase = 2;
-			if (m_wr_final_pending)
-				m_armed = true;
+			// Second-sector data arm: first IRQ5 of a sector is usually re-armed by the ID ISR's
+			// bit11 pulse; when that pulse is late/missing the same deadlock as WRLOC applies.
+			// Force-arm the prepared mark (D800 same-value re-arm is a separate measured path).
+			if (WR_FORCE_ARM_DATA) m_armed = true;
 			m_next_rec = machine().time() + sector_period() * 70 / 100;
 			return;
 		}
@@ -1669,12 +1702,23 @@ void multibus_storager_device::advance_read()
 			// took the re-arm leg ($8552) with the work leg ($873E) never running.
 			// The first IRQ5 (parity 0) runs $8552, which issues the E802 bit11 re-arm - so the
 			// arm for THIS second delivery is produced by the first one.
-			logerror("WRDATA2 second IRQ5 done=%d/%d t=%.5f\n",
-				m_wr_done, m_sec_count, machine().time().as_double());
+			// Final-cycle probe (inst4 write#1 vs #2): firmware posts 8080 @ $1a54 only when it
+			// still has a live soft-timer freelist and the write alternator.  Snapshot the cells
+			// that arm that path so a same-run compare does not need a debugger for [$7986].
+			{
+				address_space &cs = m_cpu->space(AS_PROGRAM);
+				logerror("WRDATA2 second IRQ5 done=%d/%d final=%d [7302]=%04x [7950]=%04x "
+					"[$7986]=%04x node+2=%02x t=%.5f\n",
+					m_wr_done, m_sec_count, m_wr_final_pending ? 1 : 0,
+					cs.read_word(0x7302), cs.read_word(0x7950), cs.read_word(0x7986),
+					m_node_base ? cs.read_byte((m_node_base + 2) & 0xffff) : 0xff,
+					machine().time().as_double());
+			}
 			m_mark_pending = 5;
 			m_sec_phase = 3;
-			if (m_wr_final_pending)
-				m_armed = true;
+			// Second IRQ5: normally armed by first IRQ5's $8552 bit11 pulse.  Force so a missed
+			// pulse cannot strand the work leg (and the final cycle that posts $1a54).
+			if (WR_FORCE_ARM_DATA) m_armed = true;
 			m_next_rec = machine().time() + sector_period() * 15 / 100;
 			return;
 		}
@@ -1735,7 +1779,10 @@ void multibus_storager_device::advance_read()
 						tgt.r, first, last, m_wr_done, m_sec_count, m_wr_walked, m_track_n * 2,
 						machine().time().as_double());
 			}
-			logerror("WRNEXT sector done=%d/%d walked=%d - no second IRQ5 (no arm for it) t=%.5f\n",
+			// Historical string said "no second IRQ5"; that was wrong once WRDATA2 was restored.
+			// This line is end-of-record only (phase 3 finished).  A zero-done walk with
+			// WRCOMMIT ... FAILED is media/protect/locate, not a missing mark.
+			logerror("WRNEXT sector done=%d/%d walked=%d t=%.5f\n",
 				m_wr_done, m_sec_count, m_wr_walked, machine().time().as_double());
 			m_sec_phase = 0;
 			// DO NOT count walked sectors.  The walk starts wherever the head happens to be, so it
@@ -1747,27 +1794,33 @@ void multibus_storager_device::advance_read()
 			m_sec_index = (m_sec_index + 1) % std::max(1, m_track_n);
 			m_wr_walked++;
 
-			// Close path v3: mark cycle before IRQ4 (never after — v2 hung the machine post-0x80).
-			//   1) count met → m_wr_final_pending, stay active, prime arm for one more cycle
-			//   2) that cycle's phase-3 → IRQ4 + m_wr_complete (host 0x80), no further marks
+			// Close path v6: mark cycle, then observe-only deferred re-check (never IRQ4 from here).
+			//   1) count met → m_wr_final_pending, one more mark cycle
+			//   2) that cycle's phase-3 → m_wr_complete + arm observe (~750us)
+			// Seven healthy closes: fw posts 80 within 90–130us, often before WRDONE.  The spare-
+			// track 4-sector write never posts and holds [$7986] live (733c) — model must deliver
+			// the event that path waits on, not invent a channel-done.
 			if (m_wr_final_pending)
 			{
 				m_status_armed = true;
 				m_wr_complete = true;
 				m_wr_final_pending = false;
 				m_write_active = false;
-				logerror("WRDONE %d/%d committed after %d walked - final cycle done, IRQ4 t=%.5f\n",
-					m_wr_done, m_sec_count, m_wr_walked, machine().time().as_double());
-				if (m_dma_done)
-					m_dma_done->adjust(attotime::from_usec(10));
+				arm_wr_close_failsafe("final-cycle");
 			}
 			else if (m_wr_done >= m_sec_count && m_sec_count > 0)
 			{
 				m_wr_final_pending = true;
 				m_armed = true;
 				m_sec_phase = 0;
-				logerror("WRFINAL pending %d/%d walked=%d - one mark cycle then IRQ4 t=%.5f\n",
-					m_wr_done, m_sec_count, m_wr_walked, machine().time().as_double());
+				{
+					address_space &cs = m_cpu->space(AS_PROGRAM);
+					logerror("WRFINAL pending %d/%d walked=%d - one mark cycle then deferred close "
+						"[$7986]=%04x [7302]=%04x t=%.5f\n",
+						m_wr_done, m_sec_count, m_wr_walked,
+						cs.read_word(0x7986), cs.read_word(0x7302),
+						machine().time().as_double());
+				}
 				// Do not wait solely on firmware bit11; schedule the final locate promptly.
 				m_next_rec = machine().time() + sector_period() * 15 / 100;
 				m_pump->adjust(attotime::from_usec(PHYSICAL_TIMING ? 100 : 200));
@@ -1775,14 +1828,13 @@ void multibus_storager_device::advance_read()
 			}
 			else if (m_wr_walked > m_track_n * 2)
 			{
-				logerror("WRWALKEND done=%d/%d walked=%d/%d reason=WALK-BOUND(model) t=%.5f\n",
-					m_wr_done, m_sec_count, m_wr_walked, m_track_n * 2,
-					machine().time().as_double());
 				m_status_armed = true;
 				m_wr_complete = true;
 				m_write_active = false;
-				if (m_dma_done)
-					m_dma_done->adjust(attotime::from_usec(10));
+				logerror("WRWALKEND done=%d/%d walked=%d/%d reason=WALK-BOUND(model) t=%.5f\n",
+					m_wr_done, m_sec_count, m_wr_walked, m_track_n * 2,
+					machine().time().as_double());
+				arm_wr_close_failsafe("walk-bound");
 				logerror("WRDONE %d/%d (walk-bound force) t=%.5f\n",
 					m_wr_done, m_sec_count, machine().time().as_double());
 			}
@@ -2568,7 +2620,8 @@ attotime multibus_storager_device::dma_time(u32 len) const
 	return attotime::from_nsec(600) * ((len + 1) / 2);
 }
 
-// End of the bus-master transfer: the gate array releases the local bus and raises the channel-done IRQ4.
+// End of a real bus-master DMA: release the local-bus hold and raise channel-done IRQ4.
+// Write-close failsafe does NOT use this timer (see arm_wr_close_failsafe / wr_close_check).
 TIMER_CALLBACK_MEMBER(multibus_storager_device::dma_done)
 {
 	if (m_bus_held)
@@ -2577,6 +2630,74 @@ TIMER_CALLBACK_MEMBER(multibus_storager_device::dma_done)
 		m_bus_held = false;
 	}
 	m_cpu->set_input_line(M68K_IRQ_4, HOLD_LINE);
+}
+
+// Observe window only (v6).  ≈5× measured fw self-complete (90–130us).  Do NOT raise IRQ4 on
+// timeout — inst6: that raise while node+2=81 is one-to-one with the $4626 derail.
+static constexpr int WR_CLOSE_OBSERVE_US = 750;
+
+void multibus_storager_device::arm_wr_close_failsafe(char const *why)
+{
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	u8 const node2 = m_node_base ? cs.read_byte((m_node_base + 2) & 0xffff) : 0xff;
+	// Already done at the arming instant — no need to wait (healthy closes often land 80 first).
+	if (node2 == 0x80)
+	{
+		logerror("WRDONE %d/%d walked=%d - fw already posted (node+2=80) at close (%s); "
+			"[7302]=%04x [$7986]=%04x t=%.5f\n",
+			m_wr_done, m_sec_count, m_wr_walked, why,
+			cs.read_word(0x7302), cs.read_word(0x7986),
+			machine().time().as_double());
+		return;
+	}
+	logerror("WRDONE %d/%d walked=%d - arm close observe %dus (%s) "
+		"[7302]=%04x [$7986]=%04x node+2=%02x t=%.5f\n",
+		m_wr_done, m_sec_count, m_wr_walked, WR_CLOSE_OBSERVE_US, why,
+		cs.read_word(0x7302), cs.read_word(0x7986), node2,
+		machine().time().as_double());
+	if (m_wr_close)
+		m_wr_close->adjust(attotime::from_usec(WR_CLOSE_OBSERVE_US));
+}
+
+TIMER_CALLBACK_MEMBER(multibus_storager_device::wr_close_check)
+{
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	u8 const node2 = m_node_base ? cs.read_byte((m_node_base + 2) & 0xffff) : 0xff;
+	u16 const freelist = cs.read_word(0x7986);
+	if (node2 == 0x80)
+	{
+		logerror("WRCLOSE observe: node+2=80 (fw self-completed) done=%d/%d "
+			"[$7986]=%04x t=%.5f\n",
+			m_wr_done, m_sec_count, freelist, machine().time().as_double());
+		return;
+	}
+	// Never raise IRQ4 here.  Live [$7986] is the hang fingerprint (healthy final clears it to 0;
+	// the spare-track 4-sector write leaves it non-zero).  Dump the ACTIVE queue head [$736c]
+	// separately: IRQ1 walks $736c, not $7986.  $7986 is the per-context cell; $2B80 is expire
+	// only (count hit 0), not the tick itself.
+	u16 const qhead = cs.read_word(0x736c);
+	u16 blk_cnt = 0xffff, blk_code = 0xffff, blk_next = 0xffff;
+	bool on_queue = false;
+	if (freelist >= 0x4000 && freelist < 0x7f00)
+	{
+		blk_cnt  = cs.read_word(freelist);
+		blk_code = cs.read_word((freelist + 2) & 0xffff);
+		blk_next = cs.read_word((freelist + 8) & 0xffff);
+		for (u16 p = qhead, guard = 0; p >= 0x4000 && p < 0x7f00 && guard < 32; guard++)
+		{
+			if (p == freelist) { on_queue = true; break; }
+			u16 const n = cs.read_word((p + 8) & 0xffff);
+			if (n == p || n == 0) break;
+			p = n;
+		}
+	}
+	logerror("WRCLOSE STALL (no IRQ4): node+2=%02x still busy after %dus done=%d/%d "
+		"[7302]=%04x [7950]=%04x [$7986]=%04x [$736c]=%04x "
+		"blk{cnt=%04x code=%04x next=%04x on_q=%d} pc=%06x t=%.5f\n",
+		node2, WR_CLOSE_OBSERVE_US, m_wr_done, m_sec_count,
+		cs.read_word(0x7302), cs.read_word(0x7950), freelist, qhead,
+		blk_cnt, blk_code, blk_next, on_queue ? 1 : 0,
+		m_cpu->pcbase() & 0xffffff, machine().time().as_double());
 }
 
 // ---------------------------------------------------------------------------
@@ -2670,7 +2791,14 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		d = (d & ~0x0400) | (wprot ? 0x0400 : 0);         // bit10 = write-protect
 		d = (d & ~0x0010) | (index ? 0x0010 : 0);         // bit4  = index pulse
 		bool const f000_floppy_sel = ((m_sel_drive & 0xe0) == 0xc0);
-		if (m_ser_active && !(E802B0_SELECT_KEYED && f000_floppy_sel))
+		if (HD_BIT1_SEEK_COMPLETE && !f000_floppy_sel)
+		{
+			// Rigid unit: busy while the step train is running, clear once settled.  m_ser_last_t is
+			// stamped on every E802 bit0 falling edge, which on this path IS the step.
+			bool const stepping = (machine().time().as_double() - m_ser_last_t) < HD_SETTLE_S;
+			d = (d & ~0x0002) | (stepping ? 0x0002 : 0);
+		}
+		else if (m_ser_active && !(E802B0_SELECT_KEYED && f000_floppy_sel))
 		{
 			// TEMP cont.565 (STRIP): WHO OWNS F000 bit1?  The restore completion at $6E70 waits for
 			// bit1 to clear once the head is home, but m_ser_active latches on the first serial
@@ -2944,22 +3072,6 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 					data, BIT(data, 11), m_bit11_prev ? 1 : 0,
 					(b11 && !m_bit11_prev) ? 1 : 0, m_armed ? 1 : 0, m_mark_pending,
 					m_cpu->pcbase() & 0xffffff, machine().time().as_double());
-		}
-		// WHY DOES THE RE-ARM STOP AFTER THE WRITE'S FIRST SECTOR?  armed=0 with a pending mark is
-		// consistent with THREE different mechanisms and the old GAW capture cannot separate them,
-		// because it predates us delivering the data-done mark at all:
-		//   A  firmware stops writing E802 after data-done   -> no writes logged here at all
-		//   B  firmware keeps writing but bit11 STAYS 1      -> writes logged, edge never rises
-		//   C  the writes arrive by some path that misses this edge detector
-		// Log every E802 write during a write command with the edge state, so one run decides.
-		if (TRACE_GAWRITE && cmd_is_write() && m_write_active)
-		{
-			static int n = 0;
-			if (++n <= 60)
-				logerror("E802W data=%04x b11=%d prev=%d armed=%d pend=%d done=%d/%d pc=%06x t=%.5f\n",
-					data, b11 ? 1 : 0, m_bit11_prev ? 1 : 0, m_armed ? 1 : 0, m_mark_pending,
-					m_wr_done, m_sec_count, m_cpu->pcbase() & 0xffffff,
-					machine().time().as_double());
 		}
 		if (b11 && !m_bit11_prev)
 		{
@@ -3744,8 +3856,27 @@ void multibus_storager_device::d800_w(offs_t offset, u16 data, u16 mem_mask)
 	// firmware has just chosen.
 	// Read path deliberately untouched: it stages through deliver_mark() as it always has, and
 	// this fires only while a write command is current.
-	if (m_write_active && cmd_is_write() && m_d800 != was && m_track_n > 0)
-		stage_record(m_track[m_sec_index % m_track_n]);
+	// cont.569: D800 on the write path is dual-use.
+	//   (1) value change 3ed6→3ecf: select write staging base ($7DAC→$7D9E); re-stage.
+	//   (2) same-value store at $97C8: measured end of the 1.81s post-WRLOC gap (attempt 1
+	//       WRLOC r=0e → silence → D800SEL 3ecf→3ecf restage=0 → WRDATA 4us later).  The
+	//       store IS the re-arm signal; m_d800!=was discarded it and left IRQ6 pending with
+	//       armed=0 until a soft-timer path re-entered $97C8.  Staging was already correct
+	//       (7d9e) — not a buffer-identity bug.
+	if (cmd_is_write())
+	{
+		bool const value_changed = (m_d800 != was);
+		bool const will_restage = (m_write_active && value_changed && m_track_n > 0);
+		bool const same_rearm = (m_write_active && !value_changed && m_mark_pending != 0);
+		if (will_restage)
+			stage_record(m_track[m_sec_index % m_track_n]);
+		if (same_rearm)
+		{
+			m_armed = true;
+			deliver_mark();
+			advance_read();
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3858,6 +3989,8 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 	m_window_seen = false; m_term_fired = false; m_idx_prev = false; m_read_active = false; m_data_chunks = 0;   // per-command reset
 	m_write_active = false; m_wr_done = 0; m_wr_walked = 0;
 	m_wr_final_pending = false; m_wr_complete = false;
+	if (m_wr_close)
+		m_wr_close->adjust(attotime::never);
 	// The gate array RETAINS its field program across command boundaries - the firmware says so
 	// explicitly.  $5FF6 cmpi.w #$1,$793e / beq $6028 makes the builder emit NEITHER op1A NOR op18
 	// when the program already in the gate array is the one this command needs; op18 publishes the
@@ -4043,8 +4176,14 @@ void multibus_storager_device::bus_mem_w(offs_t offset, u16 data, u16 mem_mask)
 // PIT outputs
 // ---------------------------------------------------------------------------
 
-// PIT1 ctr0 OUT = the system tick -> 68000 IRQ1 (handler 0x2b58 walks the software-timeout queue and
-// re-pets the counter via the E800 bit9 gate).  count 0xFF00 (mode 3, MSB-only) = ~26ms at /4.
+// PIT1 ctr0 OUT = the system tick -> 68000 IRQ1 (handler $2B58 walks the $736c software-timeout
+// queue and re-pets the counter via the E800 bit9 gate).  count 0xFF00 (mode 3, MSB-only) ≈ 26ms
+// at /4 (board.yaml + cont.159: authentic, not a ×256 defect).
+//
+// NOTE on debugger bps: $2B80 is NOT the tick entry — it is the EXPIRE path inside $2B58
+// (subq count hits 0).  Entry is $2B58; per-tick decrement is $2B7A.  Sparse $2B80 hits mean few
+// timers ran to completion (most are cancelled via $2ABA), not that IRQ1 is starved.
+// ---------------------------------------------------------------------------------------------
 void multibus_storager_device::timer0_out(int state)
 {
 	bool const rising = state && !m_timer_out;
@@ -4100,6 +4239,7 @@ void multibus_storager_device::device_start()
 	m_ioreg_int_timer = timer_alloc(FUNC(multibus_storager_device::ioreg_int), this);
 	m_pump = timer_alloc(FUNC(multibus_storager_device::pump_tick), this);
 	m_dma_done = timer_alloc(FUNC(multibus_storager_device::dma_done), this);
+	m_wr_close = timer_alloc(FUNC(multibus_storager_device::wr_close_check), this);
 }
 
 void multibus_storager_device::device_reset()
@@ -4546,6 +4686,12 @@ void multibus_storager_device::device_reset()
 				logerror("7ABC-WRITE <= %04x mask=%04x%s t=%.5f\n", data, mem_mask,
 					use ? "  -> LATCHED m_sec_count" : "", machine().time().as_double());
 			});
+		// Soft-timer count arm (inst8 wrap finding): block addresses move (7318/733c/7360…) so
+		// catch the WRITE of the count word, not a fixed address.  IRQ1 walk is proven correct;
+		// cnt=ffff after first subq means the arm was 0000 (wrap) or ffff (huge).  Log every
+		// full-word store of 0000/ffff in the freelist/block pool, plus #$32 (the normal arm) so
+		// the healthy path is the same-run control.  PC names $89E8 (reload #$32/#$201C) vs
+		// $29F8 (register from stack) vs anything else.
 		if (TRACE_CHUNK_PATH)
 			cs.install_read_tap(0x7654, 0x7695, "ownmap",
 			[this](offs_t offset, u16 &data, u16 mem_mask)

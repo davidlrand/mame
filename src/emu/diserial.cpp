@@ -14,7 +14,9 @@
 #define LOG_SETUP  (1U << 1)
 #define LOG_TX     (1U << 2)
 #define LOG_RX     (1U << 3)
-#define VERBOSE    (0)
+#define VERBOSE    (0)   // LOG_RX costs ~94% of a pcmx2 install log (4.2M lines / 300MB per
+                         // 1600s run) - one line per received BIT.  The rx phase fix it was
+                         // added to diagnose is below (m_rcv_clock_state restart) and stays.
 
 #define LOG_OUTPUT_FUNC device().logerror
 #include "logmacro.h"
@@ -237,7 +239,11 @@ void device_serial_interface::rx_w(int state)
 		LOGMASKED(LOG_RX, "Receiver is synchronized\n");
 		if (m_rcv_clock && !(m_rcv_rate.is_never()))
 		{
-			// make start delay half a cycle longer to make sure we are called after the sender
+			// make start delay half a cycle longer to make sure we are called after the sender.
+			// the clock-state toggle must restart from a known phase: if a previous frame left it
+			// high, the very first toggle samples - every sample then lands on the bit boundary
+			// (reading the previous bit) instead of the bit centre
+			m_rcv_clock_state = false;
 			m_rcv_clock->adjust(m_rcv_rate * 2, 0, m_rcv_rate);
 		}
 		else if (m_start_bit_hack_for_external_clocks)
