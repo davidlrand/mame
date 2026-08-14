@@ -298,7 +298,6 @@ constexpr bool SRAM_BYTE_SWAPPED = true;
 // 0x80 so the driver does not inherit the failed command's status.  Classifies $1c/$12; does
 // not cause REZERO (measured).  Diagnostic permanent.  Sense bytes 1-3 not fully validated.
 // Host 0x0b SEEK -> fw 0x8A (idle-latch wedge / $14E2).
-// Write-class field-program arm (ID-hunt + bit11).  Needed when OS_ROUTE_WRITE is on.
 // ESDI serial engine (17-bit frame, odd parity, inverted lines - decoded from $A118/$A1CE).  The
 // decode is believed correct but the ENGINE IS PARKED: measured (cont.570) that on the hard-disk
 // boot $A118 and $A1CE execute ZERO times while 14 E802 bit0 falling edges fire, so clocking the
@@ -325,8 +324,6 @@ constexpr double HD_SETTLE_S = 0.015;
 constexpr bool OS_C0_STATUS_FILL = true;
 
 // --- Experiments (default OFF) ------------------------------------------------------------
-// Host 0x0a -> fw 0x96.  Incomplete for full install; scratch medium only.
-constexpr bool OS_ROUTE_WRITE = false;   // parked; ON only for install runs on scratch media
 // Flux encoder self-test (writes a sector).  Never against archival media.
 constexpr bool WRSEC_SELFTEST = false;
 // Extra trailing record (refuted for latch clear).
@@ -3667,7 +3664,7 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 						"t=%.5f\n", spt, hds, m_uib_base, machine().time().as_double());
 				}
 			}
-			else if ((op == 0x08 || (OS_ROUTE_WRITE && op == 0x0a)) && unit >= 2 && nsec)
+			else if ((op == 0x08 || op == 0x0a) && unit >= 2 && nsec)
 			{
 				// The firmware's own read IOPB (STEP 134 layout - the one the boot read uses):
 				// [0] cmd 0x95, [1] bit0 = ADDRESSED, [4] unit, [6-9] BE32 address in current-size
