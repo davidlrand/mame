@@ -337,8 +337,6 @@ constexpr bool OS_C0_STATUS_FILL = true;
 // --- Experiments (default OFF) ------------------------------------------------------------
 // Host 0x0a -> fw 0x96.  Incomplete for full install; scratch medium only.
 constexpr bool OS_ROUTE_WRITE = false;   // parked; ON only for install runs on scratch media
-// F000 bit2 batch-ready ($846a / $8acc).  Generator not established hardware meaning.
-constexpr bool F000_BIT2_BATCH_RDY = false;  // parked; ON only for install runs (off = $201A retry storm)
 // Flux encoder self-test (writes a sector).  Never against archival media.
 constexpr bool WRSEC_SELFTEST = false;
 // Extra trailing record (refuted for latch clear).
@@ -2826,7 +2824,7 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 	// micro-op, which is the only reader before a transfer starts:
 	//   bit0  FAULT      $663C btst #0 -> if SET the op aborts with error $10
 	//   bit2  BATCH RDY  $846a btst #2 -> SOLE ROM consumer; SET required to enter $8480 and
-	//                    install the {#$32,#$201C} soft-timer at $84DA.  See F000_BIT2_BATCH_RDY.
+	//                    install the {#$32,#$201C} soft-timer at $84DA.  See the bit2 transfer-gate note below.
 	//   bit3  FAULT      $65AE btst #3 -> if SET the op aborts with error $1B
 	//   bit4  INDEX      $6746 btst #4
 	//   bit5  UNIT READY $66D6 masks F000 and compares == $20, i.e. ready with no other status bits
@@ -2920,12 +2918,18 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 			d = (d & ~0x0002) | (trk0 ? 0 : 0x0002);   // bit1 = position not confirmed home
 		else
 			d = (d & ~0x0002) | (m_settle_out ? 0 : 0x0002);  // bit1 = seek/settle busy (PIT ctr1 one-shot, low = busy)
-		// bit2: sole ROM consumer $846a (batch-start).  See F000_BIT2_BATCH_RDY.
 		// Always strip backing-store residue; optionally drive from m_prog_loaded (v2 — DMA term
 		// retired after measured falsification at $846a with prog=1 dma=1).
-		d &= ~0x0004;
-		if (F000_BIT2_BATCH_RDY && m_prog_loaded)
-			d |= 0x0004;
+		// bit2 = TRANSFER GATE, and a healthy channel holds it asserted.  ESTABLISHED (cont.571)
+		// from the only two consumers in the ROM, both of which treat CLEAR as a fault and neither
+		// of which has a path that wants it clear:
+		//     $846E  btst #2 -> clear -> sense $1A
+		//     $8ACC  andi #4 -> clear -> $8F1E -> sense $1A  (alongside faults $27/$28)
+		// So it is not a batch-ready strobe.  It was previously driven from m_prog_loaded, which
+		// was a guess: set often enough to carry an install, clear often enough elsewhere to
+		// produce 1736 x $201A in one 220s run.  Same treatment as the drive-fault bits below - a
+		// healthy modelled unit reports no fault.
+		d |= 0x0004;
 		if (TRACE_GAWRITE && cmd_is_write())
 			logerror("F000B2 d=%04x b2=%d prog=%d dma=%d t=%.5f\n",
 				d, BIT(d, 2), m_prog_loaded ? 1 : 0, m_dma_active ? 1 : 0,
