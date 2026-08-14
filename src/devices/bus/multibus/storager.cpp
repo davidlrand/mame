@@ -110,7 +110,6 @@ namespace {
 // --- Permanent model behaviour (measured; not experiment knobs) -----------------------------
 // Physically timed records (one sector period at 300 rpm).  Arm-driven-as-fast-as-rearm was an
 // A/B; the timed model is correct.
-constexpr bool PHYSICAL_TIMING = true;
 // One record per address mark; the firmware chooses whether to arm the data phase (no HW sector
 // comparator).  The firmware stops re-arming when it has what it wants.
 constexpr bool PER_ADDRESS_MARK = true;
@@ -271,7 +270,6 @@ constexpr bool SRAM_BYTE_SWAPPED = true;
 // --- Permanent OS-channel / write-path behaviour ------------------------------------------
 // Only IDs inside the commanded range produce marks.  Firmware counts marks, not matches;
 // post-mark skips stole sector counts while posting success.  Fixed.
-constexpr bool WR_SKIP_SILENT = true;
 
 // E802 bit0 is a SHARED stimulus: it is the ESDI serial clock AND the floppy STEP line, and the
 // SELECTED drive is what responds.  DECODED (cont.565, board.yaml conf V): the E804 low byte is the
@@ -284,7 +282,6 @@ constexpr bool WR_SKIP_SILENT = true;
 // -> never serial", and makes no claim that a non-floppy select implies a real serial transfer.
 // Deliberately NOT gated on the CPU being inside $A118: no board signal carries a program counter,
 // so that would be an HLE shim that fails silently on any other path driving the same line.
-constexpr bool E802B0_SELECT_KEYED = true;
 
 // F000 bit1 on the FLOPPY path = "head position not confirmed at track 0", not the settle
 // one-shot's OUT.  MEASURED (cont.563-4): the firmware's restore gate at $6D94 tests bit1 and
@@ -297,15 +294,11 @@ constexpr bool E802B0_SELECT_KEYED = true;
 // agree with a position-confidence latch: $6D94 SET -> recalibrate, and the $6E2C pulse loop
 // ($6E58 andi #$2) keeps stepping while SET, which terminates exactly when the head reaches
 // track 0.  The ESDI handshake use of bit1 is a separate branch and is untouched.
-constexpr bool FLOPPY_BIT1_NOT_HOME = true;
 // REQUEST SENSE (0x03): latch fw sense at HOST POST 0x82, serve 4-byte class-0, clean mailbox
 // 0x80 so the driver does not inherit the failed command's status.  Classifies $1c/$12; does
 // not cause REZERO (measured).  Diagnostic permanent.  Sense bytes 1-3 not fully validated.
-constexpr bool OS_REQUEST_SENSE = true;
 // Host 0x0b SEEK -> fw 0x8A (idle-latch wedge / $14E2).
-constexpr bool OS_ROUTE_SEEK = true;
 // Write-class field-program arm (ID-hunt + bit11).  Needed when OS_ROUTE_WRITE is on.
-constexpr bool ARM_WRITE_CLASS = true;
 // ESDI serial engine (17-bit frame, odd parity, inverted lines - decoded from $A118/$A1CE).  The
 // decode is believed correct but the ENGINE IS PARKED: measured (cont.570) that on the hard-disk
 // boot $A118 and $A1CE execute ZERO times while 14 E802 bit0 falling edges fire, so clocking the
@@ -320,7 +313,6 @@ constexpr bool ESDI_SERIAL_ENGINE = false;
 // this path those edges are the restore STEP train ($6E2C/$6E40), not a serial clock ($A118 runs
 // zero times).  The restore leaves the line high, so bit1 never cleared.  board.yaml has bit1 as
 // "seek/settle active (also ESDI handshake strobe)" - seek/settle is the primary meaning.
-constexpr bool HD_BIT1_SEEK_COMPLETE = true;
 // Settle after the last step edge before a rigid unit reports on-cylinder.
 constexpr double HD_SETTLE_S = 0.015;
 // Force-arm the prepared write mark instead of waiting for the firmware's E802 bit11 re-arm.
@@ -329,8 +321,6 @@ constexpr double HD_SETTLE_S = 0.015;
 // were extrapolated from it, not measured.  Split so the A/B can tell whether the narrow fix is
 // enough - forcing marks the firmware did not request is exactly the class of error that the v3
 // close-path IRQ4 turned out to be.
-constexpr bool WR_FORCE_ARM_LOCATE = true;   // MEASURED deadlock fix (WRGAP window); keep
-constexpr bool WR_FORCE_ARM_DATA   = false;  // A/B REFUTED: 6/48 posts vs 8/9; 37 x $201c
 // c0 sub-7 status fill (interim C++ until host-op->fw map).  See docs/FIRMWARE-DISPATCH-TABLE.
 constexpr bool OS_C0_STATUS_FILL = true;
 
@@ -340,7 +330,6 @@ constexpr bool OS_ROUTE_WRITE = false;   // parked; ON only for install runs on 
 // Flux encoder self-test (writes a sector).  Never against archival media.
 constexpr bool WRSEC_SELFTEST = false;
 // Extra trailing record (refuted for latch clear).
-constexpr bool EXTRA_RECORD = false;
 
 // --- Trace (default OFF except install-oriented ESDI) -------------------------------------
 // Per-record probes STRIP before upstream; dma_snoop is functional not TRACE_*.
@@ -396,7 +385,7 @@ private:
 	// only under the ARM_WRITE_CLASS A/B (see the flag for what that does and does not prove).
 	bool cmd_is_read()  const { return m_iopb_cmd == 0x94 || m_iopb_cmd == 0x95; }
 	bool cmd_is_write() const { return m_iopb_cmd == 0x96 || m_iopb_cmd == 0x82; }
-	bool cmd_armable()  const { return cmd_is_read() || (ARM_WRITE_CLASS && cmd_is_write()); }
+	bool cmd_armable()  const { return cmd_is_read() || cmd_is_write(); }
 	void mailbox_submit(u32 host_iopb, u32 dst);   // deliver via the mailbox, as the hardware does
 	u16 bus_data_r(offs_t offset);
 	u16 bus_mem_r(offs_t offset, u16 mem_mask);
@@ -1270,11 +1259,9 @@ void multibus_storager_device::start_field_program()
 		m_armed = true;
 		m_read_window = true;
 		m_next_rec = machine().time();
-		m_pump->adjust(attotime::from_usec(PHYSICAL_TIMING ? 100 : 200));
+		m_pump->adjust(attotime::from_usec(100));
 		logerror("WRFINAL re-arm engage cmd=%02x done=%d/%d t=%.5f\n",
 			m_iopb_cmd, m_wr_done, m_sec_count, machine().time().as_double());
-		if (!PHYSICAL_TIMING)
-			advance_read();
 		return;
 	}
 	// The commanded sector count is carried by the program the firmware just loaded - one port-$3F
@@ -1473,9 +1460,7 @@ void multibus_storager_device::start_field_program()
 	// 1.875/8.75ms, a 64us IRQ6/IRQ5 runaway with no data-done).
 	if (first_arm)
 		m_next_rec = machine().time();
-	m_pump->adjust(attotime::from_usec(PHYSICAL_TIMING ? 100 : 200));
-	if (!PHYSICAL_TIMING)
-		advance_read();      // stage + deliver the first record if the firmware is armed
+	m_pump->adjust(attotime::from_usec(100));
 }
 
 // Deliver the held mark's interrupt IFF the firmware has armed (a bit-change PRIOR to the interrupt).
@@ -1658,7 +1643,6 @@ void multibus_storager_device::advance_read()
 			// several runs as a consistency check passing; it was the defect.
 			// The gate array signals on an ID MATCH, so a non-matching record must generate no
 			// stimulus whatsoever - walk past it here, before staging, silently.
-			if (WR_SKIP_SILENT)
 			{
 				address_space &cs5 = m_cpu->space(AS_PROGRAM);
 				u32 const spt5 = m_uib_base ? cs5.read_byte((m_uib_base + 1) & 0xffff) : 16;
@@ -1702,7 +1686,7 @@ void multibus_storager_device::advance_read()
 			// waits for the other.  The read path gets a bit11 re-arm from the prior field's ISR
 			// before the next ID; the write's first post-commit ID does not.  Deliver the prepared
 			// mark - same as m_wr_final_pending force-arm, for every write locate.
-			if (WR_FORCE_ARM_LOCATE) m_armed = true;
+			m_armed = true;
 			m_next_rec = machine().time() + sector_period() * 15 / 100;
 			return;
 		}
@@ -1734,7 +1718,6 @@ void multibus_storager_device::advance_read()
 			// Second-sector data arm: first IRQ5 of a sector is usually re-armed by the ID ISR's
 			// bit11 pulse; when that pulse is late/missing the same deadlock as WRLOC applies.
 			// Force-arm the prepared mark (D800 same-value re-arm is a separate measured path).
-			if (WR_FORCE_ARM_DATA) m_armed = true;
 			m_next_rec = machine().time() + sector_period() * 70 / 100;
 			return;
 		}
@@ -1763,7 +1746,6 @@ void multibus_storager_device::advance_read()
 			m_sec_phase = 3;
 			// Second IRQ5: normally armed by first IRQ5's $8552 bit11 pulse.  Force so a missed
 			// pulse cannot strand the work leg (and the final cycle that posts $1a54).
-			if (WR_FORCE_ARM_DATA) m_armed = true;
 			m_next_rec = machine().time() + sector_period() * 15 / 100;
 			return;
 		}
@@ -1868,7 +1850,7 @@ void multibus_storager_device::advance_read()
 				}
 				// Do not wait solely on firmware bit11; schedule the final locate promptly.
 				m_next_rec = machine().time() + sector_period() * 15 / 100;
-				m_pump->adjust(attotime::from_usec(PHYSICAL_TIMING ? 100 : 200));
+				m_pump->adjust(attotime::from_usec(100));
 				return;
 			}
 			else if (m_wr_walked > m_track_n * 2)
@@ -1995,30 +1977,11 @@ void multibus_storager_device::advance_read()
 					bc.read_word(0x741c), bc.read_word(0x7968), bc.read_word(0x7a36),
 					m_host_dma_n, m_cmd_buf, m_cmd_bytes, machine().time().as_double());
 			}
-			// Offer the trailing record ONLY when the firmware actually armed a chunk for it.  Read
-			// m_lram directly - going through the address space here would fire the device's own
-			// dma_snoop read tap and clobber m_term_bit0.
-			bool const chunk_armed = m_lram[(0x741c - 0x4000) >> 1] != 0;
-			if (!EXTRA_RECORD || m_extra_done || !chunk_armed)
-			{
-				m_read_active = false;
-				return;
-			}
-			m_extra_done = true;
-			m_extra_active = true;
-			m_extra_sec_index = m_sec_index;
-			m_extra_want_r = m_want_r;
-			m_extra_blocks_left = m_blocks_left;
-			m_extra_presented = 0;
-			m_extra_deadline = machine().time() + sector_period() * (m_track_n * 2 + 2);
-			logerror("EXTRA: chunk armed ([$741c]=%04x [$741e]=%04x) after recs=%d/%d - presenting "
-				"ONE more record, hunt frozen at index=%d want_r=%u dma_n=%u t=%.5f\n",
-				m_lram[(0x741c - 0x4000) >> 1], m_lram[(0x741e - 0x4000) >> 1],
-				m_cmd_records, m_sec_count, m_sec_index, m_want_r, m_host_dma_n,
-				machine().time().as_double());
+			m_read_active = false;
+			return;
 		}
 	}
-	if (PHYSICAL_TIMING && machine().time() < m_next_rec)
+	if (machine().time() < m_next_rec)
 		return;                             // this field has not passed the head yet
 	captured_sector const &s = m_track[m_sec_index];   // physical order = ascending R for the boot read
 	// cont.521: the gate array HUNTS for the programmed sector.  A record that is not the one the
@@ -2888,14 +2851,14 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		if (ESDI_SERIAL_ENGINE && m_esdi_resp_phase && (m_sel_drive & 0xe0) != 0xc0)
 			d = (d & ~0x0010) | (m_esdi_out_bit ? 0 : 0x0010);
 		bool const f000_floppy_sel = ((m_sel_drive & 0xe0) == 0xc0);
-		if (HD_BIT1_SEEK_COMPLETE && !f000_floppy_sel)
+		if (!f000_floppy_sel)
 		{
 			// Rigid unit: busy while the step train is running, clear once settled.  m_ser_last_t is
 			// stamped on every E802 bit0 falling edge, which on this path IS the step.
 			bool const stepping = (machine().time().as_double() - m_ser_last_t) < HD_SETTLE_S;
 			d = (d & ~0x0002) | (stepping ? 0x0002 : 0);
 		}
-		else if (m_ser_active && !(E802B0_SELECT_KEYED && f000_floppy_sel))
+		else if (m_ser_active && !f000_floppy_sel)
 		{
 			// TEMP cont.565 (STRIP): WHO OWNS F000 bit1?  The restore completion at $6E70 waits for
 			// bit1 to clear once the head is home, but m_ser_active latches on the first serial
@@ -2914,10 +2877,8 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 			}
 			d = (d & ~0x0002) | (m_ser_clk ? 0x0002 : 0);  // bit1 = ESDI transfer-acknowledge, follows the clock
 		}
-		else if (FLOPPY_BIT1_NOT_HOME)
-			d = (d & ~0x0002) | (trk0 ? 0 : 0x0002);   // bit1 = position not confirmed home
 		else
-			d = (d & ~0x0002) | (m_settle_out ? 0 : 0x0002);  // bit1 = seek/settle busy (PIT ctr1 one-shot, low = busy)
+			d = (d & ~0x0002) | (trk0 ? 0 : 0x0002);   // bit1 = position not confirmed home
 		// Always strip backing-store residue; optionally drive from m_prog_loaded (v2 — DMA term
 		// retired after measured falsification at $846a with prog=1 dma=1).
 		// bit2 = TRANSFER GATE, and a healthy channel holds it asserted.  ESTABLISHED (cont.571)
@@ -3123,7 +3084,7 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 		{
 			bool const clk = BIT(data, 0);
 			bool const floppy_sel = ((m_sel_drive & 0xe0) == 0xc0);
-			if (m_ser_clk && !clk && !(E802B0_SELECT_KEYED && floppy_sel))
+			if (m_ser_clk && !clk && !floppy_sel)
 			{
 				// DO NOT call this a serial ack.  E802 bit0 is DUAL-USE: it is the ESDI serial clock
 				// AND the floppy STEP line, and this handler arms both with no select gate.  Measured
@@ -3511,7 +3472,7 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 				logerror("IOREG C0 STATUS unit=%u sub=%02x reply@%06x was:%s -> c1 t=%.5f\n",
 					unit, sub, req, was.c_str(), machine().time().as_double());
 			}
-			if (OS_REQUEST_SENSE && op == 0x03 && req)
+			if (op == 0x03 && req)
 			{
 				// Allocation length is 0 (measured cdb: 03 40 00 00 ...), which for class-0 sense
 				// means the 4-byte default.  AV stays CLEAR: we have no verified failing block to
@@ -3660,7 +3621,7 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 			// cylinder/head, built the way the boot ROM builds one at FE3C20-FE3C67: divide the
 			// address by the per-cylinder size for CYL, then MOD/DIV for HEAD.  Sector IDs are
 			// track-relative and 1-based on this medium.
-			if (OS_ROUTE_SEEK && op == 0x0b && unit >= 2)
+			if (op == 0x0b && unit >= 2)
 			{
 				address_space &cs3 = m_cpu->space(AS_PROGRAM);
 				u32 const spt = m_uib_base ? cs3.read_byte((m_uib_base + 1) & 0xffff) : 16;
