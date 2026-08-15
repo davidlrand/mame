@@ -3,7 +3,7 @@
 # $2 = lua script basename (default dippc.lua)
 #
 # SCRATCH MEDIA ONLY.  Same rule as install-run.sh / dbg-run.sh: never mount the archival
-# siemens/set1/mx2-001.imd.  When OS_ROUTE_WRITE is promoted (firmware write path default), a
+# siemens/set1/mx2-001.imd.  Now that the firmware write path is the default, a
 # direct archival mount would either refuse writes (mode 444 → WPT) or, if someone unlocked the
 # master, corrupt the only clean install floppy.  Copy + chmod u+w every run.
 cd /Users/dlr/src/mame

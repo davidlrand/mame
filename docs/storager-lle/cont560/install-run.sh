@@ -5,8 +5,11 @@
 #   usage:  install-run.sh <label> [seconds_to_run] [extra keystrokes file]
 #   media:  SCRATCH ONLY - floppy and HD are both fresh copies per run.  Never archival.
 #
-# The floppy is now WRITABLE (OS_ROUTE_WRITE), so a run that reuses one image is not a clean
-# repeat: the installer's own writes carry into the next run.  Copy every time.
+# NO REBUILD IS NEEDED FOR AN INSTALL.  Write routing is unconditional as of 3888995d028;
+# there are no flags to flip for either an install or a read regression.
+#
+# The floppy is WRITABLE (host writes go through the firmware unconditionally), so reusing one
+# image is not a clean repeat: the installer's own writes carry into the next run.  Copy every time.
 set -u
 cd /Users/dlr/src/mame
 
@@ -21,7 +24,7 @@ LABEL=${1:-run}
 SECS=${2:-1400}
 mkdir -p "$S"
 
-# SOURCE FROM THE ARCHIVAL ORIGINAL, NOT A /tmp CACHE.  With OS_ROUTE_WRITE on, the floppy is
+# SOURCE FROM THE ARCHIVAL ORIGINAL, NOT A /tmp CACHE.  The floppy is
 # genuinely writable, so any /tmp copy an earlier run touched is DIRTY - and a run booting a dirty
 # install floppy stops at "warning: mounting unclean fs" waiting for an fsck answer, which reads
 # exactly like a hang on boot.  Read the archival image, never write it.
