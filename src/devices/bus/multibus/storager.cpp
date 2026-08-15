@@ -298,22 +298,14 @@ constexpr bool SRAM_BYTE_SWAPPED = true;
 // 0x80 so the driver does not inherit the failed command's status.  Classifies $1c/$12; does
 // not cause REZERO (measured).  Diagnostic permanent.  Sense bytes 1-3 not fully validated.
 // Host 0x0b SEEK -> fw 0x8A (idle-latch wedge / $14E2).
-// ESDI serial engine (17-bit frame, odd parity, inverted lines - decoded from $A118/$A1CE).  The
-// decode is believed correct but the ENGINE IS PARKED: measured (cont.570) that on the hard-disk
-// boot $A118 and $A1CE execute ZERO times while 14 E802 bit0 falling edges fire, so clocking the
-// engine from those edges deserialises STEP pulses into fake all-zero commands.  E802 bit0 is
-// dual-use and there is no hardware "serial window" signal to gate on; until the boot's real
-// failure (sense $30/$4b BEFORE any serial transaction) is found, this must stay off.
-constexpr bool ESDI_SERIAL_ENGINE = false;
-// F000 bit1 on a RIGID unit is seek/settle-busy, not the serial transfer-ack.  MEASURED
-// (cont.570) on the hard-disk boot: $6E70 waits for `F000 & D7` to clear with D7=$0002, and at the
-// 13.05s expiry ($1F4 ticks armed at $6E04, sense $30) F000=$2802 - bit1 stuck SET.  Cause: the
-// ack branch is gated on m_ser_active, which latches on the FIRST E802 bit0 falling edge, and on
-// this path those edges are the restore STEP train ($6E2C/$6E40), not a serial clock ($A118 runs
-// zero times).  The restore leaves the line high, so bit1 never cleared.  board.yaml has bit1 as
-// "seek/settle active (also ESDI handshake strobe)" - seek/settle is the primary meaning.
-// Settle after the last step edge before a rigid unit reports on-cylinder.
-constexpr double HD_SETTLE_S = 0.015;
+// ESDI serial engine + F000 bit1 frame gate (cont.572).  Measured on the post-restore boot:
+//   - rigid unit runs ZERO step pulses; restore completes via [$794c]==0 ($6E6A) with bit1 CLEAR
+//   - $A118 then runs (D0=$3000 Request Configuration); $201E is the mid-frame bit1 wait
+//   - STEP-TRAIN probes 0; so rigid E802 bit0 edges are serial clocks, not steps (floppy demuxed)
+// Frame = 17 beats starting on clock-low to a rigid unit, ending after the rising edge of beat 17.
+//   rigid bit1: frame_active ? follows_clock : CLEAR
+// That is idle-clear for restore and transfer-ack for $A118/$A1CE.  HD_SETTLE_S retired.
+constexpr bool ESDI_SERIAL_ENGINE = true;
 // Force-arm the prepared write mark instead of waiting for the firmware's E802 bit11 re-arm.
 // LOCATE is the site where the deadlock was MEASURED (WRLOC -> WRDATA arm gap of 1.81s, WRGAP
 // pend=6 armed=0, zero E802 writes in the window).  DATA covers the two data-phase IRQ5s, which
@@ -504,7 +496,10 @@ private:
 	// is why send-only commands complete) and drives F000 bit4 for the two commands that read back.
 	u16  m_esdi_shift = 0;       // command word being clocked IN from E802 bit1
 	u16  m_esdi_resp = 0;        // response word being clocked OUT on F000 bit4
-	int  m_esdi_beat = 0;        // 0..16 within the 17-beat frame
+	int  m_esdi_beat = 0;        // 0..16 within the 17-beat frame (shift-register index)
+	int  m_esdi_frame_falls = 0; // falling edges seen in the current frame (1..17)
+	bool m_esdi_frame_active = false; // true while bit1 must follow the serial clock
+	bool m_esdi_frame_closing = false; // rises of beat 17 seen; end on next non-rise e802 write
 	bool m_esdi_resp_phase = false;  // false = receiving a command, true = returning a response
 	bool m_esdi_out_bit = false;     // the bit currently presented on F000 bit4
 	u16  m_esdi_last_cmd = 0;
@@ -2836,8 +2831,17 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		u32 const term = 0x4000 | m_dma_term | m_term_bit0;
 		d = (d & ~0x1000) | ((m_dma_active && m_last_bw == term) ? 0x1000 : 0);
 		d = (d & ~0x0800) | (m_timer_out ? 0x0800 : 0);   // bit11 = PIT timer OUT
-		d = (d & ~0x0080) | (present ? 0x0080 : 0);       // bit7  = drive ready / door-closed
-		d = (d & ~0x0020) | (present ? 0x0020 : 0);       // bit5  = drive READY (fw 0x767c btst #5)
+		// Drive READY / door-closed demux by E804 select (same split as bit0 clock/STEP).
+		// Floppy: medium present.  Rigid: hard-disk image present.
+		// MEASURED (cont.573): after serial RECAL ($1000) the rigid path at $6d4e waits for
+		//   F000 & ($7a0a ? $220 : $120) == $20
+		// i.e. bit5 SET and bit8/9 CLEAR.  Bit5 was floppy-only, so HD-only boot timed out $30
+		// in the CONTROL+RECAL loop forever.  Bit8 is already held clear below.
+		bool const f000_floppy_sel = ((m_sel_drive & 0xe0) == 0xc0);
+		bool const rigid_ready = (m_hd[0] && m_hd[0]->exists()) || (m_hd[1] && m_hd[1]->exists());
+		bool const unit_ready = f000_floppy_sel ? present : rigid_ready;
+		d = (d & ~0x0080) | (unit_ready ? 0x0080 : 0);   // bit7  = drive ready / door-closed
+		d = (d & ~0x0020) | (unit_ready ? 0x0020 : 0);   // bit5  = drive READY (fw $6d62/$66D6)
 		d = (d & ~0x2000) | (trk0 ? 0 : 0x2000);          // bit13 = track 0, active-low (fw 0x5de4 btst #$d)
 		d = (d & ~0x0400) | (wprot ? 0x0400 : 0);         // bit10 = write-protect
 		d = (d & ~0x0010) | (index ? 0x0010 : 0);         // bit4  = index pulse
@@ -2845,37 +2849,22 @@ u16 multibus_storager_device::ch_r(offs_t offset, u16 mem_mask)
 		// Demux by drive select, the same hardware-faithful routing as the E802 bit0 clock/STEP
 		// split - an ESDI drive has no index line here and a floppy has no serial response.
 		// INVERTED: $A1CE treats `btst #4` CLEAR as a received 1.
-		if (ESDI_SERIAL_ENGINE && m_esdi_resp_phase && (m_sel_drive & 0xe0) != 0xc0)
+		if (ESDI_SERIAL_ENGINE && m_esdi_resp_phase && !f000_floppy_sel)
 			d = (d & ~0x0010) | (m_esdi_out_bit ? 0 : 0x0010);
-		bool const f000_floppy_sel = ((m_sel_drive & 0xe0) == 0xc0);
 		if (!f000_floppy_sel)
 		{
-			// Rigid unit: busy while the step train is running, clear once settled.  m_ser_last_t is
-			// stamped on every E802 bit0 falling edge, which on this path IS the step.
-			bool const stepping = (machine().time().as_double() - m_ser_last_t) < HD_SETTLE_S;
-			d = (d & ~0x0002) | (stepping ? 0x0002 : 0);
-		}
-		else if (m_ser_active && !f000_floppy_sel)
-		{
-			// TEMP cont.565 (STRIP): WHO OWNS F000 bit1?  The restore completion at $6E70 waits for
-			// bit1 to clear once the head is home, but m_ser_active latches on the first serial
-			// clock edge and only clears at the COMMAND boundary, so it can still own the pin long
-			// after its handshake finished.  Log exactly the ambiguous case - drive AT track 0 while
-			// the serial branch is driving bit1 - with the age of the last clock edge, which
-			// separates "handshake is over, latch outlived it" from "genuinely overlapping".
-			if (trk0 && m_mux_prints < 40)
-			{
-				m_mux_prints++;
-				logerror("BIT1MUX at-trk0 but SER owns bit1: ser_clk=%d -> bit1=%d | last ser edge %.6fs ago"
-					" | cmd=%02x t=%.5f\n",
-					m_ser_clk ? 1 : 0, m_ser_clk ? 1 : 0,
-					machine().time().as_double() - m_ser_last_t,
-					m_iopb_cmd, machine().time().as_double());
-			}
-			d = (d & ~0x0002) | (m_ser_clk ? 0x0002 : 0);  // bit1 = ESDI transfer-acknowledge, follows the clock
+			// Rigid F000 bit1 (cont.572): transfer-ack ONLY inside a 17-beat serial frame; CLEAR at
+			// idle.  Measured: restore never steps a rigid unit; $6E58 needs bit1 CLEAR to finish,
+			// while $A118 needs bit1 to follow the clock mid-frame.  "Always follow clock" breaks
+			// restore (idle clock high → bit1 stuck SET → $30).  Settle-after-edge breaks $A118
+			// (second half of each beat never sees bit1 SET → $201E).
+			if (m_esdi_frame_active)
+				d = (d & ~0x0002) | (m_ser_clk ? 0x0002 : 0);
+			else
+				d &= ~0x0002;
 		}
 		else
-			d = (d & ~0x0002) | (trk0 ? 0 : 0x0002);   // bit1 = position not confirmed home
+			d = (d & ~0x0002) | (trk0 ? 0 : 0x0002);   // floppy: position not confirmed home
 		// Always strip backing-store residue; optionally drive from m_prog_loaded (v2 — DMA term
 		// retired after measured falsification at $846a with prog=1 dma=1).
 		// bit2 = TRANSFER GATE, and a healthy channel holds it asserted.  ESTABLISHED (cont.571)
@@ -3076,41 +3065,66 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 	}
 	else if (a == 0xe802)
 	{
-		// bit0 = the ESDI serial clock.  The drive acknowledges by following it.
+		// bit0 = ESDI serial clock (rigid) or floppy STEP (select $c0).  Demux by E804 select.
 		if (ACCESSING_BITS_0_7)
 		{
 			bool const clk = BIT(data, 0);
 			bool const floppy_sel = ((m_sel_drive & 0xe0) == 0xc0);
-			if (m_ser_clk && !clk && !floppy_sel)
+			bool const rigid = !floppy_sel;
+			bool const fall = rigid && m_ser_clk && !clk;
+			bool const rise = rigid && !m_ser_clk && clk;
+			if (fall)
 			{
-				// DO NOT call this a serial ack.  E802 bit0 is DUAL-USE: it is the ESDI serial clock
-				// AND the floppy STEP line, and this handler arms both with no select gate.  Measured
-				// (cont.565): in a whole floppy boot the firmware's serial routines ($A118 send,
-				// $A1CE receive, $A17E wait-low) execute ZERO times while 61 of these edges fire, each
-				// one advancing the head a cylinder - so every latch here was a step misread as a
-				// clock.  The old wording ("SER: ack takes F000 bit1") was then cited back as evidence
-				// of a serial transaction that never happened.  Name the event, not the guess.
-				if (!m_ser_active)
-					logerror("E802B0 low edge (DUAL-USE: floppy STEP and/or ESDI serial clock - "
-						"serial NOT confirmed without an $A118 window) cmd=%02x e802=%04x t=%.5f\n",
-						m_iopb_cmd, data, machine().time().as_double());
-				// TEMP cont.565 (STRIP): is this edge a SERIAL CLOCK or a FLOPPY STEP?  E802 bit0 is
-				// wired to both in this handler.  Log the drive-select byte and the head position so
-				// "the serial ack latched" and "the head stepped" can be told apart, and so any
-				// hardware discriminator (E804 drive select) shows itself.
-				if (m_mux_prints < 40)
+				// New frame, or continue.  If the previous frame already had 17 falls, close it
+				// first (covers A118→A1CE with no intervening non-edge write).
+				if (m_esdi_frame_active && m_esdi_frame_falls >= 17)
 				{
-					floppy_image_device *const qf = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
-					m_mux_prints++;
-					logerror("E802B0 edge: sel_drive=%02x sel_head=%x cmd=%02x fdd_cyl=%d t=%.5f\n",
-						m_sel_drive, m_sel_head, m_iopb_cmd, qf ? qf->get_cyl() : -1,
-						machine().time().as_double());
+					if (TRACE_ESDI)
+						logerror("ESDI frame end (next fall) falls=%d t=%.5f\n",
+							m_esdi_frame_falls, machine().time().as_double());
+					m_esdi_frame_active = false;
+					m_esdi_frame_falls = 0;
+					m_esdi_frame_closing = false;
+				}
+				if (!m_esdi_frame_active)
+				{
+					m_esdi_frame_active = true;
+					m_esdi_frame_falls = 0;
+					m_esdi_frame_closing = false;
 				}
 				m_ser_last_t = machine().time().as_double();
-				m_ser_active = true;    // a real transaction: the controller drove the clock low
-				if (ESDI_SERIAL_ENGINE) esdi_serial_beat(data);
+				m_ser_active = true;
+				if (ESDI_SERIAL_ENGINE)
+					esdi_serial_beat(data);
+				m_esdi_frame_falls++;
+				if (TRACE_ESDI && m_esdi_frame_falls <= 3)
+					logerror("ESDI frame fall #%d beat=%d resp=%d sel=%02x e802=%04x t=%.5f\n",
+						m_esdi_frame_falls, m_esdi_beat, m_esdi_resp_phase ? 1 : 0,
+						m_sel_drive, data, machine().time().as_double());
+			}
+			else if (rise)
+			{
+				// Do NOT end the frame here: $A118 still samples bit1 SET after this rising edge.
+				// Mark closing; the epilogue e802 rewrite (clock already high) ends the frame.
+				if (m_esdi_frame_active && m_esdi_frame_falls >= 17)
+					m_esdi_frame_closing = true;
+			}
+			else if (!rigid && m_ser_clk && !clk)
+			{
+				// Floppy STEP — do not arm the ESDI frame or shift register.
+				m_ser_last_t = machine().time().as_double();
 			}
 			m_ser_clk = clk;
+			// Epilogue / level rewrite after beat 17 high: drop frame so idle bit1 is CLEAR.
+			if (rigid && m_esdi_frame_closing && m_esdi_frame_falls >= 17 && clk && !rise)
+			{
+				if (TRACE_ESDI)
+					logerror("ESDI frame end (epilogue) falls=%d t=%.5f\n",
+						m_esdi_frame_falls, machine().time().as_double());
+				m_esdi_frame_active = false;
+				m_esdi_frame_falls = 0;
+				m_esdi_frame_closing = false;
+			}
 		}
 		// bit6 = the IRQ2 ack the doorbell handler toggles LOW on entry.
 		if (!BIT(data, 6))
@@ -3162,9 +3176,12 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 			int_w<2>(0);
 		m_host_int_prev = host_int;
 
-		// bit0 = HD/floppy STEP pulse, bit13 = step direction (fw @0x1066/0x1088: bit13 set = inward).
+		// bit0 = floppy STEP or ESDI serial clock.  Demux by E804 select: a rigid unit never steps
+		// (cont.572), and serial clocks must not move the floppy or fire TRK0 position zeroing
+		// (cont.573 STEPEDGE leak during $A118).  Direction is bit1, not bit13 (cont.558).
 		// MAME steps on the 1->0 edge; dir_w=1 -> toward track 0.  Each STEP retriggers the PIT ctr1
-		// mode-5 settle one-shot on its gate (F000 bit1 busy until it times out).
+		// mode-5 settle one-shot on its gate (F000 bit1 busy until it times out) - floppy only.
+		if ((m_sel_drive & 0xe0) == 0xc0)
 		if (floppy_image_device *const fdd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr)
 		{
 			// TEMP cont.552 (STRIP): step-pulse census.  One firmware pulse must move exactly one
@@ -4099,6 +4116,12 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 	m_held_len = 0;   // no field carries across a command boundary
 	m_am_presented = 0;
 	m_ser_active = false; m_ser_clk = true;   // the serial ack does not carry across a command boundary
+	m_esdi_frame_active = false;
+	m_esdi_frame_falls = 0;
+	m_esdi_frame_closing = false;
+	m_esdi_beat = 0;
+	m_esdi_resp_phase = false;
+	m_esdi_shift = 0;
 	// Engagement must be decided HERE for a retained program.  With op18 skipped, nothing in the
 	// ladder (24 28 56 58 54 4A 42 36 00) writes E000, so the bit11 test below never evaluates and
 	// start_field_program() would never re-trigger.  Both inputs are the gate array's own: it knows
@@ -4331,10 +4354,13 @@ void multibus_storager_device::esdi_command(u16 cmd)
 		m_esdi_resp = 0x0000;
 		respond = true;
 		break;
-	case 0x3:  // REQUEST CONFIGURATION -> stored big-endian into UIB+$0e/$0f by $a686
+	case 0x3:  // REQUEST CONFIGURATION
+		// $a686 stores the response big-endian into NODE([$71bc])+$0e/$0f (NOT the UIB — A0 is
+		// the node pointer latched at accept).  Post-store $a690 waits for F000 bit8 (or bit9
+		// when [$7a0a]!=0) CLEAR.  UIB+$0e is a separate host-template field ($743a gate).
+		// Encoding of the 16-bit product word is still open; 0 leaves NODE+$e/$f zeroed.
 		name = "REQ-CONFIG";
-		m_esdi_resp = 0x0000;   // PROVISIONAL: encoding not yet established - measure what the
-		                        // firmware does with UIB+$e/$f before inventing a value.
+		m_esdi_resp = 0x0000;   // PROVISIONAL: NODE+$e/$f consumers ($12ae not.w of +$f, …)
 		respond = true;
 		break;
 	case 0x4: name = "SELECT-HEAD"; m_esdi_head = cmd & 0x000f; break;
