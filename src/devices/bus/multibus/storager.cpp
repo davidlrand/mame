@@ -403,6 +403,9 @@ private:
 	// (get_next_transition) and the gate array deserialises it, doing address-mark detect and filling the
 	// gate array's capture cells + raising IRQ5/IRQ6 per field boundary.
 	bool flux_density_fm() const;
+	// UIB+$12 bit1: firmware $102A policy — set → sector IDs 0..spt-1, clear → 1..spt.
+	// Matches the want-list builder's [$7954] base (cont.584).  Not density (that is bit2).
+	bool sector_id_zero_based() const;
 	u8   logical_r(u8 phys) const;
 	u16  ioreg_r(offs_t offset);
 	void ioreg_w(offs_t offset, u16 data, u16 mem_mask);   // physical sector ID -> FIRMWARE sector index (1-based, base UIB[4])
@@ -702,7 +705,8 @@ private:
 	u32  m_cur_last_chunk = 0;      // last chunk deposited into during THIS command
 	u32  m_prev_last_chunk = 0;     // ...and during the previous one
 	u16  m_held_r = 0;              // presented sector of the field currently held
-	u16  m_want_r = 0;              // physical sector the gate array is hunting for (0 = any)
+	u16  m_want_r = 0;              // physical sector ID the hunt seeks (0 is valid when zero-based)
+	bool m_hunt_active = false;     // true => match m_want_r; false => present any (replaces old "0=any")
 	u32  m_first_chunk = 0;         // chunk the FIRST record of this command was deposited into
 	u32  m_host_dma_n = 0;          // host data transfers issued so far this command
 	int  m_cmd_records = 0;         // data fields delivered THIS command (bounds the run)
@@ -763,6 +767,16 @@ private:
 // from the UIB, a host-supplied control block the gate array DMAs in itself - not a firmware snoop.
 // Corroboration for the field map: UIB[1] = sectors/track is read by the FIRMWARE at $7362
 // (move.b ($1,A6),D2) for exactly that purpose, so the ROM and the HLE agree on the layout.
+bool multibus_storager_device::sector_id_zero_based() const
+{
+	// Firmware $102A: btst #1,(UIB+$12); bne store_without_+1.  Rigid UIBs $37/$2f have bit1
+	// set, so LBA 0 correctly yields [$7954]=0 and the ledger is R-indexed from 0.  Presenting
+	// 1-based IDs against that map left pos0=FF forever (cont.584).
+	if (m_uib_base < 0x4000 || m_uib_base >= 0x8000)
+		return false;
+	return BIT(m_cpu->space(AS_PROGRAM).read_byte((m_uib_base + 0x12) & 0xffff), 1);
+}
+
 u8 multibus_storager_device::logical_r(u8 phys) const
 {
 	// The CPUAP addresses the medium by LOGICAL BLOCK, not by physical sector ID: it issues SASI
@@ -1122,10 +1136,15 @@ bool multibus_storager_device::capture_track_rigid()
 	for (u8 k = 0; k < 8; k++)
 		if ((128u << k) == secsz) { nn = k; break; }
 
+	// Sector ID numbering follows UIB+$12 bit1 — the same policy firmware uses at $102A when
+	// it writes [$7954].  bit1 set → 0..spt-1 (rigid $37/$2f); clear → 1..spt (floppy-style).
+	// Hardcoding i+1 against a 0-based want-list left pos0=FF unstaked forever (cont.584).
+	// LBA path is unchanged: image offset uses i, so R=0 still delivers LBA 0 content.
+	bool const id0 = BIT(u12, 1);
 	for (u32 i = 0; i < spt; i++)
 	{
 		captured_sector &t = m_track[i];
-		t.c = u8(cyl); t.h = u8(head); t.r = u8(i + 1); t.nn = nn;
+		t.c = u8(cyl); t.h = u8(head); t.r = u8(id0 ? i : i + 1); t.nn = nn;
 		t.dam = 0xfb;
 		t.len = u16(secsz);   // full media sector; delivery slices by live [$7996]
 		u64 const off = (base + i) * secsz;
@@ -1137,8 +1156,9 @@ bool multibus_storager_device::capture_track_rigid()
 	m_rigid_track = true;   // deposit full sector; GA host-payload after each field (cont.578)
 	if (TRACE_ESDI)
 		logerror("capture_track_rigid: unit=%d cyl=%u head=%u spt=%u secsz=%u lba_base=%llu "
-			"N=%u (uib=%04x +0=%u +1=%u +12=%02x) t=%.5f\n",
+			"N=%u id=%s (uib=%04x +0=%u +1=%u +12=%02x) t=%.5f\n",
 			unit, cyl, head, spt, secsz, (unsigned long long)base, nn,
+			id0 ? "0..spt-1" : "1..spt",
 			uib, heads, spt, u12, machine().time().as_double());
 	return true;
 }
@@ -1170,6 +1190,25 @@ void multibus_storager_device::capture_track()
 		{
 			m_rigid_track = false;
 			m_rigid_host_valid = false;
+		}
+		// cont.584: the LEDGER dump below lived only on the flux path, so rigid early-return
+		// produced a false "0 ledger lines" reading.  Snapshot here too when the rigid producer
+		// armed - want-list / $AA plant are live on this path; the open question is termination.
+		if (TRACE_ESDI && m_rigid_track)
+		{
+			address_space &lc = m_cpu->space(AS_PROGRAM);
+			char w[400]; w[0] = 0; int wn = 0; int pos = 0;
+			for (u32 k = 0x7654; k <= 0x76bf; k++)
+			{
+				u8 const v = lc.read_byte(k);
+				if ((v == 0xaa || v == 0xff || v == 0xfe) && wn < 28)
+				{
+					pos += sprintf(w + pos, "%u:%02x ", k - 0x7654, v);
+					wn++;
+				}
+			}
+			logerror("LEDGER $7654..$76BF (rigid arm): %d special cell(s) [pos:byte]: %s\n",
+				wn, wn ? w : "(none)");
 		}
 		return;
 	}
@@ -1593,15 +1632,16 @@ void multibus_storager_device::start_field_program()
 			if (m_desc_n)
 			{
 				m_want_r = 0;
+				m_hunt_active = false;
 				for (int i = 2; i < m_desc_n; i++)
 					if (m_desc_val[i-2] >= 0x3e && m_desc_val[i-1] >= 0x3e && m_desc_val[i] > 0 && m_desc_val[i] < 0x3e)
-					{ m_want_r = m_desc_val[i]; break; }
+					{ m_want_r = m_desc_val[i]; m_hunt_active = true; break; }
 			}
 			// cont.579/580: PROG-parse misfires on the rigid stream (04:0002 → start=2 vs REQ 0).
-			// Apply the command's start sector (node+8/+9, 0-based → want R = start+1) ONCE per
-			// HOST GO (m_hunt_from_req), not on every first_arm that sees a fresh program — that
-			// re-pinned R=1 after each BOUND and free-ran 218× label into host memory.  Program
-			// reuse without a new GO keeps retention (cont.521).
+			// Apply the command's start sector (node+8/+9) ONCE per HOST GO (m_hunt_from_req).
+			// cont.584: convert with the SAME +1 policy as firmware $102A / [$7954] — UIB+$12
+			// bit1 set → IDs are 0-based (from_req = req_start); clear → 1-based (+1).  An
+			// unconditional +1 against a 0-based want-list was the ledger pos0 residual.
 			if (m_hunt_from_req)
 			{
 				m_hunt_from_req = false;
@@ -1609,19 +1649,26 @@ void multibus_storager_device::start_field_program()
 				u32 const nd = m_node_base ? m_node_base : 0x71f0;
 				u16 const req_start = (u16(ns.read_byte((nd + 0x08) & 0xffff)) << 8)
 				                    | ns.read_byte((nd + 0x09) & 0xffff);
-				u16 const from_req = u16(req_start + 1);
+				bool const id0 = sector_id_zero_based();
+				u16 const from_req = u16(req_start + (id0 ? 0 : 1));
 				u16 const spt_lim = u16(std::max(1, m_track_n));
-				if (from_req >= 1 && from_req <= spt_lim)
+				u16 const lo = id0 ? 0 : 1;
+				u16 const hi = id0 ? u16(spt_lim - 1) : spt_lim;
+				if (from_req >= lo && from_req <= hi)
 				{
-					if (m_want_r != from_req)
-						logerror("HUNT start REQ=%u -> R=%u (PROG/retained was %u) t=%.5f\n",
-							req_start, from_req, m_want_r, machine().time().as_double());
+					if (!m_hunt_active || m_want_r != from_req)
+						logerror("HUNT start REQ=%u -> R=%u (%s; PROG/retained was %u%s) t=%.5f\n",
+							req_start, from_req, id0 ? "0-based" : "1-based",
+							m_want_r, m_hunt_active ? "" : " inactive",
+							machine().time().as_double());
 					m_want_r = from_req;
+					m_hunt_active = true;
 				}
 			}
 		logerror("PROG n=%u %s| e000: %04x %04x %04x %04x t=%.5f\n",
 				m_desc_n, pb, m_ch[0], m_ch[1], m_ch[2], m_ch[3], machine().time().as_double());
-		logerror("PROG start sector = %u%s\n", m_want_r,
+		logerror("PROG start sector = %u%s%s\n", m_want_r,
+				m_hunt_active ? "" : " (any)",
 				m_desc_n ? "" : "  (RETAINED - program reused)");
 		}
 		// cont.517: carry the previous command's LAST chunk across the boundary.  C800[0] is armed only
@@ -2198,6 +2245,30 @@ void multibus_storager_device::advance_read()
 					(m_sec_index >= 0 && m_sec_index < m_track_n) ? m_track[m_sec_index].r : 0xff,
 					bc.read_word(0x741c), bc.read_word(0x7968), bc.read_word(0x7a36),
 					m_host_dma_n, m_cmd_buf, m_cmd_bytes, machine().time().as_double());
+				// cont.584: residual want-list at extent end.  Close is $7ED8 after the scan
+				// reaches $AA with no outstanding $FF wants; if low cells still hold $FF after
+				// a 2-sector DELIV the window cannot terminate.  Dump the first 40 cells + any
+				// $AA so plant address (spt-sized vs count-sized) is visible without a full census.
+				if (TRACE_ESDI)
+				{
+					char lb[160]; int lp = 0; int nff = 0, nfe = 0; u32 aa = 0;
+					for (u32 k = 0; k < 40; k++)
+					{
+						u8 const v = bc.read_byte(0x7654 + k);
+						if (v == 0xff) nff++;
+						else if (v == 0xfe) nfe++;
+						else if (v == 0xaa && !aa) aa = 0x7654 + k;
+						if (lp < 140)
+							lp += sprintf(lb + lp, "%02X", v);
+					}
+					if (!aa)
+					{
+						for (u32 k = 0x7654; k <= 0x76bf; k++)
+							if (bc.read_byte(k) == 0xaa) { aa = k; break; }
+					}
+					logerror("BOUND LEDGER [0..39]=%s | ff=%d fe=%d aa@%04x [$741c]=%04x t=%.5f\n",
+						lb, nff, nfe, aa, bc.read_word(0x741c), machine().time().as_double());
+				}
 			}
 			m_read_active = false;
 			return;
@@ -2211,7 +2282,8 @@ void multibus_storager_device::advance_read()
 	// sectors nobody requested, so the first WANTED record arrives with the arm still pointing at
 	// the previous command's chunk.  The disk keeps turning; skip to the next field and let the
 	// wanted one come round.
-	if (m_want_r && logical_r(s.r) != m_want_r)
+	// cont.584: m_hunt_active, not m_want_r!=0 — with 0-based IDs, R=0 is a real sector.
+	if (m_hunt_active && logical_r(s.r) != m_want_r)
 	{
 		m_sec_index++;
 		if (m_sec_index >= m_track_n) m_sec_index = 0;
@@ -2391,12 +2463,18 @@ void multibus_storager_device::advance_read()
 			m_extra_presented++;   // a record cycle completed AFTER the offer
 		if (m_blocks_left > 0) m_blocks_left--;   // cont.525: one block of the linear run
 		m_sec_index++;                          // one sector completed after its data-done record
-		if (m_want_r)        // hunt the next sector in the run
+		if (m_hunt_active)        // hunt the next sector in the run
 		{
-			m_want_r = u16(m_want_r % std::max(1, m_track_n) + 1);
-			// cont.525: wrapping to sector 1 IS the track boundary.  The firmware does not seek here
-			// (measured), so the gate array walks: head 0 -> head 1 -> step to the next cylinder.
-			if (m_want_r == 1 && m_blocks_left > 0)
+			// cont.584: wrap in the ID space the drive declared (0..spt-1 or 1..spt).
+			int const n = std::max(1, m_track_n);
+			bool const id0 = sector_id_zero_based();
+			if (id0)
+				m_want_r = u16((int(m_want_r) + 1) % n);
+			else
+				m_want_r = u16(m_want_r % n + 1);
+			// cont.525: wrapping to the first ID of the track IS the track boundary.
+			u16 const first_id = id0 ? 0 : 1;
+			if (m_want_r == first_id && m_blocks_left > 0)
 			{
 				floppy_image_device *const fw = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
 				if (fw)
@@ -4450,7 +4528,10 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 			u8 const spt = m_uib_base ? wn.read_byte((m_uib_base + 1) & 0xffff) : 0;
 			if (spt)
 			{
-				m_want_r = u16(addr % spt) + 1;
+				// cont.584: same 0/1-based policy as capture and $102A.
+				bool const id0 = sector_id_zero_based();
+				m_want_r = u16(addr % spt) + (id0 ? 0 : 1);
+				m_hunt_active = true;
 				// The HEAD comes from the request too.  Seeding the walk from m_sel_head uses the
 				// stale E804 select - measured `WALK seed head=1` for a request whose position
 				// (psec 160) is cyl 5 HEAD 0 - so the run started on the wrong surface before it
@@ -4462,8 +4543,9 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 					m_walk_head = u8((addr / spt) % heads);
 					m_cmd_cyl = u16((addr / spt) / heads);
 				}
-				logerror("HUNT start = sector %u cyl=%u head=%u (addressed, addr=%u spt=%u) t=%.5f\n",
-					m_want_r, m_cmd_cyl, m_walk_head, addr, spt, machine().time().as_double());
+				logerror("HUNT start = sector %u cyl=%u head=%u (addressed, addr=%u spt=%u %s) t=%.5f\n",
+					m_want_r, m_cmd_cyl, m_walk_head, addr, spt,
+					id0 ? "0-based" : "1-based", machine().time().as_double());
 			}
 		}
 		logerror("WALK seed blocks=%d head=%d cmd_cyl=%u t=%.5f\n", m_blocks_left, m_walk_head,
@@ -5202,38 +5284,46 @@ void multibus_storager_device::device_reset()
 				logerror("FWSTAT node+2 <= %04x mask=%04x  t=%.5f\n",
 					data & 0xffff, mem_mask & 0xffff, machine().time().as_double());
 			});
-		// cont.584: [$741c] clear/set census.  After N correct rigid DELIVs, BOUND still shows
-		// [$741c]=1 and the command posts 82/$1C.  EXTRA and DMA-order cuts did not clear it.
-		// Hit-count the writer sites on floppy (closes) vs rigid (does not): clear writers are
-		// $7CA4, $7ED8, $85E6, $8A88, $9318/$934E; set writers include $7B06/$7F14 (arm).
-		// Gated on TRACE_ESDI so the install run produces the table without TRACE_CHUNK_PATH.
-		if (TRACE_ESDI || TRACE_CHUNK_PATH)
-			cs.install_write_tap(0x741c, 0x741d, "accept_reject",
-			[this](offs_t, u16 &data, u16 mem_mask)
+		// cont.584 RETIRED: LATCH741c write-site census on [$741c].  Named the missing close as
+		// $7ED8 (ledger $AA end-of-window) - floppy hits it, rigid never does.  Stripped.
+		// cont.584: WHERE each ledger stake lands.  BOUND residual is a single cell:
+		//   [0]=FF [1]=C0 FE×32 aa@7676 (34-wide = spt) [$741c]=1
+		// so the window is the right size and 32/34 wants were consumed — only pos0 stays
+		// unstaked.  $8120/$8128 write $c0 into ($7654+index); log the write address against
+		// presented R and want-ID [$7428].  Same "verify WHERE, not just THAT" discipline as
+		// the write-path sector landing check.  Gated on TRACE_ESDI (rigid install path).
+		if (TRACE_ESDI)
+			cs.install_write_tap(0x7654, 0x76bf, "stake_where",
+			[this](offs_t offset, u16 &data, u16 mem_mask)
 			{
-				if (mem_mask == 0)
+				// Byte stakes only ($8120 move.b #$c0 / $8128 move.b d0).  Word writes are
+				// init/builder noise and the lane split under SRAM_BYTE_SWAPPED is different.
+				if (mem_mask == 0 || mem_mask == 0xffff)
+					return;
+				u8 const v = (mem_mask == 0x00ff) ? u8(data) : u8(data >> 8);
+				// $c0 = stake (done); $fe = consumed-want intermediate the scan also steps.
+				// Both matter for "who left [0]=FF": if FE never hits pos0 either, nothing
+				// claimed that slot.
+				if (v != 0xc0 && v != 0xfe)
+					return;
+				// Logical cell under byte-swapped SRAM: low lane is odd address, high even.
+				// (Same extraction accept_count uses for the Q3 arm — cont.427.)
+				u32 const cell = (mem_mask == 0x00ff) ? ((offset & 0xffff) + 1) : (offset & 0xffff);
+				if (cell < 0x7654 || cell > 0x76bf)
 					return;
 				u32 const pc = m_cpu->pcbase() & 0xffffff;
-				u16 const v = data & 0xffff;
-				// Map PC to the known ROM sites (pcbase can sit a few bytes into the insn).
+				address_space &ls = m_cpu->space(AS_PROGRAM);
+				u8 const pos0 = ls.read_byte(0x7654);
+				u16 const want = ls.read_word(0x7428);
 				char const *site = "other";
-				if (pc >= 0x7ca0 && pc <= 0x7cb0) site = "$7CA4";
-				else if (pc >= 0x7ed4 && pc <= 0x7ee0) site = "$7ED8";
-				else if (pc >= 0x85e2 && pc <= 0x85f0) site = "$85E6";
-				else if (pc >= 0x8a84 && pc <= 0x8a90) site = "$8A88";
-				else if (pc >= 0x9314 && pc <= 0x9320) site = "$9318";
-				else if (pc >= 0x934a && pc <= 0x9356) site = "$934E";
-				else if (pc >= 0x7c04 && pc <= 0x7c10) site = "$7C08";
-				else if (pc >= 0x7b02 && pc <= 0x7b10) site = "$7B06";
-				else if (pc >= 0x7f10 && pc <= 0x7f1c) site = "$7F14";
-				else if (pc >= 0x7d58 && pc <= 0x7d64) site = "$7D5C";
-				else if (pc >= 0x79f2 && pc <= 0x79fc) site = "$79F6";
-				else if (pc >= 0x84a6 && pc <= 0x84b0) site = "$84AA";
-				else if (pc >= 0x8660 && pc <= 0x866a) site = "$8664";
-				logerror("LATCH741c %-5s <=%04x site=%-6s pc=%06x cmd=%02x rigid=%d r=%02x "
-					"recs=%d/%d t=%.5f\n",
-					v ? "set" : "clear", v, site, pc, m_iopb_cmd, m_rigid_track ? 1 : 0,
-					m_last_r, m_cmd_records, m_sec_count, machine().time().as_double());
+				if (pc >= 0x811c && pc <= 0x8126) site = "$8120";
+				else if (pc >= 0x8124 && pc <= 0x812e) site = "$8128";
+				else if (pc >= 0x6f50 && pc <= 0x7070) site = "wantbld";
+				logerror("STAKE %02x -> [%04x] pos=%d site=%s pc=%06x r=%02x want=%04x "
+					"pos0=%02x rigid=%d recs=%d/%d t=%.5f\n",
+					v, cell, int(cell - 0x7654), site, pc, m_last_r, want, pos0,
+					m_rigid_track ? 1 : 0, m_cmd_records, m_sec_count,
+					machine().time().as_double());
 			});
 		// cont.491: FRESH UNFILTERED tap on the stride table.  Do NOT reuse "accept_count" below -
 		// it carries three filters from a retired question, EACH of which would silence this one:
