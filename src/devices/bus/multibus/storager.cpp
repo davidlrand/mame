@@ -653,16 +653,21 @@ private:
 	// Rigid (cont.578): sector size UIB+2/+3 = 512; [$7996]=0x0200 on this path so field == sector
 	// (no multi-chunk).  m_rigid_track gates autonomous host payload DMA after deposit — the
 	// firmware never kicks E800 bit12 for rigid data (only IOPB), so the GA must bus-master.
+	// cont.586: capture latch + sector array are one unit (clear together).  NOT the same
+	// lifetime as m_rigid_host_valid (per HOST GO) or m_rigid_dma_pending (per field).
+	// Bundling the payload cursor into this clear made every rigid_host_payload skip.
+	void clear_rigid_track_capture();
 	bool m_rigid_track = false;
 	// cont.581: payload destination is NOT m_c000.  Floppy: firmware writes C000 to the data
 	// buffer before each data bit12 (measured c000=0fc2dd on DELIV).  Rigid: every bit12 is IOPB
 	// at c000=0fe780 and never retargets C000 — seeding m_c000 at HOST GO is clobbered by the
 	// node fetch.  m_rigid_host is the device's own cursor: seed from m_cmd_buf, advance per field.
+	// Lifetime = the command (seeded at HOST GO only; do not clear with the track).
 	u32  m_rigid_host = 0;
 	bool m_rigid_host_valid = false;
 	// cont.583: host DMA deferred until after the data-done mark is taken so $8018 stamps
 	// READY before IRQ4 (floppy: mark → $8018 → bit12).  Queued at deposit; fired when
-	// m_mark_pending clears (end of advance_read / pump).
+	// m_mark_pending clears (end of advance_read / pump).  Lifetime = one field.
 	bool m_rigid_dma_pending = false;
 	u32  m_rigid_dma_src = 0;
 	u32  m_rigid_dma_len = 0;
@@ -775,6 +780,18 @@ bool multibus_storager_device::sector_id_zero_based() const
 	if (m_uib_base < 0x4000 || m_uib_base >= 0x8000)
 		return false;
 	return BIT(m_cpu->space(AS_PROGRAM).read_byte((m_uib_base + 0x12) & 0xffff), 1);
+}
+
+void multibus_storager_device::clear_rigid_track_capture()
+{
+	// cont.586: capture only.  Flag + m_track_n drop together so a later stage cannot apply
+	// the eight-byte layout to leftover rigid sectors (N at +7 → $202A).
+	// Do NOT clear m_rigid_host_valid here — that cursor is seeded once at HOST GO and must
+	// survive the whole command; dropping it made FIELD deposit to SRAM with DELIV=0.
+	// Do NOT clear m_rigid_dma_pending — that is one field's deferred DMA; cancel only at
+	// HOST GO (new command) or after the transfer fires.
+	m_rigid_track = false;
+	m_track_n = 0;
 }
 
 u8 multibus_storager_device::logical_r(u8 phys) const
@@ -1078,10 +1095,8 @@ bool multibus_storager_device::capture_track_rigid()
 	u8 const u12 = (uib >= 0x4000 && uib < 0x8000) ? cs.read_byte((uib + 0x12) & 0xffff) : 0;
 	if ((u12 & 0x23) != 0x23)
 	{
-		// cont.582: clear the rigid latch so a later floppy-class command cannot free-run the
-		// previous track's 512-byte fields into a 256-byte host extent.
-		m_rigid_track = false;
-		m_rigid_host_valid = false;
+		// cont.582/586: drop latch AND capture so leftovers cannot free-run under floppy layout.
+		clear_rigid_track_capture();
 		logerror("capture_track_rigid: UIB+$12=%02x not rigid class (need &23==23) uib=%04x "
 			"sel=%02x m_uib_base=%04x - skip t=%.5f\n",
 			u12, uib, m_sel_drive, m_uib_base, machine().time().as_double());
@@ -1187,10 +1202,7 @@ void multibus_storager_device::capture_track()
 	if (rigid_class)
 	{
 		if (!capture_track_rigid())
-		{
-			m_rigid_track = false;
-			m_rigid_host_valid = false;
-		}
+			clear_rigid_track_capture();
 		// cont.584: the LEDGER dump below lived only on the flux path, so rigid early-return
 		// produced a false "0 ledger lines" reading.  Snapshot here too when the rigid producer
 		// armed - want-list / $AA plant are live on this path; the open question is termination.
@@ -1212,8 +1224,9 @@ void multibus_storager_device::capture_track()
 		}
 		return;
 	}
-	m_rigid_track = false;   // floppy: flux path; host DMA is firmware E800 bit12 kicks
-	m_rigid_host_valid = false;
+	// floppy: flux path; host DMA is firmware E800 bit12 kicks.  cont.586: drop any prior
+	// rigid capture before rebuilding m_track from flux (m_track_n already 0 above).
+	clear_rigid_track_capture();
 	floppy_image_device *const fdd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
 	if (!fdd || !fdd->exists())
 		return;
@@ -1752,10 +1765,20 @@ void multibus_storager_device::stage_record(captured_sector const &s)
 	// Same class test as capture_track() - NOT the drive select.  cont.584: a floppy read runs with
 	// sel=$78 ($60 masked), so a `!= 0xc0` test hands the RIGID ten-byte layout to MFM floppy
 	// records and the head compare answers $202A.
-	bool stage_rigid = false;
-	if (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
-		stage_rigid = ((cs.read_byte((m_uib_base + 0x12) & 0xffff) & 0x23) == 0x23);
-	if (!fm && stage_rigid)
+	// ...but do NOT re-derive it per record.  m_uib_base is whichever UIB was last DMA'd, so it can
+	// transiently point at the floppy's ($6e60) mid-command; a rigid record staged in that window
+	// gets the EIGHT-byte layout, which puts N at +7 where the ten-byte layout has H.  MEASURED
+	// (cont.586): $7C44 read $7DB3 = $02 - the 512-byte size code (128<<2) sitting in the head
+	// slot - and answered $202A, twice per run, while the other records read $00 and passed.
+	// The class belongs to the COMMAND: capture_track() decided it and m_rigid_track records it.
+	// Do not re-derive from m_uib_base (stale UIB mid-command) or present rigid leftovers after
+	// the latch drops (cont.586).
+	if (TRACE_ESDI && (cmd_is_read() || cmd_is_write()))
+		logerror("STAGELAYOUT dst=%04x fm=%d rigid_track=%d track_n=%d -> %s | c=%02x h=%02x r=%02x nn=%02x t=%.5f\n",
+			dst, fm ? 1 : 0, m_rigid_track ? 1 : 0, m_track_n,
+			(!fm && m_rigid_track) ? "TEN-byte" : (fm ? "FM-5" : "MFM-8"),
+			s.c, s.h, s.r, s.nn, machine().time().as_double());
+	if (!fm && m_rigid_track)
 	{
 		cs.write_byte((dst + 0) & 0xffff, 0xa1);
 		cs.write_byte((dst + 1) & 0xffff, 0xa1);
@@ -2227,6 +2250,9 @@ void multibus_storager_device::advance_read()
 					m_lram[(0x741c - 0x4000) >> 1], m_lram[(0x7968 - 0x4000) >> 1],
 					m_cmd_records, m_sec_count, machine().time().as_double());
 				m_read_active = false;
+				// cont.586: do NOT clear_rigid_track_capture here.  Capture may still be needed
+				// for a deferred field DMA; track drops at HOST GO / next capture entry.
+				// Free-running presentation after bound is a separate defect (done_n climbing).
 				return;
 			}
 			// still waiting for the field to come round - keep presenting
@@ -2271,6 +2297,9 @@ void multibus_storager_device::advance_read()
 				}
 			}
 			m_read_active = false;
+			// cont.586: leave capture + payload cursor alone at BOUND.  Host DMA may still be
+			// deferred for the last field; track is invalidated at the next HOST GO.  Stopping
+			// free-run (done_n > sec_count) is the separate cut that prevents late re-stage.
 			return;
 		}
 	}
@@ -4553,6 +4582,9 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 	}
 	m_iopb_addr = dbi;
 	m_window_seen = false; m_term_fired = false; m_idx_prev = false; m_read_active = false; m_data_chunks = 0;   // per-command reset
+	// cont.586: prior capture does not survive HOST GO (first-arm recaptures).  Payload cursor
+	// was already re-seeded above for data commands; do not touch m_rigid_host_valid here.
+	clear_rigid_track_capture();
 	m_write_active = false; m_wr_done = 0; m_wr_walked = 0;
 	m_wr_final_pending = false; m_wr_complete = false;
 	m_wr_stall_watch_blk = 0; m_wr_stall_watch_left = 0;
@@ -5723,6 +5755,9 @@ void multibus_storager_device::device_reset()
 	m_e800_bit12_prev = false;
 	m_host_int_prev = false;
 	m_read_window = false;
+	clear_rigid_track_capture();
+	m_rigid_host_valid = false;   // full reset — all three lifetimes end
+	m_rigid_dma_pending = false;
 	m_cmd = CMD_IDLE;
 	m_armed = false;
 	m_e000b11_prev = false;
