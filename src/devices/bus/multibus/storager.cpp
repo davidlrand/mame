@@ -2305,6 +2305,22 @@ void multibus_storager_device::advance_read()
 	}
 	if (machine().time() < m_next_rec)
 		return;                             // this field has not passed the head yet
+	// AN EMPTY CAPTURE PRESENTS NOTHING.  A drive with no medium raises no marks; the model must
+	// not index m_track[] when the capture produced no sectors, or it stages the PREVIOUS command's
+	// residue.  MEASURED (cont.588): the boot ROM probes unit=02 (floppy) with cnt=8 then cnt=4 at
+	// secsz=128 before falling back to unit=00, and on an HD-only machine those probes find no
+	// medium - the class gate correctly declines and leaves m_track_n = 0.  Presentation then
+	// staged m_track[0] from the last RIGID capture (c=00 h=00 r=00 nn=02) under the eight-byte
+	// layout, so $7C46 read N as the head: sense $202A, twice, on the probe RETRIES that follow a
+	// rigid capture.  Clock the sector on so the walk/settle machinery still turns - an early
+	// return here is what must NOT be done (it stalls the floppy's head-1 crossing at cyl 1).
+	if (m_track_n <= 0)
+	{
+		m_next_rec = machine().time() + sector_period();
+		return;
+	}
+	if (m_sec_index < 0 || m_sec_index >= m_track_n)
+		m_sec_index = 0;
 	captured_sector const &s = m_track[m_sec_index];   // physical order = ascending R for the boot read
 	// cont.521: the gate array HUNTS for the programmed sector.  A record that is not the one the
 	// firmware asked for must not be presented at all - presenting it drives the arm pipeline with
