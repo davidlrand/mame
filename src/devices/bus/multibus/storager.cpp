@@ -420,6 +420,9 @@ private:
 	// channel DMA: on the E800 bit12 kickoff the gate array bus-masters one field between the local
 	// SRAM buffer and host memory via the C000 up-counter, then raises IRQ4 (channel/DMA done).
 	void run_channel_dma();
+	// cont.578/581: rigid path never kicks E800 bit12 for payload and never points C000 at the
+	// read buffer (IOPB traffic owns C000 at 0fe780).  Device-side payload cursor, not m_c000.
+	void rigid_host_payload(u32 local_src, u32 len);
 	attotime dma_time(u32 len) const;  // bus-hold / transfer time for a len-byte bus-master DMA
 	TIMER_CALLBACK_MEMBER(dma_done);   // transfer end: release the bus hold, raise the channel-done IRQ4
 	// Write close-path deferred failsafe (v5): re-check node+2 after firmware's self-complete window.
@@ -633,7 +636,9 @@ private:
 	// the engine (advance_read) delivers a record per address mark, one IRQ6 + one IRQ5 each, for as long
 	// as the firmware keeps re-arming E802 bit11 - it does NOT count down a commanded run.
 	struct captured_sector { u8 c = 0, h = 0, r = 0, nn = 0, dam = 0; u16 len = 0; u8 data[1200] = {}; };
-	captured_sector m_track[32];
+	// Cap must hold the densest track we present.  HD UIB +1 has been seen as 34 (512-byte
+	// geometry); a silent clamp to 32 dropped two sectors and corrupted the ID hunt (cont.574).
+	captured_sector m_track[64];
 	int  m_track_n = 0;             // sectors recovered in the last full-track capture
 	// WRSEC_SELFTEST (STRIP): phase 0 = write the pattern, 1 = verify on the next capture, 2 = done.
 	int  m_wrsec_phase = 0;
@@ -641,6 +646,27 @@ private:
 	u16  m_wrsec_len = 0;
 	u8   m_wrsec_pat[1200] = {};
 	void capture_track();          // synchronous full-revolution flux decode into m_track
+	bool capture_track_rigid();    // rigid (ESDI) producer: flat sectors from the HD image
+	// Rigid (cont.578): sector size UIB+2/+3 = 512; [$7996]=0x0200 on this path so field == sector
+	// (no multi-chunk).  m_rigid_track gates autonomous host payload DMA after deposit — the
+	// firmware never kicks E800 bit12 for rigid data (only IOPB), so the GA must bus-master.
+	bool m_rigid_track = false;
+	// cont.581: payload destination is NOT m_c000.  Floppy: firmware writes C000 to the data
+	// buffer before each data bit12 (measured c000=0fc2dd on DELIV).  Rigid: every bit12 is IOPB
+	// at c000=0fe780 and never retargets C000 — seeding m_c000 at HOST GO is clobbered by the
+	// node fetch.  m_rigid_host is the device's own cursor: seed from m_cmd_buf, advance per field.
+	u32  m_rigid_host = 0;
+	bool m_rigid_host_valid = false;
+	// cont.583: host DMA deferred until after the data-done mark is taken so $8018 stamps
+	// READY before IRQ4 (floppy: mark → $8018 → bit12).  Queued at deposit; fired when
+	// m_mark_pending clears (end of advance_read / pump).
+	bool m_rigid_dma_pending = false;
+	u32  m_rigid_dma_src = 0;
+	u32  m_rigid_dma_len = 0;
+	// cont.580: apply node start→want_r once per HOST GO, not on every first_arm with a fresh
+	// program (that re-pinned R=1 every re-arm and free-ran the label into host memory).
+	bool m_hunt_from_req = false;
+	u16  m_xfer_len = 0;           // bytes deposited into the last data field (DMA length)
 	void stage_record(captured_sector const &s);   // stage the record the firmware verifies (read AND write)
 	bool write_sector(u8 want_r, const u8 *src, u32 len);   // locate by ID, overwrite data field in place
 	bool m_read_active = false;     // a read window is open (records delivered until the firmware stops re-arming)
@@ -999,9 +1025,145 @@ bool multibus_storager_device::write_sector(u8 want_r, const u8 *src, u32 len)
 	return true;
 }
 
+// Rigid (ESDI) capture producer.  The floppy path recovers a track by decoding a physical
+// revolution; a rigid unit has no flux to decode here - the drive and the gate array own the
+// serialiser - so the equivalent act is to present the sectors that lie under the heads at the
+// position the SERIAL LINK last commanded.  That position is not guessed: $1000 RECAL and $0xxx
+// SEEK arrive over $A118 and are recorded by the serial engine, so m_esdi_cyl/m_esdi_head are the
+// drive's own idea of where it is.
+//
+// Sector size is the drive's own declaration at UIB+2/+3 (cont.576: 0x0200 = 512), not the
+// inherited 1024 assumption.  Field split is NOT decided here: [$7996] is written later during
+// transfer setup (cont.577 / cont.523 shape), so capture only stages secsz bytes and sets
+// m_rigid_track; delivery samples [$7996] and slices.  Geometry: UIB +0 heads, +1 spt; refuse
+// if UIB+$12 is not rigid class ($6ce4).
+bool multibus_storager_device::capture_track_rigid()
+{
+	m_track_n = 0;
+	// Drive select carries the unit in bits 5-7 ($60 = unit 0, $c0 = the floppy).  Only unit 0 is
+	// wired to -hard1 today; fall back to whichever image exists rather than presenting nothing.
+	// Note: sel can change between capture and delivery (measured sel=78 vs sel=1d) — another
+	// reason transfer parameters must not freeze here.
+	int unit = ((m_sel_drive & 0xe0) == 0x60) ? 0 : 1;
+	if (!m_hd[unit] || !m_hd[unit]->exists())
+		unit = (m_hd[0] && m_hd[0]->exists()) ? 0 : 1;
+	if (!m_hd[unit] || !m_hd[unit]->exists())
+		return false;
+
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	// Geometry source (cont.574): [$799a] and m_uib_base TRACK THE SAME value on the measured
+	// boot — switching to [$799a] alone does not fix early captures at $6e60.  When select is
+	// already rigid but [$799a] still names the floppy UIB, that disagreement is the finding;
+	// do not invent a third source.  get_info() is still rejected (fabricated for raw .img).
+	u32 uib = cs.read_word(0x799a) & 0xffff;
+	if (uib < 0x4000 || uib >= 0x8000)
+		uib = m_uib_base;
+	// Class gate: firmware's own rigid test is UIB+$12 & $23 == $23 ($6ce4).  Skip while the
+	// current UIB is still the floppy class so we do not present HD image sectors under floppy
+	// spt/heads.  The later command that has loaded $6c00 will capture.
+	u8 const u12 = (uib >= 0x4000 && uib < 0x8000) ? cs.read_byte((uib + 0x12) & 0xffff) : 0;
+	if ((u12 & 0x23) != 0x23)
+	{
+		// cont.582: clear the rigid latch so a later floppy-class command cannot free-run the
+		// previous track's 512-byte fields into a 256-byte host extent.
+		m_rigid_track = false;
+		m_rigid_host_valid = false;
+		logerror("capture_track_rigid: UIB+$12=%02x not rigid class (need &23==23) uib=%04x "
+			"sel=%02x m_uib_base=%04x - skip t=%.5f\n",
+			u12, uib, m_sel_drive, m_uib_base, machine().time().as_double());
+		return false;
+	}
+	// +0 / +1 = heads / spt for the LBA path: ESTABLISHED at $0ffe (mulu heads) and $90ea/$9102
+	// (divu spt), and at $7362 (spt into the per-track remainder).  +0 changing 12→8 at $6c00 in
+	// one command window is a LIVE UIB rewrite (host/firmware), not proof the field is something
+	// else — both 8 and 12 appear as real geometries in the install path.
+	// +2/+3 = sector size in bytes (BE word).  MEASURED cont.576 at UIB $6c00: 0x0200 = 512.
+	// That supersedes the 1024 assumption.  Chunks/sector are NOT frozen here — they come from
+	// size / [$7996] at delivery (cont.577).
+	u32 heads = 0, spt = 0, secsz = 512;
+	if (uib >= 0x4000 && uib < 0x8000)
+	{
+		heads = cs.read_byte((uib + 0) & 0xffff);
+		spt   = cs.read_byte((uib + 1) & 0xffff);
+		u16 const uib_ss = cs.read_word((uib + 2) & 0xffff);
+		if (uib_ss >= 128 && uib_ss <= 1024)
+			secsz = uib_ss;
+	}
+	// Do not sample [$7996] here.  Capture runs at program-load; the firmware writes field
+	// length later during transfer setup.  Sampling early produced flen=secsz → chunks=1
+	// (cont.577 regression).  Log the raw cell only as a diagnostic of the ordering trap.
+	u16 const raw_7996 = cs.read_word(0x7996);
+	logerror("RIGIDGEO uib=%04x m_uib_base=%04x +0=%u +1=%u +2/+3=%u +12=%02x "
+		"[$7996]=%04x(not used at capture) sel=%02x t=%.5f\n",
+		uib, m_uib_base, heads, spt, secsz, u12, raw_7996, m_sel_drive,
+		machine().time().as_double());
+	if (heads == 0 || spt == 0)
+	{
+		logerror("capture_track_rigid: no geometry (uib=%04x +0=%u +1=%u) - nothing presented t=%.5f\n",
+			uib, heads, spt, machine().time().as_double());
+		return false;
+	}
+	if (spt > std::size(m_track))
+	{
+		logerror("capture_track_rigid: *** SPT CLAMP *** uib=%04x spt=%u > track[%zu] — "
+			"%u sectors DROPPED t=%.5f\n",
+			uib, spt, std::size(m_track), spt - u32(std::size(m_track)),
+			machine().time().as_double());
+		spt = u32(std::size(m_track));
+	}
+
+	u32 const cyl  = m_esdi_cyl;
+	u32 const head = (heads > 0) ? (m_esdi_head % heads) : 0;
+	u64 const base = (u64(cyl) * heads + head) * spt;
+	u64 const len  = m_hd[unit]->img_length();
+	// N in the ID: 128 << N = secsz.  512 → N=2; 1024 → N=3.  secsz is from UIB (stable at
+	// capture); field count is not.
+	u8 nn = 2;
+	for (u8 k = 0; k < 8; k++)
+		if ((128u << k) == secsz) { nn = k; break; }
+
+	for (u32 i = 0; i < spt; i++)
+	{
+		captured_sector &t = m_track[i];
+		t.c = u8(cyl); t.h = u8(head); t.r = u8(i + 1); t.nn = nn;
+		t.dam = 0xfb;
+		t.len = u16(secsz);   // full media sector; delivery slices by live [$7996]
+		u64 const off = (base + i) * secsz;
+		std::memset(t.data, 0, sizeof(t.data));
+		if (off + secsz <= len)
+			m_hd[unit]->img_read(off, t.data, secsz);
+	}
+	m_track_n = int(spt);
+	m_rigid_track = true;   // deposit full sector; GA host-payload after each field (cont.578)
+	if (TRACE_ESDI)
+		logerror("capture_track_rigid: unit=%d cyl=%u head=%u spt=%u secsz=%u lba_base=%llu "
+			"N=%u (uib=%04x +0=%u +1=%u +12=%02x) t=%.5f\n",
+			unit, cyl, head, spt, secsz, (unsigned long long)base, nn,
+			uib, heads, spt, u12, machine().time().as_double());
+	return true;
+}
+
 void multibus_storager_device::capture_track()
 {
 	m_track_n = 0;
+	// RIGID UNITS HAVE NO FLUX.  Everything below this point is a PLL decode of a floppy
+	// revolution, which is meaningless for an ESDI drive - the gate array deserialises that
+	// channel itself and the image is flat sectors.  Route by drive select, the same demux the
+	// E802 bit0 clock/STEP split and the F000 bit1/bit5 composition already use.  MEASURED
+	// (cont.573): without this a rigid cmd=95 loads its field program, arms the $201C/#$32
+	// watchdog at $7B1C, and then starves - zero IRQ5, zero IRQ6, m_track_n=0 - because this
+	// function returned empty before doing anything.  Same consumer, different producer.
+	if ((m_sel_drive & 0xe0) != 0xc0)
+	{
+		if (!capture_track_rigid())
+		{
+			m_rigid_track = false;
+			m_rigid_host_valid = false;
+		}
+		return;
+	}
+	m_rigid_track = false;   // floppy: flux path; host DMA is firmware E800 bit12 kicks
+	m_rigid_host_valid = false;
 	floppy_image_device *const fdd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
 	if (!fdd || !fdd->exists())
 		return;
@@ -1399,6 +1561,7 @@ void multibus_storager_device::start_field_program()
 		double const phase = rev > 0.0 ? std::fmod(machine().time().as_double(), rev) / rev : 0.0;
 		m_sec_index = int(phase * m_track_n) % std::max(1, m_track_n);
 		m_sec_phase = 0;
+		m_xfer_len = 0;
 		m_read_active = true;
 		// cont.520: dump the field program the firmware just pushed.  The spec lists 'compare' among
 		// the E000 command-word operations and leaves sector selection open; the ISR is measured NOT
@@ -1422,6 +1585,28 @@ void multibus_storager_device::start_field_program()
 				for (int i = 2; i < m_desc_n; i++)
 					if (m_desc_val[i-2] >= 0x3e && m_desc_val[i-1] >= 0x3e && m_desc_val[i] > 0 && m_desc_val[i] < 0x3e)
 					{ m_want_r = m_desc_val[i]; break; }
+			}
+			// cont.579/580: PROG-parse misfires on the rigid stream (04:0002 → start=2 vs REQ 0).
+			// Apply the command's start sector (node+8/+9, 0-based → want R = start+1) ONCE per
+			// HOST GO (m_hunt_from_req), not on every first_arm that sees a fresh program — that
+			// re-pinned R=1 after each BOUND and free-ran 218× label into host memory.  Program
+			// reuse without a new GO keeps retention (cont.521).
+			if (m_hunt_from_req)
+			{
+				m_hunt_from_req = false;
+				address_space &ns = m_cpu->space(AS_PROGRAM);
+				u32 const nd = m_node_base ? m_node_base : 0x71f0;
+				u16 const req_start = (u16(ns.read_byte((nd + 0x08) & 0xffff)) << 8)
+				                    | ns.read_byte((nd + 0x09) & 0xffff);
+				u16 const from_req = u16(req_start + 1);
+				u16 const spt_lim = u16(std::max(1, m_track_n));
+				if (from_req >= 1 && from_req <= spt_lim)
+				{
+					if (m_want_r != from_req)
+						logerror("HUNT start REQ=%u -> R=%u (PROG/retained was %u) t=%.5f\n",
+							req_start, from_req, m_want_r, machine().time().as_double());
+					m_want_r = from_req;
+				}
 			}
 		logerror("PROG n=%u %s| e000: %04x %04x %04x %04x t=%.5f\n",
 				m_desc_n, pb, m_ch[0], m_ch[1], m_ch[2], m_ch[3], machine().time().as_double());
@@ -1494,6 +1679,32 @@ void multibus_storager_device::stage_record(captured_sector const &s)
 	if (dst < 0x4000 || dst + (fm ? 5 : 8) > 0x8000)
 		dst = 0x7dac;                       // not yet latched (first record of a command)
 	int k = 0;
+	// A RIGID UNIT USES A DIFFERENT ID LAYOUT, AND THE FIRMWARE DECLARES IT.  The record's field
+	// offsets are not fixed - they come from POSPTRs the firmware installs per media class, and the
+	// compare at $7C40/$7C46 dereferences UIB+$cc to find the head.  MEASURED (cont.575) on a rigid
+	// read: that pointer is $7DB3 against a staging base of $7DAC ([$7434]=3ed6), i.e. head at
+	// base+7 - where the eight-byte MFM layout puts N, which is why the firmware read $03 (the
+	// 1024-byte size code) as a head and answered $202A while the model's own ID-CMP said MATCH.
+	//
+	// base+7 is exactly what the TEN-byte layout predicts: $8A1A-$8A2C verifies bytes 0-2 OR'd ==
+	// $A1, byte 3 == $FE, byte 4 == $FF, and the hardcoded POSPTRs at $2DB4 give C=+5 H=+7 R=+8.
+	// That layout was written for the floppy in cont.448 and correctly REVERTED in cont.449 because
+	// the floppy's live POSPTRs ($2CF2) say C=+4 H=+5 R=+6.  It was never wrong - it is the RIGID
+	// layout, and $2DB4 is the rigid POSPTR init.  Cylinder is two bytes here, high at +5.
+	if (!fm && (m_sel_drive & 0xe0) != 0xc0)
+	{
+		cs.write_byte((dst + 0) & 0xffff, 0xa1);
+		cs.write_byte((dst + 1) & 0xffff, 0xa1);
+		cs.write_byte((dst + 2) & 0xffff, 0xa1);
+		cs.write_byte((dst + 3) & 0xffff, 0xfe);
+		cs.write_byte((dst + 4) & 0xffff, 0xff);
+		cs.write_byte((dst + 5) & 0xffff, 0x00);              // +5  C high (single-byte media)
+		cs.write_byte((dst + 6) & 0xffff, s.c);               // +6  C low
+		cs.write_byte((dst + 7) & 0xffff, s.h);               // +7  H   <- UIB+$cc points here
+		cs.write_byte((dst + 8) & 0xffff, logical_r(s.r));    // +8  R
+		cs.write_byte((dst + 9) & 0xffff, s.nn);              // +9  N
+		return;
+	}
 	if (fm)
 	{
 		// FM record, five bytes.  The firmware's POSPTRs for this layout are C=+1 H=+2 R=+3
@@ -1958,7 +2169,9 @@ void multibus_storager_device::advance_read()
 		}
 		else
 		{
-		if (!m_bound_logged)
+			// cont.583: EXTRA trailing-arm REFUTED for rigid too ([$741c] stays 1 after delivery;
+			// same result as floppy EXTRA_RECORD, deleted 54b79b003b8).  Do not re-present.
+			if (!m_bound_logged)
 			{
 				m_bound_logged = true;
 				address_space &bc = m_cpu->space(AS_PROGRAM);
@@ -2097,15 +2310,22 @@ void multibus_storager_device::advance_read()
 		// A skipped record is NOT a completed sector and must not count toward the run.
 		bool const fresh_arm = true;   // FLUSH_ON_CLAIM - REFUTED
 		bool deposited = false;
+		// Field length: for rigid, [$7996]=0x0200 equals UIB secsz so field == sector (cont.578);
+		// multi-chunk is retired.  Floppy: one field of s.len.  DMA length follows the deposited
+		// field.
+		u32 const flen = u32(s.len);
+		m_xfer_len = u16(flen);
 		// DEPOSIT_BY_CLAIM - REFUTED.  Body removed; preserved verbatim in commit bebdc9428d9
 		// (pre-cleanup checkpoint).  It was the `if` arm of this if/else, so the surviving arm
 		// below is now the unconditional path.
-		if (fresh_arm && dep >= 0x4000 && dep + s.len <= 0x8000)
+		// Place = C800-commanded chunk (dep).  Measured rigid stride +0x200 matches secsz.
+		u32 const place = dep;
+		if (fresh_arm && place >= 0x4000 && place + flen <= 0x8000 && flen <= s.len)
 		{
-			for (int k = 0; k < s.len; k++)
-				cs.write_byte((dep + k) & 0xffff, s.data[k]);
-			m_cur_last_chunk = dep;
-			if (!m_first_chunk) m_first_chunk = dep;
+			for (u32 k = 0; k < flen; k++)
+				cs.write_byte((place + k) & 0xffff, s.data[k]);
+			m_cur_last_chunk = place;
+			if (!m_first_chunk) m_first_chunk = place;
 			deposited = true;
 		}
 		else
@@ -2116,16 +2336,33 @@ void multibus_storager_device::advance_read()
 			// receives stale content while sectors 2..8 land correctly at positions 1..7.
 			// Do not withhold the RECORD (that deadlocks - the arm never comes); hold the DATA and
 			// flush it as soon as a chunk is armed. (cont.437)
-			m_held_len = s.len;
+			m_held_len = flen;
 			m_held_r = logical_r(s.r);
-			std::copy_n(s.data, s.len, m_held_data);
+			std::copy_n(s.data, flen, m_held_data);
 			// The claim may ALREADY be in the table when the record arrives (it is not always
 			// written afterwards), so try immediately as well as on a later claim write.
 			// FLUSH_ON_CLAIM - REFUTED (called flush_held_on_claim() here); see bebdc9428d9
 			logerror("FIELD r=%02x held - no chunk armed yet t=%.5f\n",
 				s.r, machine().time().as_double());
 		}
-		m_mark_pending = 5;                     // data field captured (IRQ5 #2 -> $8018 done)
+		// cont.583: queue host DMA, deliver the data-done mark first.  Floppy order is $8018
+		// (READY stamp) then E800 bit12; doing DMA+IRQ4 before the mark left the drain racing
+		// an unstamped slot.  The pump fires the queued DMA once the mark has been taken.
+		// EXTRA trailing-arm REFUTED again for rigid ([$741c] stays 1) — not re-tried.
+		bool const host_room = !m_cmd_bytes || !m_rigid_host_valid
+			|| (m_rigid_host >= m_cmd_buf
+				&& m_rigid_host + flen <= m_cmd_buf + m_cmd_bytes);
+		if (deposited && m_rigid_track && host_room)
+		{
+			m_rigid_dma_pending = true;
+			m_rigid_dma_src = place;
+			m_rigid_dma_len = flen;
+		}
+		else if (deposited && m_rigid_track && !host_room)
+			logerror("RIGID host DMA skip (extent) host=%06x+%u of %06x..%06x t=%.5f\n",
+				m_rigid_host, flen, m_cmd_buf, m_cmd_buf + m_cmd_bytes,
+				machine().time().as_double());
+		m_mark_pending = 5;                     // data field captured (IRQ5 #2 -> $8018/$7FEE done)
 		m_sec_phase = 0;
 		// cont.531: count DELIVERED sectors, not presented records.  Counting presentations lets a
 		// command whose records never reach a chunk still reach its count and post 0x80 - a hollow
@@ -2187,7 +2424,7 @@ void multibus_storager_device::advance_read()
 		// second track's run - look elsewhere.
 		if (++m_data_done_n == m_sec_count)
 		{
-			// COUNT EXHAUST (model observation only).  Do NOT write firmware RAM here.
+			// COUNT EXHAUST (model observation only).  Do NOT call firmware RAM here.
 			// A prior experiment OR'd UIB+$12 bit7 (op42 guard bypass at $6C32) and deposited a
 			// phase byte at node+$26 from the pump.  Both are RETIRED (cont.426): with the SRAM byte
 			// order corrected the firmware's own word writes satisfy those gates, and the read
@@ -2201,6 +2438,13 @@ void multibus_storager_device::advance_read()
 		}
 	}
 	deliver_mark();
+	// cont.583: after a data-done mark has been consumed, run the queued rigid host DMA so
+	// $8018 has had a chance to stamp READY (same order as floppy bit12 after $8018).
+	if (m_rigid_dma_pending && !m_mark_pending)
+	{
+		m_rigid_dma_pending = false;
+		rigid_host_payload(m_rigid_dma_src, m_rigid_dma_len);
+	}
 }
 
 // The mark clock: stage/deliver the next record while the window is armed, then
@@ -2246,6 +2490,13 @@ TIMER_CALLBACK_MEMBER(multibus_storager_device::pump_tick)
 	deliver_mark();
 	if (m_read_window)
 		advance_read();
+	// cont.583: rigid host DMA after the data-done mark is taken (may need a later pump if the
+	// first deliver_mark was IPL-masked).  Order matches floppy: $8018 READY, then payload/IRQ4.
+	if (m_rigid_dma_pending && !m_mark_pending)
+	{
+		m_rigid_dma_pending = false;
+		rigid_host_payload(m_rigid_dma_src, m_rigid_dma_len);
+	}
 	// Q3b: deposit the end marker once the firmware has signalled it bootstrapped.  Done HERE, from the
 	// device's own context: currently_executing() is not the local CPU, so the model's $4000-$7FFF snoop
 	// taps ignore it and m_term_bit0 / m_last_bw stay clean.  From the next record onward the firmware
@@ -2301,8 +2552,66 @@ TIMER_CALLBACK_MEMBER(multibus_storager_device::pump_tick)
 }
 
 // ---------------------------------------------------------------------------
-// channel DMA (E800 bit12 kickoff)
+// channel DMA (E800 bit12 kickoff) and rigid autonomous host payload
 // ---------------------------------------------------------------------------
+
+// cont.578/581: after a rigid field is deposited in the C800 chunk, bus-master it to the host
+// via m_rigid_host — NOT m_c000.  Evidence:
+//   floppy data bit12: c000=0fc2dd (firmware wrote the data buffer into C000 before the kick)
+//   rigid every bit12:  c000=0fe780 (IOPB only — never retargets C000 to the read buffer)
+// Seeding m_c000 at HOST GO is clobbered by the node fetch microseconds later.  m_rigid_host is
+// the device's payload cursor; hard-bound to m_cmd_bytes.
+void multibus_storager_device::rigid_host_payload(u32 local_src, u32 len)
+{
+	if (!len || local_src < 0x4000 || local_src + len > 0x8000)
+		return;
+	if (!m_bus)
+		return;
+	if (!m_rigid_host_valid || m_rigid_host >= 0xff0000)
+	{
+		logerror("RIGID host payload SKIP local=%04x len=%u hostv=%d host=%06x cmd_buf=%06x "
+			"(c000=%06x is IOPB traffic, unused here) t=%.5f\n",
+			local_src, len, m_rigid_host_valid ? 1 : 0, m_rigid_host, m_cmd_buf, m_c000,
+			machine().time().as_double());
+		return;
+	}
+	// Hard bound — no silent overrun into host memory (write-path discipline).
+	if (m_cmd_bytes && (m_rigid_host < m_cmd_buf || m_rigid_host + len > m_cmd_buf + m_cmd_bytes))
+	{
+		logerror("*** DMA OUT OF EXTENT (rigid) REFUSED: host %06x+%u outside %06x..%06x "
+			"(xfer #%u) t=%.5f ***\n",
+			m_rigid_host, len, m_cmd_buf, m_cmd_buf + m_cmd_bytes,
+			m_host_dma_n + 1, machine().time().as_double());
+		return;
+	}
+	address_space &cs = m_cpu->space(AS_PROGRAM);
+	address_space &bs = m_bus->space(AS_PROGRAM);
+	for (u32 k = 0; k < len; k++)
+		bs.write_byte((m_rigid_host + k) & 0xffffff, cs.read_byte((local_src + k) & 0xffff));
+	m_host_dma_n++;
+	m_data_chunks++;
+	// DELIV log (same shape as the floppy bit12 path) so the content oracle is one grep away.
+	{
+		u32 sum = 0;
+		for (u32 k = 0; k < len; k++)
+			sum = (sum + bs.read_byte((m_rigid_host + k) & 0xffffff)) & 0xffffff;
+		char t[17]; t[16] = 0;
+		for (int k = 0; k < 16 && u32(k) < len; k++)
+		{
+			u8 const c = bs.read_byte((m_rigid_host + k) & 0xffffff);
+			t[k] = (c >= 0x20 && c < 0x7f) ? char(c) : '.';
+		}
+		if (len < 16) t[len] = 0;
+		logerror("DELIV rigid r=%02x len=%u host=%06x <- chunk %04x sum=%06x first16:\"%s\" t=%.5f\n",
+			m_last_r, len, m_rigid_host, local_src, sum, t, machine().time().as_double());
+	}
+	m_rigid_host = (m_rigid_host + len) & 0xffffff;
+	// Same DTACK hold + channel-done IRQ4 as firmware-kicked DMA: the local bus is busy for the
+	// transfer and the firmware's drain expects IRQ4 when a payload move completes.
+	m_cpu->suspend(SUSPEND_REASON_HALT, true);
+	m_bus_held = true;
+	m_dma_done->adjust(dma_time(len));
+}
 
 // One host DMA between the local SRAM buffer and host memory via the C000 up-counter (spec §3.4/§6.4).
 // Read (0x94/0x95): SRAM chunk -> host; write: host -> SRAM.  Completion raises IRQ4.
@@ -2361,8 +2670,10 @@ void multibus_storager_device::run_channel_dma()
 			e800, BIT(e800, 14) ? "host->LOCAL" : "local->host", ld, m_c000, m_d000,
 			m_sec_index, m_track_n, machine().time().as_double());
 	bool const is_data = m_sec_count > 0 && ld >= 0x4000 && ld < 0x7000;   // the linear data buffer
-	u32 data_len = m_track[0].len;
-	if (m_sec_index >= 0 && m_sec_index < m_track_n)
+	// Prefer the length of the field just deposited (m_xfer_len).  Rigid sets it to secsz (field
+	// == sector).  Fall back to media size only if no deposit ran.
+	u32 data_len = m_xfer_len ? m_xfer_len : m_track[0].len;
+	if (!m_xfer_len && m_sec_index >= 0 && m_sec_index < m_track_n)
 		data_len = m_track[m_sec_index].len;
 	u32 const len = is_data ? data_len : (BIT(e800, 13) ? 0x18 : 0x20);   // node = 0x18, UIB = 0x20
 	// TEMP cont.447: is the transfer length coming from the wrong object?  m_track[0].len is sector
@@ -3514,7 +3825,8 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 			// full multi-user install (see docs/storager-lle/GATEARRAY-READ-SPEC.md):
 			//   position is 21 BITS - the top 5 live in the unit byte.  Dropping them wraps every
 			//   track past 64 MB and sends the format's verify pass into an endless spare-assignment
-			//   loop.  Sector size is 1024 (the c2 SET-CONFIG declares it), not the floppy's 256.
+			//   loop.  Sector size on THIS path is still 1024 (c2 SET-CONFIG / HLE); the firmware
+			//   UIB declares 512 (cont.576) — open whether they differ by channel (see data phase).
 			//   dev[5] = 0xC0 is the Multibus burst-size parameter and is NOT part of the count.
 			//   count 0 means 4, NOT 256 - a 256 reading sprays 256 KB of kernel memory onto the
 			//   platter (the HLE confirmed this from scattered superblock images on the disk).
@@ -3556,15 +3868,21 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 						is_xfer ? util::string_format("%u", hnsec).c_str() : "-",
 						req, (is_xfer && nsec_raw == 0) ? "  [count0->4]" : "",
 						machine().time().as_double());
-				logerror("ESDI op=%02x unit=%u psec=%u (byte %llu) nsec=%u buf=%06x t=%.5f\n",
+				logerror("ESDI op=%02x unit=%u psec=%u (byte %llu @1024) nsec=%u buf=%06x t=%.5f\n",
 					op, unit, hpsec, (unsigned long long)(u64(hpsec) * 1024), hnsec, req,
 					machine().time().as_double());
 				// DATA PHASE.  The gate array is the DMA engine: the firmware issues the ESDI
 				// command, the gate array moves the bytes.  On the floppy that means decoding flux;
 				// on the rigid disk the image IS the drive surface, so the transfer is a flat
-				// sector-array copy at psec*1024.  This is NOT the HLE shim - that bypassed the
-				// firmware's command processing entirely; here the host interface is decoded and the
-				// data phase serviced, which is the gate array's own role.
+				// sector-array copy.  This is NOT the HLE shim - that bypassed the firmware's
+				// command processing entirely; here the host interface is decoded and the data
+				// phase serviced, which is the gate array's own role.
+				//
+				// SECTOR SIZE — OPEN (cont.576).  This unit<2 OS-channel path still uses 1024 and
+				// has carried the install.  The firmware path's own UIB declares 512 (UIB+2/+3).
+				// Either the OS channel genuinely blocks at 1024 while the firmware path uses the
+				// drive's native 512, or this shim has been wrong in a way its success masked.  Do
+				// not quietly unify them when retiring unit<2 onto the firmware path — measure.
 				//
 				// Required by the installer's DISK-TYPE AUTO-DETECT: it writes 48 sectors at psec 0
 				// (op 0x0b) and reads 1 back (op 0x08).  With no data moved the read-back is garbage
@@ -3577,10 +3895,11 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 				// installer's own read-back verify honest.
 				if (unit < 2 && m_hd[unit] && m_hd[unit]->exists())
 				{
-					std::vector<u8> sec(size_t(hnsec) * 1024, 0);
+					u32 const os_secsz = 1024;   // see SECTOR SIZE — OPEN above; not UIB+2/+3
+					std::vector<u8> sec(size_t(hnsec) * os_secsz, 0);
 					if (op == 0x08)
 					{
-						m_hd[unit]->img_read(u64(hpsec) * 1024, sec.data(), u32(sec.size()));
+						m_hd[unit]->img_read(u64(hpsec) * os_secsz, sec.data(), u32(sec.size()));
 						for (size_t k = 0; k < sec.size(); k++)
 							bs.write_byte((req + u32(k)) & 0xffffff, sec[k]);
 					}
@@ -3590,7 +3909,7 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 						// Writing here is expected - the installer's format is meant to overwrite.
 						for (size_t k = 0; k < sec.size(); k++)
 							sec[k] = bs.read_byte((req + u32(k)) & 0xffffff);
-						m_hd[unit]->img_write(u64(hpsec) * 1024, sec.data(), u32(sec.size()));
+						m_hd[unit]->img_write(u64(hpsec) * os_secsz, sec.data(), u32(sec.size()));
 					}
 					// 0x0b USED TO WRITE HERE.  It is SASI SEEK(6) and transfers nothing, so that
 					// copied whatever stale bytes were in the request buffer onto the platter at the
@@ -3862,6 +4181,15 @@ void multibus_storager_device::c800_w(offs_t offset, u16 data, u16 mem_mask)
 {
 	COMBINE_DATA(&m_c800[offset & 0xff]);
 
+	// cont.583: $8018 writes C800[0]=[$741e] AFTER stamping READY $40.  That is the moment to
+	// host-DMA the field just deposited (floppy: bit12 follows $8018).  Firing earlier races the
+	// drain against an unstamped slot.
+	if ((offset & 0xff) == 0 && m_rigid_dma_pending)
+	{
+		m_rigid_dma_pending = false;
+		rigid_host_payload(m_rigid_dma_src, m_rigid_dma_len);
+	}
+
 	// A held first field flushes as soon as the firmware arms a chunk: the arm is what gives it a
 	// destination, and until then it has none. (cont.437)
 	if ((offset & 0xff) == 0 && m_held_len)
@@ -4045,6 +4373,46 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 		u32 const wb = m_node_base ? m_node_base : 0x71f0;
 		m_blocks_left = (int(wn.read_byte((wb + 0x0a) & 0xffff)) << 8)
 		              | int(wn.read_byte((wb + 0x0b) & 0xffff));
+		// cont.578/580: capture the host data buffer from the IOPB for rigid autonomous payload DMA.
+		// Firmware never reloads C000 for rigid data; the GA must seed and re-seed here every GO.
+		// IOPB [0x0d-0x0f] = 24-bit BE buffer; [0x0a-0x0b] = BE16 sector count.
+		m_cmd_buf = (u32(wn.read_byte((wb + 0x0d) & 0xffff)) << 16)
+		          | (u32(wn.read_byte((wb + 0x0e) & 0xffff)) << 8)
+		          |  u32(wn.read_byte((wb + 0x0f) & 0xffff));
+		// Byte extent: count × sector size.  Rigid UIB secsz is 512; floppy native is 128/256.
+		// Prefer UIB+2/+3 when present, else 512 if rigid class, else 256 (MFM default).
+		u32 secsz = 256;
+		if (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
+		{
+			u8 const u12 = wn.read_byte((m_uib_base + 0x12) & 0xffff);
+			u16 const uss = wn.read_word((m_uib_base + 2) & 0xffff);
+			if ((u12 & 0x23) == 0x23 && uss >= 128 && uss <= 1024)
+				secsz = uss;
+			else if ((u12 & 0x23) == 0x23)
+				secsz = 512;
+			else if (uss == 128 || uss == 256)
+				secsz = uss;
+		}
+		u32 const nsec = u32(m_blocks_left > 0 ? m_blocks_left : 1);
+		m_cmd_bytes = nsec * secsz;
+		m_host_dma_n = 0;
+		m_data_chunks = 0;
+		// cont.581: payload cursor is device-side, not C000.  Firmware IOPB traffic owns C000
+		// (always 0fe780 on rigid bit12); the floppy path gets a separate C000 write to the data
+		// buffer before each data kick — rigid has no equivalent.  Seed m_rigid_host only.
+		if (m_cmd_buf != 0 && m_cmd_buf < 0xff0000)
+		{
+			m_rigid_host = m_cmd_buf;
+			m_rigid_host_valid = true;
+		}
+		else
+			m_rigid_host_valid = false;
+		// One-shot hunt seed for this command (consumed on the next first_arm).
+		m_hunt_from_req = true;
+		m_rigid_dma_pending = false;
+		logerror("HOST GO buffer=%06x bytes=%u (nsec=%u secsz=%u) rigid_host seed=%06x "
+			"(c000 left to IOPB) t=%.5f\n",
+			m_cmd_buf, m_cmd_bytes, nsec, secsz, m_rigid_host, machine().time().as_double());
 		m_walk_head = m_sel_head & 1;
 		m_cmd_cyl = 0xffff;   // sequential: no cylinder gate (already on-cylinder by retention)
 		// AN ADDRESSED READ STARTS AT THE SECTOR IT ASKED FOR.  A controller reads in natural
