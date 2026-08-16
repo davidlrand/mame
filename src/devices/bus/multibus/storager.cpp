@@ -1153,7 +1153,18 @@ void multibus_storager_device::capture_track()
 	// (cont.573): without this a rigid cmd=95 loads its field program, arms the $201C/#$32
 	// watchdog at $7B1C, and then starves - zero IRQ5, zero IRQ6, m_track_n=0 - because this
 	// function returned empty before doing anything.  Same consumer, different producer.
-	if ((m_sel_drive & 0xe0) != 0xc0)
+	// BRANCH ON UNIT CLASS, NOT ON "NOT THE FLOPPY SELECT".  MEASURED (cont.584): the boot ROM's
+	// own floppy reads run with sel=$78, which masks to $60 - so a `!= 0xc0` test calls them rigid,
+	// bypasses the flux capture, and the class gate inside then skips.  m_track_n stays 0 and the
+	// FLOPPY CANNOT BOOT (zero `capture_track: cyl=` lines in a whole install run).  The class is
+	// UIB+$12 & $23 == $23 ($6CE4) - ask it here, and let everything else reach the flux path.
+	bool rigid_class = false;
+	if (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
+	{
+		address_space &ccs = m_cpu->space(AS_PROGRAM);
+		rigid_class = ((ccs.read_byte((m_uib_base + 0x12) & 0xffff) & 0x23) == 0x23);
+	}
+	if (rigid_class)
 	{
 		if (!capture_track_rigid())
 		{
@@ -1691,7 +1702,13 @@ void multibus_storager_device::stage_record(captured_sector const &s)
 	// That layout was written for the floppy in cont.448 and correctly REVERTED in cont.449 because
 	// the floppy's live POSPTRs ($2CF2) say C=+4 H=+5 R=+6.  It was never wrong - it is the RIGID
 	// layout, and $2DB4 is the rigid POSPTR init.  Cylinder is two bytes here, high at +5.
-	if (!fm && (m_sel_drive & 0xe0) != 0xc0)
+	// Same class test as capture_track() - NOT the drive select.  cont.584: a floppy read runs with
+	// sel=$78 ($60 masked), so a `!= 0xc0` test hands the RIGID ten-byte layout to MFM floppy
+	// records and the head compare answers $202A.
+	bool stage_rigid = false;
+	if (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
+		stage_rigid = ((cs.read_byte((m_uib_base + 0x12) & 0xffff) & 0x23) == 0x23);
+	if (!fm && stage_rigid)
 	{
 		cs.write_byte((dst + 0) & 0xffff, 0xa1);
 		cs.write_byte((dst + 1) & 0xffff, 0xa1);
@@ -5185,19 +5202,38 @@ void multibus_storager_device::device_reset()
 				logerror("FWSTAT node+2 <= %04x mask=%04x  t=%.5f\n",
 					data & 0xffff, mem_mask & 0xffff, machine().time().as_double());
 			});
-		if (TRACE_CHUNK_PATH)
+		// cont.584: [$741c] clear/set census.  After N correct rigid DELIVs, BOUND still shows
+		// [$741c]=1 and the command posts 82/$1C.  EXTRA and DMA-order cuts did not clear it.
+		// Hit-count the writer sites on floppy (closes) vs rigid (does not): clear writers are
+		// $7CA4, $7ED8, $85E6, $8A88, $9318/$934E; set writers include $7B06/$7F14 (arm).
+		// Gated on TRACE_ESDI so the install run produces the table without TRACE_CHUNK_PATH.
+		if (TRACE_ESDI || TRACE_CHUNK_PATH)
 			cs.install_write_tap(0x741c, 0x741d, "accept_reject",
 			[this](offs_t, u16 &data, u16 mem_mask)
 			{
-				floppy_image_device *const fd = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
-				// THE WRITER PC, NOT THE VALUE.  Six sites write #$1 to [$741c] - $79F6, $7B06,
-				// $7D5C, $7F14, $84AA, $8664 - and only $7D5C is the record-reject path.  Labelling
-				// a non-zero write "REJECT" conflated all six and mis-aimed the whole end-of-command
-				// story.  $8282 only cares about the value, but WE need the site to know what left
-				// it set.
-				logerror("DECIDE %-6s [741c]<=%04x pc=%06x  r=%02x presented=%u  cyl=%d head=%u\n",
-					(data & 0xffff) ? "set" : "clear", data & 0xffff, m_cpu->pcbase() & 0xffffff,
-					m_last_r, m_last_presented, fd ? fd->get_cyl() : -1, m_sel_head & 1);
+				if (mem_mask == 0)
+					return;
+				u32 const pc = m_cpu->pcbase() & 0xffffff;
+				u16 const v = data & 0xffff;
+				// Map PC to the known ROM sites (pcbase can sit a few bytes into the insn).
+				char const *site = "other";
+				if (pc >= 0x7ca0 && pc <= 0x7cb0) site = "$7CA4";
+				else if (pc >= 0x7ed4 && pc <= 0x7ee0) site = "$7ED8";
+				else if (pc >= 0x85e2 && pc <= 0x85f0) site = "$85E6";
+				else if (pc >= 0x8a84 && pc <= 0x8a90) site = "$8A88";
+				else if (pc >= 0x9314 && pc <= 0x9320) site = "$9318";
+				else if (pc >= 0x934a && pc <= 0x9356) site = "$934E";
+				else if (pc >= 0x7c04 && pc <= 0x7c10) site = "$7C08";
+				else if (pc >= 0x7b02 && pc <= 0x7b10) site = "$7B06";
+				else if (pc >= 0x7f10 && pc <= 0x7f1c) site = "$7F14";
+				else if (pc >= 0x7d58 && pc <= 0x7d64) site = "$7D5C";
+				else if (pc >= 0x79f2 && pc <= 0x79fc) site = "$79F6";
+				else if (pc >= 0x84a6 && pc <= 0x84b0) site = "$84AA";
+				else if (pc >= 0x8660 && pc <= 0x866a) site = "$8664";
+				logerror("LATCH741c %-5s <=%04x site=%-6s pc=%06x cmd=%02x rigid=%d r=%02x "
+					"recs=%d/%d t=%.5f\n",
+					v ? "set" : "clear", v, site, pc, m_iopb_cmd, m_rigid_track ? 1 : 0,
+					m_last_r, m_cmd_records, m_sec_count, machine().time().as_double());
 			});
 		// cont.491: FRESH UNFILTERED tap on the stride table.  Do NOT reuse "accept_count" below -
 		// it carries three filters from a retired question, EACH of which would silence this one:
