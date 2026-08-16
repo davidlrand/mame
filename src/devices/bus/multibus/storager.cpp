@@ -593,6 +593,9 @@ private:
 	u8  m_last_r = 0, m_last_presented = 0;   // identity of the record being decided (cont.460)
 	u32 m_data_chunks = 0;       // data chunks delivered in the current command (LABEL_BODY_SKIP)
 	u8  m_iopb_cmd = 0;          // command byte from the auto-fetched IOPB (drives the model's channel)
+	// IOPB[4] unit, latched at GO.  GATEARRAY-READ-SPEC: 0/1 = ESDI rigid, 2/3 = floppy.
+	// Producer selection uses this — NOT UIB+$12 & $23 ($6CE4 is restore/positioning, not producer).
+	u8  m_cmd_unit = 0;
 	std::unique_ptr<u16[]> m_lram;   // SRAM_BYTE_SWAPPED backing store
 	u16 lram_r(offs_t offset, u16 mem_mask);
 	void lram_w(offs_t offset, u16 data, u16 mem_mask);
@@ -1063,19 +1066,17 @@ bool multibus_storager_device::write_sector(u8 want_r, const u8 *src, u32 len)
 // SEEK arrive over $A118 and are recorded by the serial engine, so m_esdi_cyl/m_esdi_head are the
 // drive's own idea of where it is.
 //
-// Sector size is the drive's own declaration at UIB+2/+3 (cont.576: 0x0200 = 512), not the
-// inherited 1024 assumption.  Field split is NOT decided here: [$7996] is written later during
-// transfer setup (cont.577 / cont.523 shape), so capture only stages secsz bytes and sets
-// m_rigid_track; delivery samples [$7996] and slices.  Geometry: UIB +0 heads, +1 spt; refuse
-// if UIB+$12 is not rigid class ($6ce4).
+// Sector size is the drive's own declaration at UIB+2/+3 (live: label $37 → 512, post-label
+// $06 → 1024).  Field split is NOT decided here: [$7996] is written later during transfer setup
+// (cont.577 / cont.523 shape), so capture only stages secsz bytes and sets m_rigid_track;
+// delivery samples [$7996] and slices.  Geometry: UIB +0 heads, +1 spt.  Producer reachability
+// is by IOPB unit (0/1), not by UIB+$12 class — $6CE4 & $23==$23 is the restore fork.
 bool multibus_storager_device::capture_track_rigid()
 {
 	m_track_n = 0;
-	// Drive select carries the unit in bits 5-7 ($60 = unit 0, $c0 = the floppy).  Only unit 0 is
-	// wired to -hard1 today; fall back to whichever image exists rather than presenting nothing.
-	// Note: sel can change between capture and delivery (measured sel=78 vs sel=1d) — another
-	// reason transfer parameters must not freeze here.
-	int unit = ((m_sel_drive & 0xe0) == 0x60) ? 0 : 1;
+	// Image unit from the command IOPB (m_cmd_unit), with select/exists fallback for the
+	// pre-GO settle window and for a missing second HD.  Only unit 0 is wired to -hard1 today.
+	int unit = (m_cmd_unit < 2) ? int(m_cmd_unit) : 0;
 	if (!m_hd[unit] || !m_hd[unit]->exists())
 		unit = (m_hd[0] && m_hd[0]->exists()) ? 0 : 1;
 	if (!m_hd[unit] || !m_hd[unit]->exists())
@@ -1089,26 +1090,16 @@ bool multibus_storager_device::capture_track_rigid()
 	u32 uib = cs.read_word(0x799a) & 0xffff;
 	if (uib < 0x4000 || uib >= 0x8000)
 		uib = m_uib_base;
-	// Class gate: firmware's own rigid test is UIB+$12 & $23 == $23 ($6ce4).  Skip while the
-	// current UIB is still the floppy class so we do not present HD image sectors under floppy
-	// spt/heads.  The later command that has loaded $6c00 will capture.
+	// UIB+$12 supplies parameters (bit1 = 0-based IDs, bit2 = density/size), not producer
+	// selection.  Class $37 (label: 12 heads × 34 spt × 512 B) and class $06 (post-label:
+	// 8 × 9 × 1024 B) are the same rigid transport with different host-declared geometry —
+	// measured: identical field-program port00 boundaries, same E000 words 1–3.
 	u8 const u12 = (uib >= 0x4000 && uib < 0x8000) ? cs.read_byte((uib + 0x12) & 0xffff) : 0;
-	if ((u12 & 0x23) != 0x23)
-	{
-		// cont.582/586: drop latch AND capture so leftovers cannot free-run under floppy layout.
-		clear_rigid_track_capture();
-		logerror("capture_track_rigid: UIB+$12=%02x not rigid class (need &23==23) uib=%04x "
-			"sel=%02x m_uib_base=%04x - skip t=%.5f\n",
-			u12, uib, m_sel_drive, m_uib_base, machine().time().as_double());
-		return false;
-	}
 	// +0 / +1 = heads / spt for the LBA path: ESTABLISHED at $0ffe (mulu heads) and $90ea/$9102
 	// (divu spt), and at $7362 (spt into the per-track remainder).  +0 changing 12→8 at $6c00 in
-	// one command window is a LIVE UIB rewrite (host/firmware), not proof the field is something
-	// else — both 8 and 12 appear as real geometries in the install path.
-	// +2/+3 = sector size in bytes (BE word).  MEASURED cont.576 at UIB $6c00: 0x0200 = 512.
-	// That supersedes the 1024 assumption.  Chunks/sector are NOT frozen here — they come from
-	// size / [$7996] at delivery (cont.577).
+	// one command window is a LIVE UIB rewrite (host INIT after label read), not a foreign mode.
+	// +2/+3 = sector size in bytes (BE word).  Live: 0x0200 under $37, 0x0400 under $06.
+	// Chunks/sector are NOT frozen here — they come from size / [$7996] at delivery (cont.577).
 	u32 heads = 0, spt = 0, secsz = 512;
 	if (uib >= 0x4000 && uib < 0x8000)
 	{
@@ -1123,8 +1114,8 @@ bool multibus_storager_device::capture_track_rigid()
 	// (cont.577 regression).  Log the raw cell only as a diagnostic of the ordering trap.
 	u16 const raw_7996 = cs.read_word(0x7996);
 	logerror("RIGIDGEO uib=%04x m_uib_base=%04x +0=%u +1=%u +2/+3=%u +12=%02x "
-		"[$7996]=%04x(not used at capture) sel=%02x t=%.5f\n",
-		uib, m_uib_base, heads, spt, secsz, u12, raw_7996, m_sel_drive,
+		"[$7996]=%04x(not used at capture) unit=%u sel=%02x t=%.5f\n",
+		uib, m_uib_base, heads, spt, secsz, u12, raw_7996, m_cmd_unit, m_sel_drive,
 		machine().time().as_double());
 	if (heads == 0 || spt == 0)
 	{
@@ -1183,23 +1174,18 @@ void multibus_storager_device::capture_track()
 	m_track_n = 0;
 	// RIGID UNITS HAVE NO FLUX.  Everything below this point is a PLL decode of a floppy
 	// revolution, which is meaningless for an ESDI drive - the gate array deserialises that
-	// channel itself and the image is flat sectors.  Route by drive select, the same demux the
-	// E802 bit0 clock/STEP split and the F000 bit1/bit5 composition already use.  MEASURED
-	// (cont.573): without this a rigid cmd=95 loads its field program, arms the $201C/#$32
-	// watchdog at $7B1C, and then starves - zero IRQ5, zero IRQ6, m_track_n=0 - because this
-	// function returned empty before doing anything.  Same consumer, different producer.
-	// BRANCH ON UNIT CLASS, NOT ON "NOT THE FLOPPY SELECT".  MEASURED (cont.584): the boot ROM's
-	// own floppy reads run with sel=$78, which masks to $60 - so a `!= 0xc0` test calls them rigid,
-	// bypasses the flux capture, and the class gate inside then skips.  m_track_n stays 0 and the
-	// FLOPPY CANNOT BOOT (zero `capture_track: cyl=` lines in a whole install run).  The class is
-	// UIB+$12 & $23 == $23 ($6CE4) - ask it here, and let everything else reach the flux path.
-	bool rigid_class = false;
-	if (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
-	{
-		address_space &ccs = m_cpu->space(AS_PROGRAM);
-		rigid_class = ((ccs.read_byte((m_uib_base + 0x12) & 0xffff) & 0x23) == 0x23);
-	}
-	if (rigid_class)
+	// channel itself and the image is flat sectors.  Same consumer, different producer.
+	//
+	// PRODUCER BY IOPB UNIT (GATEARRAY-READ-SPEC): 0/1 → ESDI rigid, 2/3 → floppy flux.
+	// Measured mis-attribution: UIB+$12 & $23 == $23 is $6CE4's restore/positioning fork, not
+	// producer selection.  Class $06 (post-label geometry 8×9×1024) fails that mask but is the
+	// same physical field program as the $37 label read — only the chunk/port bank differs.
+	// Branching here on that mask left unit-0 $06 reads with m_track_n=0 and $201C.
+	//
+	// Prior attempt (drive select != $c0) also failed: boot ROM floppy reads run with sel=$78
+	// (masks to $60), so they looked rigid, the class gate skipped, and floppy boot starved.
+	// Unit from IOPB[4] (latched at GO as m_cmd_unit) is the correct demux.
+	if (m_cmd_unit < 2)
 	{
 		if (!capture_track_rigid())
 			clear_rigid_track_capture();
@@ -4481,6 +4467,9 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 	address_space &bs = m_bus->space(AS_PROGRAM);
 	cs.write_word(0x7b20, dst);
 	m_iopb_cmd = cs.read_byte(dst);
+	// Unit for producer selection (0/1 rigid, 2/3 floppy).  IOPB[4] on the firmware envelope;
+	// OS-driver path maps dev[1]>>5 into the same byte before GO.
+	m_cmd_unit = cs.read_byte((dst + 4) & 0xffff) & 0x03;
 	// TEMP cont.432: the IOPB->node copy is a model<->SRAM byte boundary the rule never enumerated.
 	// cs.write_byte goes through the swapped mapping, bs.read_byte does not, so node WORD reads see
 	// swapped halves while node BYTE reads round-trip correctly.  Check the $5FC0 guard's inputs
@@ -4504,7 +4493,8 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 			? "*** BOTH ZERO - $5FC0 WOULD BAIL ***" : "passes",
 		cs.read_word((dst + 0x20) & 0xffff),
 		BIT(cs.read_word((dst + 0x20) & 0xffff), 14));
-	logerror("HOST GO: cmd=%02x iopb=%06x t=%.5f\n", m_iopb_cmd, dbi, machine().time().as_double());
+	logerror("HOST GO: cmd=%02x unit=%u iopb=%06x t=%.5f\n", m_iopb_cmd, m_cmd_unit, dbi,
+		machine().time().as_double());
 	// cont.526: seed the linear walk ONCE PER COMMAND.  Total from the NODE count ([$7abc] is the
 	// per-track remainder and cannot bound a multi-track run); head from the firmware's select.
 	if (m_iopb_cmd == 0x95)
@@ -4519,18 +4509,14 @@ void multibus_storager_device::go_submit(u32 dst, u32 dbi)
 		m_cmd_buf = (u32(wn.read_byte((wb + 0x0d) & 0xffff)) << 16)
 		          | (u32(wn.read_byte((wb + 0x0e) & 0xffff)) << 8)
 		          |  u32(wn.read_byte((wb + 0x0f) & 0xffff));
-		// Byte extent: count × sector size.  Rigid UIB secsz is 512; floppy native is 128/256.
-		// Prefer UIB+2/+3 when present, else 512 if rigid class, else 256 (MFM default).
-		u32 secsz = 256;
+		// Byte extent: count × sector size from the live UIB.  Post-label host INIT rewrites
+		// geometry ($37: 512 B → $06: 1024 B); do not gate on UIB+$12 class — unit selects the
+		// producer, UIB+2/+3 is the size.  Defaults: rigid 512, floppy 256 when UIB is absent.
+		u32 secsz = (m_cmd_unit < 2) ? 512 : 256;
 		if (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
 		{
-			u8 const u12 = wn.read_byte((m_uib_base + 0x12) & 0xffff);
 			u16 const uss = wn.read_word((m_uib_base + 2) & 0xffff);
-			if ((u12 & 0x23) == 0x23 && uss >= 128 && uss <= 1024)
-				secsz = uss;
-			else if ((u12 & 0x23) == 0x23)
-				secsz = 512;
-			else if (uss == 128 || uss == 256)
+			if (uss >= 128 && uss <= 1024)
 				secsz = uss;
 		}
 		u32 const nsec = u32(m_blocks_left > 0 ? m_blocks_left : 1);
@@ -5782,6 +5768,7 @@ void multibus_storager_device::device_reset()
 	m_mark_pending = 0;
 	m_sel_head = 0;
 	m_sel_drive = 0;
+	m_cmd_unit = 0;
 	m_prog_loaded = false;
 	m_desc_n = 0;
 	m_pit2_out = false;
