@@ -343,10 +343,9 @@ constexpr bool OS_C0_STATUS_FILL = true;
 constexpr bool WRSEC_SELFTEST = false;
 // Extra trailing record (refuted for latch clear).
 
-// --- Trace (default OFF except install-oriented ST-506 rigid) -----------------------------
-// Per-record probes STRIP before upstream; dma_snoop is functional not TRACE_*.
+// --- Trace (default OFF).  dma_snoop is functional, not TRACE_*.
 constexpr bool TRACE_CHUNK_PATH = false;
-constexpr bool TRACE_ESDI       = true;   // clamp / ST-506 rigid-disk ops (name is historical)
+constexpr bool TRACE_ESDI       = false;
 constexpr bool TRACE_GAWRITE    = false;
 constexpr bool TRACE_ARM        = false;
 constexpr bool TRACE_HOSTCMD    = false;
@@ -535,14 +534,7 @@ private:
 	mutable int  m_med_dens_cyl = -1;
 	mutable int  m_med_dens_head = -1;
 	int  m_data_done_n = 0;      // data fields delivered this command (arms the completion deposit)
-	int  m_accepted_n = 0;        // sectors the firmware has ACCEPTED (ledger $c0 stakes observed)
-	int  m_prog_count = 0;        // Q3b: sectors the op18 program commands (its port-$3F push count)
-	u32  m_aa_cell = 0;           // Q3b: ledger cell for the end marker (first stake + count)
-	bool m_aa_armed = false;      // Q3b: bootstrap strobe seen, deposit owed
-	bool m_aa_done = false;       // Q3b: deposited this command
-	u32  m_aa_last = 0;           // Q3b: last cell written, so each is deposited once
-	int  m_aa_n = 0;              // Q3b: log cap
-	bool m_status_armed = false; // all commanded sectors captured - completion byte owed at node+$26
+	int  m_accepted_n = 0;        // TRACE_CHUNK_PATH: ledger $c0 stakes observed
 	bool m_timer_out = false;    // PIT1 ctr0 OUT -> F000 bit11
 	// Family ESDI serial command/status (JP14/JP15; MX300).  Spec: $A118 send / $A1CE receive.
 	// PC-MX2 Winchester is ST-506 MFM and does not use this as the data path.  E802 bit0 = clock
@@ -1484,28 +1476,6 @@ bool multibus_storager_device::capture_track_rigid()
 void multibus_storager_device::capture_track()
 {
 	m_track_n = 0;
-	// TEMP (STRIP): what does the FLOPPY capture actually resolve?  The post-confirmation read
-	// returns m_track_n=0 while the identical boot-time read returns 9; compare the two.
-	{
-		address_space &dbg = m_cpu->space(AS_PROGRAM);
-		u32 const a799a = dbg.read_word(0x799a) & 0xffff;
-		u32 ruib = a799a;
-		if (ruib < 0x4000 || ruib >= 0x8000) ruib = m_uib_base;
-		std::string ub;
-		if (ruib >= 0x4000 && ruib < 0x8000)
-			for (u32 k = 0; k < 0x14; k++)
-				ub += util::string_format(" %02x", dbg.read_byte((ruib + k) & 0xffff));
-		u16 const pca = (ruib >= 0x4000 && ruib < 0x8000) ? dbg.read_word((ruib + 0xca) & 0xffff) : 0;
-		u16 const pcc = (ruib >= 0x4000 && ruib < 0x8000) ? dbg.read_word((ruib + 0xcc) & 0xffff) : 0;
-		u16 const pce = (ruib >= 0x4000 && ruib < 0x8000) ? dbg.read_word((ruib + 0xce) & 0xffff) : 0;
-		logerror("CAPFLOP UIB[%04x] +0..13:%s\n", ruib, ub);
-		logerror("CAPFLOP in: 799a=%04x m_uib_base=%04x -> uib=%04x +12=%02x fm=%d "
-			"sel_drive=%02x sel_head=%u unit=%u POSPTR C=%04x H=%04x R=%04x t=%.5f\n",
-			a799a, m_uib_base, ruib,
-			(ruib >= 0x4000 && ruib < 0x8000) ? dbg.read_byte((ruib + 0x12) & 0xffff) : 0xff,
-			flux_density_fm() ? 1 : 0, m_sel_drive, m_sel_head, m_cmd_unit,
-			pca, pcc, pce, machine().time().as_double());
-	}
 	// The gap-derived phase split belongs to the RIGID medium's documented format.  Clear it here
 	// so a stale rigid cell size cannot leak into floppy field timing on a mixed workload - the
 	// install exercises both producers in one run.
@@ -1529,25 +1499,6 @@ void multibus_storager_device::capture_track()
 	{
 		if (!capture_track_rigid())
 			clear_rigid_track_capture();
-		// cont.584: the LEDGER dump below lived only on the flux path, so rigid early-return
-		// produced a false "0 ledger lines" reading.  Snapshot here too when the rigid producer
-		// armed - want-list / $AA plant are live on this path; the open question is termination.
-		if (TRACE_ESDI && m_rigid_track)
-		{
-			address_space &lc = m_cpu->space(AS_PROGRAM);
-			char w[400]; w[0] = 0; int wn = 0; int pos = 0;
-			for (u32 k = 0x7654; k <= 0x76bf; k++)
-			{
-				u8 const v = lc.read_byte(k);
-				if ((v == 0xaa || v == 0xff || v == 0xfe) && wn < 28)
-				{
-					pos += sprintf(w + pos, "%u:%02x ", k - 0x7654, v);
-					wn++;
-				}
-			}
-			logerror("LEDGER $7654..$76BF (rigid arm): %d special cell(s) [pos:byte]: %s\n",
-				wn, wn ? w : "(none)");
-		}
 		return;
 	}
 	// floppy: flux path; host DMA is firmware E800 bit12 kicks.  cont.586: drop any prior
@@ -1638,93 +1589,8 @@ void multibus_storager_device::capture_track()
 		}
 		state = 0;
 	}
-	// TEMP cont.439: the MFM path is exercised for the first time (media is mixed - cyl 0 is 300k FM
-	// 16x128, cyl 1+ are 300k MFM 16x256).  Report what the gate array actually decoded.
-	// TEMP cont.440: content check - dump sector R=1's first 8 bytes so the decode can be compared
-	// against the media (cyl 69 head 0 R=1 is 000000907c4e18a6 in the IMD).
-	for (int i = 0; i < m_track_n; i++)
-		if (m_track[i].r == 1)
-		{
-			logerror("  R=1 first8: %02x%02x%02x%02x%02x%02x%02x%02x  (len=%d)\n",
-				m_track[i].data[0], m_track[i].data[1], m_track[i].data[2], m_track[i].data[3],
-				m_track[i].data[4], m_track[i].data[5], m_track[i].data[6], m_track[i].data[7],
-				m_track[i].len);
-			break;
-		}
-	// TEMP cont.442: is the head where the operation TARGETS?  [$7438] is the firmware's expected
-	// cylinder and [$7436] its expected head - the values the record verify compares against
-	// ($7C52-$7C66 and $7C40-$7C46).  Compare them against the drive's actual position.
-	{
-		address_space &cs4 = m_cpu->space(AS_PROGRAM);
-		floppy_image_device *const f4 = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
-		int const act = f4 ? f4->get_cyl() : -1;
-		int const wantc = cs4.read_word(0x7438) & 0xff;
-		int const wanth = cs4.read_word(0x7436) & 0xff;
-		logerror("  SEEK CHECK: firmware wants cyl=%d head=%d | drive at cyl=%d head=%d | %s\n",
-			wantc, wanth, act, m_sel_head,
-			(act == wantc) ? "MATCH" : "*** MISMATCH - head not where the operation targets ***");
-	}
-	// RETIRED (cont.560): the three outcomes below were decided by a dump that only ever looked for
-	// $FF, so it reported "(none)" unconditionally and outcome three - "the firmware never built a
-	// want-list" - was a FALSE EMPTY, not a measurement.  The ledger is populated: $AA end sentinel,
-	// $FE/$FF special, $C0 fill.  What the ledger actually drives is the PRE-ARM fork at $7E9A/$7ED0:
-	// the first special byte at or after R+1 is $AA -> $7ED8 clears [$741c] and no chunk is armed;
-	// anything else -> $7EE0 pops a chunk ($32AC), installs it at [$741e] and $7F14 sets [$741c]=1.
-	// That is an allocation for the NEXT record, not a verdict on the last one.  Kept only as a
-	// record of how the wrong instrument produced a confident wrong conclusion.
-	// cont.459: dump the WANT-LIST LEDGER ($7654..$76BF) before any record is delivered.  Acceptance
-	// is a ledger lookup ($ff = wanted at that position), NOT an arithmetic compare - which is why an
-	// uncapped grep found only head/cylinder compares and no sector compare at all.  Three outcomes:
-	//   wants at positions 1..4    -> identity is right; the linear index DOUBLE-COUNTS the cylinder
-	//                                 (the firmware already applies its own base), revert it
-	//   wants at positions 33..36  -> linear is right; the defect is the off-by-one arm window
-	//   NO wants marked at all     -> the firmware never built a want-list; BOTH index schemes are
-	//                                 untested and the defect is upstream of the presented identity
-	// cont.463: STATE IN FORCE AT THE POINT OF USE, not an event somewhere upstream.  "Did a program
-	// load or $023F wipe happen between READ #1 and READ #3" is an event probe with a hidden third
-	// outcome - a load occurs and loads the WRONG thing.  Snapshotting the state when the read arms
-	// distinguishes three: no reload (retention defect), reload carrying FM parameters (a different
-	// defect in the same family), or correct MFM state (retention exonerated).  Event probes miss by
-	// sampling window or by firing upstream; a state read at the moment of use has no window to miss.
-	{
-		address_space &sc = m_cpu->space(AS_PROGRAM);
-		u8 const u_heads = (m_uib_base >= 0x4000 && m_uib_base < 0x8000) ? sc.read_byte(m_uib_base + 0) : 0xff;
-		u8 const u_spt   = (m_uib_base >= 0x4000 && m_uib_base < 0x8000) ? sc.read_byte(m_uib_base + 1) : 0xff;
-		u16 const u_bps  = (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
-			? u16((sc.read_byte(m_uib_base + 2) << 8) | sc.read_byte(m_uib_base + 3)) : 0xffff;
-		u8 const u_sec0  = (m_uib_base >= 0x4000 && m_uib_base < 0x8000) ? sc.read_byte(m_uib_base + 4) : 0xff;
-		u8 const u_d12   = (m_uib_base >= 0x4000 && m_uib_base < 0x8000) ? sc.read_byte(m_uib_base + 0x12) : 0xff;
-		logerror("STATE@ARM: prog_loaded=%d loading=%d id[$793c]=%04x prev[$793e]=%04x"
-			"  | UIB@%04x heads=%u spt=%u bps=%u sec0=%02x +12=%02x  | model density=%s\n",
-			m_prog_loaded ? 1 : 0, m_prog_loading ? 1 : 0,
-			sc.read_word(0x793c), sc.read_word(0x793e),
-			m_uib_base, u_heads, u_spt, u_bps, u_sec0, u_d12,
-			flux_density_fm() ? "FM" : "MFM");
-	}
-	{
-		// THE LEDGER HAS FOUR CODEPOINTS, NOT ONE.  The scan the firmware actually runs is $7E6C:
-		//     addq.w #1,D0
-		//     cmpi.b #$AA,(A0,D0.w) beq $7E8A     end-of-track sentinel
-		//     cmpi.b #$FF,(A0,D0.w) beq $7E86     special
-		//     cmpi.b #$FE,(A0,D0.w) bne $7E6C     special; anything else is SKIPPED
-		// so $AA / $FF / $FE are all live and everything else ($C0 fill from the $09F8 init) is
-		// stepped over.  Reporting only $FF made this dump answer "(none)" on every command of
-		// every run while the ledger was populated with $FE and $AA - a FALSE EMPTY, which is what
-		// the retired "the firmware never built a want-list" conclusion rested on.  $FF is a real
-		// codepoint ($7D2C, $178E); the dump was incomplete, not aimed at a fiction.
-		address_space &lc = m_cpu->space(AS_PROGRAM);
-		char w[400]; w[0] = 0; int wn = 0; int pos = 0;
-		for (u32 k = 0x7654; k <= 0x76bf; k++)
-		{
-			u8 const v = lc.read_byte(k);
-			if ((v == 0xaa || v == 0xff || v == 0xfe) && wn < 28)
-			{
-				pos += sprintf(w + pos, "%u:%02x ", k - 0x7654, v);
-				wn++;
-			}
-		}
-		logerror("LEDGER $7654..$76BF: %d special cell(s) [pos:byte]: %s\n", wn, wn ? w : "(none)");
-	}
+	// Ledger / SEEK-CHECK / R=1 / STATE@ARM dumps were campaign census (STRIP).  The want-list is
+	// firmware SRAM; the GA does not read it.  Lua under docs/storager-lle/ covers the same sites.
 	if (WRSEC_SELFTEST && m_wrsec_phase == 0 && m_track_n > 0 && !flux_density_fm())
 	{
 		m_wrsec_r = m_track[0].r;
@@ -1849,7 +1715,6 @@ void multibus_storager_device::start_field_program()
 		for (int i = 0; i < m_desc_n; i++)
 			if (m_desc_port[i] == 0x3f)
 				p3f++;
-		m_prog_count = p3f;
 		// WHERE DOES A WRITE ENCODE ITS COUNT?  ANSWERED: exactly where a read does.  The count is
 		// pushes of C800 port $3F (captured in c800_w, framed by E800 bit7), and a write pushes
 		// SIXTEEN of them - same as a read.  The count was never the problem.
@@ -1961,10 +1826,8 @@ void multibus_storager_device::start_field_program()
 		// per-COMMAND state.  NOTE: start_field_program is re-entered on EVERY record (the ISR
 		// re-issues the program's first command, E000 <= $0a6d, bit11 set), so anything that must
 		// happen once per read belongs in this block, never above it.
-		m_aa_cell = 0; m_aa_armed = false; m_aa_done = false;
-		m_accepted_n = 0; m_aa_last = 0; m_aa_n = 0;
+		m_accepted_n = 0;
 		int n = m_cpu->space(AS_PROGRAM).read_word(0x7abc) & 0xff;   // commanded sectors this track [$7abc]
-		logerror("7ABC-READ n=%d m_track_n=%d t=%.5f\n", n, m_track_n, machine().time().as_double());
 		if (n < 1 || n > m_track_n) n = m_track_n;
 		m_sec_count = n;
 		// cont.526: the walk is seeded at HOST GO, NOT here.  This block is re-entered whenever
@@ -2551,7 +2414,6 @@ void multibus_storager_device::advance_read()
 			// the event that path waits on, not invent a channel-done.
 			if (m_wr_final_pending)
 			{
-				m_status_armed = true;
 				m_wr_complete = true;
 				m_wr_final_pending = false;
 				m_write_active = false;
@@ -2577,7 +2439,6 @@ void multibus_storager_device::advance_read()
 			}
 			else if (m_wr_walked > m_track_n * 2)
 			{
-				m_status_armed = true;
 				m_wr_complete = true;
 				m_write_active = false;
 				logerror("WRWALKEND done=%d/%d walked=%d/%d reason=WALK-BOUND(model) t=%.5f\n",
@@ -3163,7 +3024,6 @@ void multibus_storager_device::advance_read()
 			// completes and posts 0x80 with neither deposit.  The old note here - "even when op42
 			// times out the host still never sees 0x80" - was measured through the inverted byte
 			// mapping and is FALSE; op42 completes in 0.5ms and the host sees 0x80.
-			m_status_armed = true;
 			logerror("GA count-exhaust n=%d t=%.4f\n",
 				m_data_done_n, machine().time().as_double());
 
@@ -3258,57 +3118,9 @@ TIMER_CALLBACK_MEMBER(multibus_storager_device::pump_tick)
 	deliver_mark();
 	if (m_read_window)
 		advance_read();
-	// Q3b: deposit the end marker once the firmware has signalled it bootstrapped.  Done HERE, from the
-	// device's own context: currently_executing() is not the local CPU, so the model's $4000-$7FFF snoop
-	// taps ignore it and m_term_bit0 / m_last_bw stay clean.  From the next record onward the firmware
-	// tests it at $7E9A (the [$7968]!=0 arm) and terminates via $7ED8.
-	if (false && m_aa_armed && m_aa_cell >= 0x7654 && m_aa_cell <= 0x76bf)
-	{
-		address_space &cs2 = m_cpu->space(AS_PROGRAM);
-		if (!m_aa_done)
-		{
-			cs2.write_byte(m_aa_cell & 0xffff, 0xaa);
-			m_aa_done = true;
-			m_aa_armed = false;
-			logerror("Q3D %10.1fus $AA -> [%04x] (bus-master) [7968]=%04x remain=%04x\n",
-				machine().time().as_double() * 1e6, m_aa_cell,
-				cs2.read_word(0x7968), cs2.read_word(0x7956));
-		}
-	}
-
 	// Intentionally NO firmware-RAM completion deposit here (see count-exhaust note above).
-	// Log once when count has exhausted and the walker has parked, so we can see the window
-	// without inventing the byte the watch pump supposedly needs.
-	// The phase byte is not a completion signal - it is the gate array's "service me" handshake.  The
-	// walker parks by writing the phase as a WORD ($15A0), which leaves $00 in the HIGH half, and the
-	// watch pump gates on a BYTE read of exactly that half ($162A).  Supply it at EVERY park while a
-	// capture is live, not once at the end: the pump is what dispatches $7964, whose $32AC query sets
-	// [$7968] ("a record is pending"), and [$7968] is what makes op4A DEFER its drain ($6EE2) instead
-	// of running it inline against an empty ledger.  The deferred drain then runs from the ISR once
-	// records exist, finds [$74b4] non-empty, and launches at $70F4 - no kick involved.
-	if (!SRAM_BYTE_SWAPPED && (m_status_armed || m_read_active))
-	{
-		u32 const node = m_node_base;
-		if (node >= 0x4000 && node + 0x26 < 0x8000)
-		{
-			address_space &cs = m_cpu->space(AS_PROGRAM);
-			if (cs.read_word((node + 0x26) & 0xffff) == 0x000a)
-			{
-				// The walker parks by writing the phase as a WORD ($15A0 move.w #$a,($26,A2)), which
-				// leaves $00 in the HIGH half - and the watch pump gates on a BYTE read of exactly that
-				// half ($162A cmpi.b #$a,($26,A1)).  No firmware path can set it, so the gate array
-				// must, after the park (the park would otherwise overwrite it).  Address derived from
-				// the D000 latch; written from device context, so it is a bus-master cycle the model's
-				// own $4000-$7FFF snoop ignores.
-				cs.write_byte((node + 0x26) & 0xffff, 0x0a);
-				bool const final = m_status_armed;
-				m_status_armed = false;
-				logerror("GA phase byte -> node+26 (%04x) node=%04x %s t=%.5f\n",
-					(node + 0x26) & 0xffff, node, final ? "(count exhausted)" : "(capture live)",
-					machine().time().as_double());
-			}
-		}
-	}
+	// SRAM_BYTE_SWAPPED is the real mapping: firmware word writes already put the phase byte
+	// where $162A reads it.  The old GA `write_byte` into node+26 is retired.
 	if (m_rigid_setup_live || (m_rigid_done_owed && m_mark_pending == 5))
 		m_pump->adjust(attotime::from_usec(10));
 	else
@@ -3450,20 +3262,6 @@ void multibus_storager_device::run_channel_dma()
 	if (!m_xfer_len && m_sec_index >= 0 && m_sec_index < m_track_n)
 		data_len = m_track[m_sec_index].len;
 	u32 const len = is_data ? data_len : (BIT(e800, 13) ? 0x18 : 0x20);   // node = 0x18, UIB = 0x20
-	// TEMP cont.447: is the transfer length coming from the wrong object?  m_track[0].len is sector
-	// INDEX 0 of the LAST capture - not the sector being moved (m_sec_index), and not any count the
-	// firmware programmed.  Compare against the sector actually in flight and the firmware's own
-	// commanded sizes ([$7460] -> PIT0 counter 1 at $4504-$4518, and [$7996], the chunk-table stride
-	// at $0ADC).
-	if (is_data)
-	{
-		address_space &cs5 = m_cpu->space(AS_PROGRAM);
-		int const si = (m_sec_index >= 0 && m_sec_index < m_track_n) ? m_sec_index : -1;
-		logerror("XFERLEN len=%u | track[0].len=%u | track[%d].len=%s | [$7460]=%04x [$7996]=%04x\n",
-			len, m_track[0].len, m_sec_index,
-			(si >= 0) ? std::to_string(m_track[si].len).c_str() : "n/a",
-			cs5.read_word(0x7460), cs5.read_word(0x7996));
-	}
 	// D000 is the GENERIC local-DMA address latch - it carries the node for one control block and the
 	// UIB for the next (both loaded at $3D42).  The class is what distinguishes them, so latch the UIB
 	// base here: it is where the operation-complete bit (UIB+$12 bit7) has to be deposited.
@@ -4154,33 +3952,6 @@ void multibus_storager_device::ch_w(offs_t offset, u16 data, u16 mem_mask)
 				return;
 			}
 			m_prog_loaded = true;      // a fresh load REPLACES a retained one
-			// TEMP cont.439: is DENSITY encoded in the field program?  The firmware never commands
-			// E800 bit10 (the model's density source) but does set node+$12 bit1 for MFM, and cont.428
-			// established this program describes the TRACK FORMAT.  Dump it per load and compare the
-			// FM (cyl 0) and MFM (cyl 1) programs.
-			{
-				char h[16 * 5 + 1]; h[0] = 0;
-				for (int k = 0; k < 16; k++)
-					sprintf(h + k * 5, "%04x ", m_prog[k]);
-				// Correlate against the CYLINDER, whose density is known independently from the media
-				// (IMD: cyl 0 = 300k FM 16x128, cyl 1+ = 300k MFM 16x256).  bit7 of every program word
-				// is the candidate discriminator; print its tally so the labelling is measured, not
-				// assumed.
-				int b7set = 0;
-				for (int k = 0; k < 16; k++)
-					if (BIT(m_prog[k], 7)) b7set++;
-				floppy_image_device *const fdd0 = m_floppy[0] ? m_floppy[0]->get_device() : nullptr;
-				address_space &cs3 = m_cpu->space(AS_PROGRAM);
-				u32 const uib = m_uib_base, nd2 = m_node_base;
-				logerror("  at load: node+12=%02x(bit1=%d)  UIB+12=%02x(bit1=%d)  E800=%04x(bit10=%d)\n",
-					cs3.read_byte((nd2 + 0x12) & 0xffff), BIT(cs3.read_byte((nd2 + 0x12) & 0xffff), 1),
-					cs3.read_byte((uib + 0x12) & 0xffff), BIT(cs3.read_byte((uib + 0x12) & 0xffff), 1),
-					m_ch[(0xe800 - 0xe000) / 2], BIT(m_ch[(0xe800 - 0xe000) / 2], 10));
-				logerror("PROGRAM cyl=%d (media says %s)  bit7 set in %d/16 words  cmd=%02x: %s\n",
-					fdd0 ? fdd0->get_cyl() : -1,
-					(fdd0 && fdd0->get_cyl() == 0) ? "FM" : "MFM",
-					b7set, m_iopb_cmd, h);
-			}
 			start_field_program();
 		}
 	}
@@ -4783,9 +4554,6 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 						is_xfer ? util::string_format("%u", hnsec).c_str() : "-",
 						req, (is_xfer && nsec_raw == 0) ? "  [count0->4]" : "",
 						machine().time().as_double());
-				logerror("ESDI op=%02x unit=%u psec=%u (byte %llu @1024) nsec=%u buf=%06x t=%.5f\n",
-					op, unit, hpsec, (unsigned long long)(u64(hpsec) * 1024), hnsec, req,
-					machine().time().as_double());
 				// DATA PHASE.  The gate array is the DMA engine: the firmware issues the ST-506
 				// command, the gate array moves the bytes.  On the floppy that means decoding flux;
 				// on the rigid disk the image IS the drive surface, so the transfer is a flat
@@ -4836,9 +4604,10 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 					// transfer here overwrites freshly-written sectors with stale request-buffer
 					// bytes)".  A format is precisely the workload that seeks between writes, so the
 					// damage landed behind the head on already-formatted ground.
-					logerror("ESDI   %s %u sec @%llu first8: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-						(op == 0x08) ? "read " : (op == 0x0a) ? "write" : (op == 0x0b) ? "seek " : "ctl  ", hnsec, (unsigned long long)(u64(hpsec) * 1024),
-						sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7]);
+					if (TRACE_ESDI)
+						logerror("ESDI   %s %u sec @%llu first8: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+							(op == 0x08) ? "read " : (op == 0x0a) ? "write" : (op == 0x0b) ? "seek " : "ctl  ", hnsec, (unsigned long long)(u64(hpsec) * 1024),
+							sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7]);
 				}
 				m_ioreg[1] = 0x00;
 				m_ioreg_done = true;
@@ -6497,30 +6266,6 @@ void multibus_storager_device::device_reset()
 		// early or late relative to.  Deferring to "after the program push" would NOT fix it - the
 		// read is already inside start_field_program(), which the reusing command does enter (that
 		// is why PROG n=0 prints); it simply enters it before the write.
-		// WHO SETS THE WRITE'S ERROR?  The sense byte reaches the host as node+3 via HOST POST.
-		// Tap the node status/error word and log the firmware PC that writes it, so 0x82/sense 0x29
-		// gets a call site instead of a guess.  Node is $71F0 in every observed command.
-		// WHICH $2029 SITE FIRES?  Two in the ROM: $979E (retry budget exhausted - `move.w #$5,D5`
-		// then subq/bne) and $99FE (a $7a0e / D2 test).  Tap the instruction fetch at each.
-		// $2029 is deposited THROUGH A POINTER: `movea.w $71be.w,A0 / move.w #$2029,(A0)` at both
-		// $7E02 (-> $7C92, the position-verify failure path) and $8AB2.  A data write, so unlike an
-		// instruction fetch this IS visible - the Harvard split hid the fetch taps below.
-		cs.install_write_tap(0x71be, 0x71bf, "errptr",
-			[this, on_local_bus](offs_t, u16 &data, u16 mem_mask)
-			{
-				if (!on_local_bus()) return;
-				logerror("ERRPTR [$71be] <= %04x pc=%06x cmd=%02x wr_done=%d phase=%d t=%.5f\n",
-					data & 0xffff, m_cpu->pcbase() & 0xffffff, m_iopb_cmd, m_wr_done,
-					m_sec_phase, machine().time().as_double());
-			});
-		cs.install_read_tap(0x979e, 0x979f, "err979e",
-			[this](offs_t, u16 &, u16)
-			{ logerror("ERR979E (retry exhausted) cmd=%02x wr_done=%d phase=%d t=%.5f\n",
-				m_iopb_cmd, m_wr_done, m_sec_phase, machine().time().as_double()); });
-		cs.install_read_tap(0x99fe, 0x99ff, "err99fe",
-			[this](offs_t, u16 &, u16)
-			{ logerror("ERR99FE ($7a0e/D2 test) cmd=%02x wr_done=%d phase=%d t=%.5f\n",
-				m_iopb_cmd, m_wr_done, m_sec_phase, machine().time().as_double()); });
 		// HARD POSPTR classifier: move.w #$7da6,($e4,A6) at $2E0C.  Remember the UIB so the
 		// DATASTEP window below can retarget +$e4 → +$ca without touching floppy TABLE arms.
 		// Read m_lram directly — this tap sits inside 0x6000-0x7fff.
@@ -6569,50 +6314,8 @@ void multibus_storager_device::device_reset()
 				logerror("E4CA APPLY uib=%04x pc=%06x +20 %04x→%04x e4 %04x→%04x t=%.5f\n",
 					uib, pc, p20, p20 | 0x4000, e4, ca, machine().time().as_double());
 			});
-		// A2: who clobbers the floppy UIB slot after the last valid FETCH (t≈11.14)?
-		// Also watch [$799a] retargeting back to $6e60 for the installer read.
-		cs.install_write_tap(0x6e60, 0x6e7f, "uib6e60",
-			[this, on_local_bus](offs_t offset, u16 &data, u16 mem_mask)
-			{
-				device_execute_interface *const exec = machine().scheduler().currently_executing();
-				logerror("UIB6E60 wr [%04x]<=%04x mask=%04x pc=%06x dma=%d cpu=%d exec=%s cmd=%02x t=%.5f\n",
-					unsigned(offset), data & 0xffff, mem_mask & 0xffff,
-					m_cpu->pcbase() & 0xffffff, m_dma_active ? 1 : 0,
-					on_local_bus() ? 1 : 0,
-					exec ? exec->device().tag() : "-",
-					m_iopb_cmd, machine().time().as_double());
-			});
-		cs.install_write_tap(0x799a, 0x799b, "ptr799a",
-			[this, on_local_bus](offs_t, u16 &data, u16 mem_mask)
-			{
-				logerror("PTR799A <= %04x mask=%04x pc=%06x cpu=%d cmd=%02x t=%.5f\n",
-					data & 0xffff, mem_mask & 0xffff,
-					m_cpu->pcbase() & 0xffffff, on_local_bus() ? 1 : 0,
-					m_iopb_cmd, machine().time().as_double());
-			});
-		cs.install_write_tap(0x71f0, 0x71f3, "nodestat",
-			[this, on_local_bus](offs_t offset, u16 &data, u16 mem_mask)
-			{
-				if (!on_local_bus()) return;
-				u32 const wpc = m_cpu->pcbase() & 0xffffff;
-				logerror("NODESTAT [%04x] <= %04x mask=%04x pc=%06x cmd=%02x wr_done=%d phase=%d t=%.5f\n",
-					unsigned(offset), data & 0xffff, mem_mask & 0xffff,
-					wpc, m_iopb_cmd, m_wr_done, m_sec_phase, machine().time().as_double());
-				// WHERE DID THE ERROR CODE COME FROM?  $184E is the ROM's generic 0x82 stamp, so the
-				// sense byte is supplied by a CALLER.  Dump the stack so the call chain names it.
-				if (wpc == 0x184a || wpc == 0x184e)
-				{
-					address_space &ls = m_cpu->space(AS_PROGRAM);
-					u32 const sp = m_cpu->state_int(M68K_SP) & 0xffffff;
-					std::string st;
-					for (int k = 0; k < 8; k++)
-						st += util::string_format(" %06x", ls.read_dword((sp + k * 4) & 0xffffff) & 0xffffff);
-					logerror("NODESTAT   stack@%06x:%s  D0=%08x D1=%08x\n", sp, st.c_str(),
-						m_cpu->state_int(M68K_D0), m_cpu->state_int(M68K_D1));
-				}
-			});
 		cs.install_write_tap(0x7abc, 0x7abd, "cnt7abc",
-			[this](offs_t offset, u16 &data, u16 mem_mask)
+			[this](offs_t, u16 &data, u16 mem_mask)
 			{
 				int const v = data & 0xff;
 				// Live read: latch any in-range per-track remainder.
@@ -6644,38 +6347,10 @@ void multibus_storager_device::device_reset()
 					m_next_rec = machine().time();
 					m_pump->adjust(attotime::from_usec(100));
 					how = "  -> REOPEN multi-track m_sec_count";
-					use = true;
 				}
-				logerror("7ABC-WRITE <= %04x mask=%04x%s t=%.5f\n", data, mem_mask,
-					how, machine().time().as_double());
-			});
-		// Soft-timer count arm (inst8 wrap finding): block addresses move (7318/733c/7360…) so
-		// catch the WRITE of the count word, not a fixed address.  IRQ1 walk is proven correct;
-		// cnt=ffff after first subq means the arm was 0000 (wrap) or ffff (huge).  Log every
-		// full-word store of 0000/ffff in the freelist/block pool, plus #$32 (the normal arm) so
-		// the healthy path is the same-run control.  PC names $89E8 (reload #$32/#$201C) vs
-		// $29F8 (register from stack) vs anything else.
-		cs.install_write_tap(0x7300, 0x74ff, "tmrcnt",
-			[this, on_local_bus](offs_t offset, u16 &data, u16 mem_mask)
-			{
-				if (!on_local_bus()) return;
-				if (mem_mask != 0xffff) return;          // count is always a full word
-				u16 const v = data & 0xffff;
-				if (v != 0x0000 && v != 0xffff && v != 0x0032)
-					return;
-				// Prefer even addresses (block+0 = count); odd-byte halves of other fields are noise.
-				if (offset & 1) return;
-				address_space &ls = m_cpu->space(AS_PROGRAM);
-				u32 const pc = m_cpu->pcbase() & 0xffffff;
-				u16 const cell = ls.read_word(0x7986);
-				u16 const qh   = ls.read_word(0x736c);
-				// code field sits at block+2 when this is a real timer block
-				u16 const code = (offset + 2 <= 0x74ff) ? ls.read_word((offset + 2) & 0xffff) : 0xffff;
-				char const *tag = (v == 0x0000) ? "ZERO" : (v == 0xffff) ? "FFFF" : "n32 ";
-				logerror("TMRCNT %s [%04x]<=%04x pc=%06x code@+2=%04x [$7986]=%04x [$736c]=%04x "
-					"cmd=%02x t=%.5f\n",
-					tag, unsigned(offset), v, pc, code, cell, qh, m_iopb_cmd,
-					machine().time().as_double());
+				if (how[0])
+					logerror("7ABC-WRITE <= %04x mask=%04x%s t=%.5f\n", data, mem_mask,
+						how, machine().time().as_double());
 			});
 		if (TRACE_CHUNK_PATH)
 			cs.install_read_tap(0x7654, 0x7695, "ownmap",
@@ -6914,7 +6589,7 @@ void multibus_storager_device::device_reset()
 			});
 		if (TRACE_CHUNK_PATH)
 			cs.install_write_tap(0x7654, 0x76bf, "accept_count",
-			[this](offs_t offset, u16 &data, u16 mem_mask)
+			[this](offs_t, u16 &data, u16 mem_mask)
 			{
 				if (!m_read_active) return;
 				// The stakes are BYTE writes ($8120 move.b #$c0,(0,a1,d1.w) / $8128 move.b d0,...),
@@ -6929,25 +6604,6 @@ void multibus_storager_device::device_reset()
 				if (v != 0xc0)
 					return;
 				m_accepted_n++;
-				// End-of-transfer marker.  The firmware's terminate fork tests ONE cell, one
-				// instruction after the last accepted sector takes the remaining count to zero
-				// ($7EBE -> $7EC2 not taken -> $7ED0 cmpi.b #$aa,(A0,D0.w) -> $7ED8, stop re-arming).
-				// Within a record it TESTS S+1 then STAKES S, so the cell that test will read is
-				// (this stake's address + 2) - and the PENULTIMATE stake is the last chance to write
-				// it, 4.6 ms ahead of the edge.  Both inputs are the gate array's own: the write
-				// address it just saw on the bus, and the count from its op18 program's port-$3F
-				// pushes.  Record only; the pump deposits it as a bus-master cycle.
-				int const n = m_prog_count > 0 ? m_prog_count : m_sec_count;
-				if (false && n > 1 && m_accepted_n == n - 1 && !m_aa_done)
-				{
-					u32 const addr = (mem_mask == 0x00ff) ? (offset + 1) : offset;
-					u32 const cell = addr + 2;
-					if (cell >= 0x7654 && cell <= 0x76bf)
-					{
-						m_aa_cell = cell;
-						m_aa_armed = true;
-					}
-				}
 			});
 		// (Diagnostic taps removed.  The Lua instruments under docs/storager-lle carry the same
 		//  coverage without compiling anything into the device: timeline.lua for the completion
@@ -6984,7 +6640,6 @@ void multibus_storager_device::device_reset()
 	m_desc_n = 0;
 	m_pit2_out = false;
 	m_data_done_n = 0;
-	m_status_armed = false;
 	m_read_active = false;
 	m_uib_dma_bps = 0;
 	m_aa_trail = 0;
