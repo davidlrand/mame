@@ -419,6 +419,10 @@ private:
 	// 0x000feba8…; field-map misread as spt=235/hds=168/class=$0f).
 	bool floppy_uib_plausible(u8 hds, u8 spt, u16 bps, u8 u12) const;
 	void latch_floppy_geo_from_bytes(u8 hds, u8 spt, u16 bps, u8 u12, u32 uib, char const *why);
+	// Commanded sectors/track: floppy uses the FLOPGEO latch (same as OS SEEK).  Live
+	// m_uib_base+$1 is the rigid UIB after HD I/O (spt=9) and produced write want 3..18
+	// on a 16-sector MFM track (psec=128).
+	u8 cmd_spt() const;
 	// UIB+$12 bit1: firmware $102A policy — set → sector IDs 0..spt-1, clear → 1..spt.
 	// Matches the want-list builder's [$7954] base (cont.584).  Not density (that is bit2).
 	bool sector_id_zero_based() const;
@@ -961,6 +965,19 @@ void multibus_storager_device::latch_floppy_geo_from_bytes(u8 hds, u8 spt, u16 b
 	m_flop_geo_valid = true;
 	logerror("FLOPGEO latch hds=%u spt=%u bps=%u +12=%02x uib=%04x (%s) t=%.5f\n",
 		hds, spt, bps, u12, uib, why ? why : "?", machine().time().as_double());
+}
+
+u8 multibus_storager_device::cmd_spt() const
+{
+	if (m_cmd_unit >= 2 && m_flop_geo_valid && m_flop_geo_spt)
+		return m_flop_geo_spt;
+	if (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
+	{
+		u8 const s = m_cpu->space(AS_PROGRAM).read_byte((m_uib_base + 1) & 0xffff);
+		if (s)
+			return s;
+	}
+	return 16;
 }
 
 bool multibus_storager_device::probe_medium_density(int cyl, int head) const
@@ -1839,16 +1856,33 @@ void multibus_storager_device::start_field_program()
 				u32 const nd = m_node_base ? m_node_base : 0x71f0;
 				u16 const req_start = (u16(ns.read_byte((nd + 0x08) & 0xffff)) << 8)
 				                    | ns.read_byte((nd + 0x09) & 0xffff);
-				bool const id0 = sector_id_zero_based();
-				u16 const from_req = u16(req_start + (id0 ? 0 : 1));
+				u16 from_req;
+				char const *how;
 				u16 const spt_lim = u16(std::max(1, m_track_n));
-				u16 const lo = id0 ? 0 : 1;
-				u16 const hi = id0 ? u16(spt_lim - 1) : spt_lim;
+				u16 lo, hi;
+				if (m_cmd_unit >= 2 && m_flop_geo_valid && m_flop_geo_spt)
+				{
+					// OS channel hands a LINEAR psec (144), not track-relative R.  A mixed
+					// 32-descriptor load after a write parsed R=23 and hunted forever ($201C).
+					u16 const spt = m_flop_geo_spt;
+					from_req = u16((req_start % spt) + 1);
+					how = "flop-latch 1-based";
+					lo = 1;
+					hi = spt_lim;
+				}
+				else
+				{
+					bool const id0 = sector_id_zero_based();
+					from_req = u16(req_start + (id0 ? 0 : 1));
+					how = id0 ? "0-based" : "1-based";
+					lo = id0 ? 0 : 1;
+					hi = id0 ? u16(spt_lim - 1) : spt_lim;
+				}
 				if (from_req >= lo && from_req <= hi)
 				{
 					if (!m_hunt_active || m_want_r != from_req)
 						logerror("HUNT start REQ=%u -> R=%u (%s; PROG/retained was %u%s) t=%.5f\n",
-							req_start, from_req, id0 ? "0-based" : "1-based",
+							req_start, from_req, how,
 							m_want_r, m_hunt_active ? "" : " inactive",
 							machine().time().as_double());
 					m_want_r = from_req;
@@ -2172,8 +2206,7 @@ void multibus_storager_device::advance_read()
 			// The gate array signals on an ID MATCH, so a non-matching record must generate no
 			// stimulus whatsoever - walk past it here, before staging, silently.
 			{
-				address_space &cs5 = m_cpu->space(AS_PROGRAM);
-				u32 const spt5 = m_uib_base ? cs5.read_byte((m_uib_base + 1) & 0xffff) : 16;
+				u32 const spt5 = cmd_spt();
 				u32 const first5 = spt5 ? (m_wr_psec % spt5) + 1 : 1;
 				u32 const last5  = first5 + m_sec_count - 1;
 				for (int guard = 0; guard <= m_track_n * 2; guard++)
@@ -2305,8 +2338,7 @@ void multibus_storager_device::advance_read()
 			if (m_track_n > 0)
 			{
 				captured_sector const &tgt = m_track[m_sec_index % m_track_n];
-				address_space &cs4 = m_cpu->space(AS_PROGRAM);
-				u32 const spt = m_uib_base ? cs4.read_byte((m_uib_base + 1) & 0xffff) : 16;
+				u32 const spt = cmd_spt();
 				u32 const first = spt ? (m_wr_psec % spt) + 1 : 1;
 				u32 const last  = first + m_sec_count - 1;
 				if (tgt.r >= first && tgt.r <= last)
@@ -4308,8 +4340,9 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 		//            warns that reading it as "write-with-verify" makes a phantom transfer that
 		//            overwrites freshly written sectors with stale request-buffer bytes.
 		//            0x0a is WRITE(6).  Floppy unit 2/3 is routed to firmware 0x96 and
-		//            write_sector() (live: tar c /dev/fl2 -> 13x cmd=96, 208 WRCOMMIT, 13/13
-		//            POST 80).  Rigid unit 0/1 still uses the OS-channel image copy below.
+		//            write_sector() (live: tar c /dev/fl2 -> 13x cmd=96, 208 WRCOMMIT,
+		//            FLOPGEO hunt REQ=144->R=1, 13/13 POST 80, no guest 1C).  Rigid
+		//            unit 0/1 still uses the OS-channel image copy below.
 		//            Dave 2026-08-01 "there are no floppy writes" predates that path.
 		//            Host op != firmware op: the board translates (host 0x08 -> firmware 0x95,
 		//            host 0x0a -> 0x96).  See IOCB-STRUCTURE.md and FIRMWARE-DISPATCH-TABLE.md.
