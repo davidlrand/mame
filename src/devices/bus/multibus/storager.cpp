@@ -131,35 +131,9 @@ namespace {
 // A/B; the timed model is correct.
 // One record per address mark; the firmware chooses whether to arm the data phase (no HW sector
 // comparator).  The firmware stops re-arming when it has what it wants.
-constexpr bool PER_ADDRESS_MARK = true;
-
-// Q3b: the gate array's end-of-transfer marker.
-//
-// The firmware's record handler forks at $7E8E on [$7968], and the two arms consult the $AA end marker
-// DIFFERENTLY:
-//   [$7968]==0 -> $7EB2: accept, $7EBE decrements the remaining count, and the marker is tested ONCE,
-//                 at $7ED0, one instruction after the count reaches zero.
-//   [$7968]!=0 -> $7E90: the marker is tested at $7E9A on EVERY record, with no count precondition.
-// They are alternatives, not a sequence: the bootstrap ([$7968] set at $82B2) happens 8.9 ms AFTER the
-// remain->0 edge, so nothing can serve $7ED0 - but $7E9A is open from the next record onward.
-//
-// Trigger: $82B8 bset #0,$7ac2, one instruction after $82B2.  Nothing in the ROM ever reads $7AC2 - it
-// is a write-only strobe, i.e. the firmware signalling hardware that it has bootstrapped.
-// Address: the FIRST stake's write address (bus-observed) plus the op18 program's own port-$3F push
-// count.  Neither is an IOCB or firmware-cell read.
-// RESULT (measured): the rule works - $7E9A read $AA at [765f] and took $7ED8, the first time the
-// firmware has ever taken a terminate branch.  The +2 offset is right: within a record the firmware
-// TESTS S+1 ($7E9A) then STAKES S ($8120/$8128), so the next record's test cell is last stake + 2.
-// BUT $7ED8 is not a completion - it only does move.w #$0,$741c and falls to $7F1A.  It does not stop
-// the ISR issuing the E802 bit11 capture re-arm, so records keep arriving (116 vs a baseline 16),
-// remain runs negative, and a later matched record clears [$7968] again at $7C92.  Left OFF: an
-// enabled path that quadruples the record count would poison every other measurement.
-// DISPROVED (cont.426).  The marker forces $7ED8, which is the EXCEPTION exit - the same place a
-// failed chunk allocation lands ($7EF4 unlk / bra $7ED8).  The NORMAL exit for the count-drain record
-// is $7ED6 bne -> $7EE0 -> $32AC allocates -> $7F14 sets [$741c], which $82B2 then consumes on the
-// same interrupt to set [$7968].  Measured A/B with the accepted-sector disarm: marker OFF gives
-// 8 records / 8 data-done / [$7968]=1; marker ON gives 8 / 8 / [$7968]=0.  The marker's only effect
-// is to suppress the bootstrap.  Kept behind the flag as a disproved hypothesis, not a fix.
+// Q3b $AA plant RETIRED (cont.426).  Forcing the ledger end-marker took $7ED8 (exception
+// exit), suppressed the [$7968] bootstrap, and did not stop E802 re-arms.  Rigid last-ID
+// close is AA-TRAIL, not a SRAM deposit.
 
 // TEMP (STRIP): stimulus/response experiment matrix.  Firmware drives; the model only changes how
 // the gate array *responds* to programmed arms + disk rotation.  No free-form writes into firmware
@@ -355,12 +329,8 @@ constexpr bool TRACE_SEEKCMP    = false;
 // false = arm-only; hang becomes "no chunk armed" if firmware stops publishing.
 constexpr bool RIGID_AUTO_STRIDE = true;
 
-// Q3 hypothesis test (TEMP): end-marker after a ledger stake, using only the write address.
-// When firmware stakes $c0 ($8120), if the NEXT ledger byte is NOT still a want ($ff), deposit
-// $AA there.  That skips mid-window (next=$ff → leave wants visible) and fires when the stake
-// lands against $fe/$aa/end - i.e. the filled prefix has no remaining $ff beyond it.  No IOCB
-// count, no [$7956] snoop.  v1 (unconditional next=$AA) interleaved $AA in front of $ff and
-// cut the read to 4 DMAs / remain stuck at 4 - so the $ff guard is required.  false = off.
+// Q3 stake-side $AA plant RETIRED with Q3b.  v1 (unconditional next=$AA) cut the read to
+// 4 DMAs; the $ff-guarded variant was never promoted.  Code removed.
 
 class multibus_storager_device
 	: public device_t
@@ -669,7 +639,6 @@ private:
 	std::unique_ptr<u16[]> m_lram;   // SRAM_BYTE_SWAPPED backing store
 	u16 lram_r(offs_t offset, u16 mem_mask);
 	void lram_w(offs_t offset, u16 data, u16 mem_mask);
-	void flush_held_on_claim();
 	u32 m_iopb_addr = 0;         // host IOPB base (the auto-fetch source)
 	u8  m_mb_in[8] = {};         // inbound host register-file latch (pio 73F4-73FB)
 
@@ -817,8 +786,7 @@ private:
 	// track ID once (addq lands on the spt $AA).  0=not started, 1=hunting last ID,
 	// 2=done.  Floppy stays at the bound stop (EXTRA refuted).
 	u8   m_aa_trail = 0;
-	bool m_extra_active = false;    // leftover EXTRA trailing-arm flag (floppy: stay false)
-	u32  m_extra_presented = 0;
+
 	attotime m_next_rec = attotime::never;   // when the next field has physically passed the head
 
 	// DATASTEP bit14 / +$e4 fix (2026-08-17).  HARD POSPTR installs ca=$7db1 (C), ce=$7db4 (R),
@@ -960,23 +928,8 @@ u8 multibus_storager_device::logical_r(u8 phys) const
 	// (node+8/+9 read as 00 20 for block 32), so a wider presented index is needed before anything
 	// beyond cylinder 7 can be recognised.  Sufficient for the label + boot-file path; NOT sufficient
 	// for a full install.
-	// SECTOR_ID_LINEAR - REFUTED, see above - body removed; the code is preserved verbatim in commit bebdc9428d9
-	// (pre-cleanup checkpoint).  Kept as a comment so the verdict survives without
-	// dead machinery that reads as live code.
-	if (true)    // SECTOR_ID_REMAP - REFUTED, see above
-		return phys;
-	if (m_uib_base < 0x4000 || m_uib_base >= 0x8000)
-		return phys;
-	address_space &cs = m_cpu->space(AS_PROGRAM);
-	u8 const spt  = cs.read_byte((m_uib_base + 1) & 0xffff);
-	// UIB[4], NOT UIB[5] - and that choice is ASSUMED, not measured.  Both floppy UIBs carry the
-	// same value in +4 and +5 (07/07 FM, 0d/0d MFM), so no floppy observation can distinguish them.
-	// The HARD-DISK UIB proves they are independent fields: it reads +4=0d, +5=13.  If this mapping
-	// is ever wrong, the HD is the discriminator - do not re-confirm it against a floppy.
-	u8 const base = cs.read_byte((m_uib_base + 4) & 0xffff);   // physical sector the volume starts at
-	if (spt == 0 || base < 1 || base > spt || phys < 1 || phys > spt)
-		return phys;
-	return u8(((phys - base + spt) % spt) + 1);
+	// SECTOR_ID_REMAP / LINEAR - REFUTED.  Present the physical ID.  Verdict in bebdc9428d9.
+	return phys;
 }
 
 bool multibus_storager_device::floppy_uib_plausible(u8 hds, u8 spt, u16 bps, u8 u12) const
@@ -1921,7 +1874,6 @@ void multibus_storager_device::start_field_program()
 		m_cmd_records = 0;
 	m_bound_logged = false;
 	m_aa_trail = 0;
-	m_extra_active = false;
 	}
 	// The gate array holds the whole track in its bit buffer (capture_track - detection-is-capture, the
 	// AM2147 + 1801 preamble search absorb positional slop), so the FIRST record of a read is available
@@ -2491,20 +2443,10 @@ void multibus_storager_device::advance_read()
 	// raises marks as the disk turns; the firmware stops them by ceasing to re-arm E802 bit11.
 	// The three counted variants and their measurements are archival - see board.yaml counted_stop_open
 	// and the cont.428 commit.  Do not reintroduce one without reading those first.
-	if (PER_ADDRESS_MARK)
-	{
-		// The disk keeps turning and every address mark that passes the head raises a record.  The gate
-		// array cannot know which sector is wanted - it has no header comparator; the firmware compares
-		// the captured field itself ($89F2) and simply stops re-arming when it is done.  So wrap, and
-		// let the arm/hold handshake be what ends the run.
-		if (m_sec_index >= m_track_n)
-			m_sec_index = 0;
-	}
-	else if (m_data_done_n >= m_sec_count && m_sec_count > 0)
-	{
-		m_read_active = false;              // window closed
-		return;
-	}
+	// One mark per address mark; firmware stops re-arming when it has what it wants.
+	// Count-based close (PER_ADDRESS_MARK=false) is retired — m_data_done_n is not a bound.
+	if (m_sec_index >= m_track_n)
+		m_sec_index = 0;
 	// cont.523: an N-sector IOCB reads N sectors.  The firmware arms once MORE after the last one
 	// (it always arms for the next record), and honouring that arm delivered a 5th sector for a
 	// 4-sector command - which then advanced the retained sector hunt past where the following
@@ -2952,8 +2894,6 @@ void multibus_storager_device::advance_read()
 		}
 		else
 			m_cmd_records++;
-		if (m_extra_active)
-			m_extra_presented++;   // a record cycle completed AFTER the offer
 		if (m_aa_trail != 2 && m_blocks_left > 0) m_blocks_left--;
 		m_sec_index++;                          // one sector completed after its data-done record
 		if (m_hunt_active)        // hunt the next sector in the run
@@ -4364,20 +4304,15 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 		//            space: 00 TEST UNIT READY, 01 REZERO, 03 REQUEST SENSE, 04 FORMAT UNIT,
 		//            08 READ(6), 0a WRITE(6), 0b SEEK(6), c0/c2 in the vendor-unique range C0-FF.
 		//            Every observed op lands on its standard code - structural, not an analogy.
-		//            0x0b is therefore SEEK, NOT a data op: the install-proven HLE records the
-		//            same and warns that reading it as "write-with-verify" makes a phantom
-		//            transfer that overwrites freshly written sectors with stale request-buffer
-		//            bytes.  Consistent with measurement here - dropping all 36 0x0b dispatches
-		//            changed nothing.
-		//            0x0a is WRITE(6) by the same structural reading, but the DIRECTION QUESTION
-		//            IS OPEN by standing instruction (Dave: "there are no floppy writes, and we
-		//            have not got to the ESDI writes" — historical; PC-MX2 Winchester is ST-506)
-		//            - and five 0x0a with unit=2 and live counts
-		//            were measured anyway.  If the SASI reading is right, those writes are real
-		//            and should not be happening, which makes them a SYMPTOM to trace upstream
-		//            rather than an opcode to implement.  Do not route 0x0a until that is settled.
-		//            Host op != firmware op: the board translates (host 0x08 -> firmware 0x95).
-		//            See docs/storager-lle/IOCB-STRUCTURE.md and FIRMWARE-DISPATCH-TABLE.md.
+		//            0x0b is SEEK, NOT a data op: the install-proven HLE records the same and
+		//            warns that reading it as "write-with-verify" makes a phantom transfer that
+		//            overwrites freshly written sectors with stale request-buffer bytes.
+		//            0x0a is WRITE(6).  Floppy unit 2/3 is routed to firmware 0x96 and
+		//            write_sector() (live: tar c /dev/fl2 -> 13x cmd=96, 208 WRCOMMIT, 13/13
+		//            POST 80).  Rigid unit 0/1 still uses the OS-channel image copy below.
+		//            Dave 2026-08-01 "there are no floppy writes" predates that path.
+		//            Host op != firmware op: the board translates (host 0x08 -> firmware 0x95,
+		//            host 0x0a -> 0x96).  See IOCB-STRUCTURE.md and FIRMWARE-DISPATCH-TABLE.md.
 		//   dev[1]   unit<<5 | position-high;  unit 2/3 = floppy, 0/1 = ST-506 HD.  Named by the
 		//            SMD 2180 as "UNIT/CYLHI SELECT - identifies one of four units and the most
 		//            significant bits of the cylinder number".
@@ -4393,11 +4328,10 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 		//            op 0xc0"), independently corroborated here from the opposite side.
 		//   buffer = the request pointer (regs [2],[3],[6])
 		//
-		// The model decodes only the HOST INTERFACE - that much is board-level - then hands the
-		// command to the FIRMWARE in its own IOPB form, through the identical path the monitor's
-		// doorbell uses.  The firmware drives the gate array and the flux read; nothing here touches
-		// the medium.  Pasting the HLE's C++ transfer back would restore exactly the shim the LLE
-		// mandate exists to remove.
+		// Host-interface decode, then dispatch.  Floppy 0x08/0x0a/0x0b become firmware IOPBs
+		// (0x95/0x96/0x8A) on the same mailbox path as the monitor doorbell.  Rigid 0x08/0x0a
+		// still copy the image here (the unit<2 SASI shim).  Do not paste the rest of the HLE
+		// transfer back — that is the shim the LLE mandate exists to remove.
 		if (dev)
 		{
 			u8 const op    = bs.read_byte(dev & 0xffffff);
@@ -4567,10 +4501,11 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 				// drive's native 512, or this shim has been wrong in a way its success masked.  Do
 				// not quietly unify them when retiring unit<2 onto the firmware path — measure.
 				//
-				// Required by the installer's DISK-TYPE AUTO-DETECT: it writes 48 sectors at psec 0
-				// (op 0x0b) and reads 1 back (op 0x08).  With no data moved the read-back is garbage
-				// and detection fails - measured, "Es war dem System leider nicht moeglich, den
-				// Plattentyp automatisch zu erkennen."
+				// Installer DISK-TYPE AUTO-DETECT needs a data phase (pattern land, then read
+				// back).  The data is the accompanying 0x0a writes, not 0x0b: 0x0b is SEEK and
+				// used to scribble stale request-buffer bytes (see below).  With no 0x0a copy
+				// the read-back is garbage — measured, "Es war dem System leider nicht moeglich,
+				// den Plattentyp automatisch zu erkennen."
 				//
 				// FORMAT REMAINS SIGNAL-ONLY (standing instruction): there is no format opcode, no
 				// track structure / spare table / defect map is laid down, and the 0x1a pattern is not
@@ -4674,14 +4609,6 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 					for (u32 k = 0; k < 0x18; k++)
 						cs3.write_byte((dst + k) & 0xffff, iopb[k]);
 					m_iopb_cmd = 0x8a;
-					{	// TEMP (STRIP): live block dump for audit — geometry used is the latch.
-						std::string sb;
-						if (m_uib_base >= 0x4000 && m_uib_base < 0x8000)
-							for (u32 k = 0; k < 0x14; k++)
-								sb += util::string_format(" %02x", cs3.read_byte((m_uib_base + k) & 0xffff));
-						logerror("SEEKUIB latch hds=%u spt=%u | live[%04x] 799a=%04x +0..13:%s\n",
-							hds, spt, m_uib_base, cs3.read_word(0x799a) & 0xffff, sb);
-					}
 					logerror("IOREG   -> firmware SEEK cmd=8a unit=%u psec=%u -> cyl=%u hd=%u sec=%u "
 						"(spt=%u hds=%u latch) dst=%04x t=%.5f\n",
 						unit, psec, cyl, hd, sec, spt, hds, dst, machine().time().as_double());
@@ -4787,7 +4714,6 @@ void multibus_storager_device::ioreg_w(offs_t offset, u16 data, u16 mem_mask)
 				m_cmd_bytes = want_bytes;
 				m_bound_logged = false;
 				m_aa_trail = 0;
-				m_extra_active = false;
 				iopb[0x0d] = u8(dstbuf >> 16);  iopb[0x0e] = u8(dstbuf >> 8); iopb[0x0f] = u8(dstbuf);
 				std::string prev;
 				for (u32 k = 0; k < 0x18; k++)
@@ -6740,42 +6666,7 @@ void multibus_storager_device::lram_w(offs_t offset, u16 data, u16 mem_mask)
 	else if (mem_mask == 0x00ff) m_lram[offset] = (m_lram[offset] & 0x00ff) | ((data & 0x00ff) << 8);
 	else                         m_lram[offset] = (m_lram[offset] & ~mem_mask) | (data & mem_mask);
 
-	// cont.519: a write into the chunk/claim table ($7696, 6-byte entries: +0 chunk byte address,
-	// +2 claimed sector) is the moment a held field's destination becomes known.  Read and write
-	// m_lram DIRECTLY here - going through the address space from inside a write handler fires the
-	// device's own dma_snoop read tap and clobbers m_term_bit0 (the class this campaign hit twice).
-	if (true)   // FLUSH_ON_CLAIM - REFUTED
-		return;
-	u32 const wa = 0x4000 + (offset << 1);
-	if (wa < 0x7696 || wa >= 0x76f6)
-		return;
-	flush_held_on_claim();
-}
-
-// Deposit a held data field into the chunk the firmware's claim table names for its sector.
-// m_lram is read and written DIRECTLY: going through the address space would fire the device's own
-// dma_snoop read tap and clobber m_term_bit0.
-void multibus_storager_device::flush_held_on_claim()
-{
-	for (u32 a = 0x7696; a < 0x76f6; a += 6)
-	{
-		u32 const i = (a - 0x4000) >> 1;
-		if (m_lram[i + 1] != m_held_r)
-			continue;
-		u32 const claimed = m_lram[i];
-		if (claimed < 0x4000 || claimed + m_held_len > 0x8000)
-			break;
-		for (u32 k = 0; k < m_held_len; k++)
-		{
-			u32 const b = claimed + k, j = (b - 0x4000) >> 1;
-			if (b & 1) m_lram[j] = (m_lram[j] & 0x00ff) | (u16(m_held_data[k]) << 8);
-			else       m_lram[j] = (m_lram[j] & 0xff00) | m_held_data[k];
-		}
-		logerror("held field (R=%u) flushed ON CLAIM into chunk %04x t=%.5f\n",
-			m_held_r, claimed, machine().time().as_double());
-		m_held_len = 0;
-		break;
-	}
+	// FLUSH_ON_CLAIM - REFUTED (bebdc9428d9).  Claim table writes are not a flush trigger.
 }
 
 void multibus_storager_device::mem_map(address_map &map)
